@@ -344,10 +344,15 @@ fn action() -> impl Strategy<Value = Action> {
         Just(Action::RequestPromotion),
         Just(Action::Rehearse),
         Just(Action::SecretsRequest),
+        Just(Action::SecretsList),
         Just(Action::Promote),
         Just(Action::ProductionLogs),
         Just(Action::ProductionDatabase),
         Just(Action::SecretsRead),
+        Just(Action::SecretsWrite),
+        Just(Action::RolloutView),
+        Just(Action::RolloutManage),
+        Just(Action::RestoreInstance),
     ]
 }
 
@@ -390,7 +395,13 @@ fn request() -> impl Strategy<Value = Request> {
 fn touches_production(action: Action) -> bool {
     matches!(
         action,
-        Action::Promote | Action::ProductionLogs | Action::ProductionDatabase | Action::SecretsRead
+        Action::Promote
+            | Action::ProductionLogs
+            | Action::ProductionDatabase
+            | Action::SecretsRead
+            | Action::SecretsWrite
+            | Action::RolloutManage
+            | Action::RestoreInstance
     )
 }
 
@@ -422,6 +433,62 @@ proptest! {
         wider.can.insert(extra);
         if judge(&token, &request) == Verdict::Allow {
             prop_assert_eq!(judge(&wider, &request), Verdict::Allow);
+        }
+    }
+}
+
+/// 비밀의 값에 닿는 일. 구현의 `Action::needs` 와 따로 적는다.
+fn touches_secret_values(action: Action) -> bool {
+    matches!(action, Action::SecretsRead | Action::SecretsWrite)
+}
+
+/// 토큰에 적어 보낼 능력의 이름. 값을 읽거나 넣는 능력의 이름을 섞는다.
+fn capability_word() -> impl Strategy<Value = &'static str> {
+    prop_oneof![
+        Just("source"),
+        Just("preview"),
+        Just("rehearse"),
+        Just("secrets_request"),
+        Just("secrets_read"),
+        Just("secrets_write"),
+        Just("secrets"),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn 어떤_토큰으로도_값을_읽거나_넣는_능력을_얻지_못한다(
+        token in token(),
+        request in request(),
+        words in proptest::collection::vec(capability_word(), 0..5),
+    ) {
+        // 받은 토큰이 무엇을 할 수 있든 값을 읽거나 넣는 일은 허락되지 않는다
+        if touches_secret_values(request.action) {
+            prop_assert_ne!(judge(&token, &request), Verdict::Allow);
+        }
+        // 값에 닿는 능력의 이름을 적어 보낸 토큰은 읽히지 않는다
+        let text = serde_json::json!({
+            "organization": "org_a",
+            "instance": "k3f9x2ab",
+            "can": words,
+            "expires_at": 5,
+        })
+        .to_string();
+        let reaches_values = words
+            .iter()
+            .any(|word| matches!(*word, "secrets_read" | "secrets_write" | "secrets"));
+        let parsed = serde_json::from_str::<Token>(&text);
+        prop_assert_eq!(parsed.is_ok(), !reaches_values);
+        if let Ok(parsed) = parsed {
+            for action in [Action::SecretsRead, Action::SecretsWrite] {
+                let request = Request {
+                    organization: parsed.organization.clone(),
+                    instance: parsed.instance.clone(),
+                    action,
+                    at: 0,
+                };
+                prop_assert_eq!(judge(&parsed, &request), Verdict::Deny(DenyReason::ServiceKeyOnly));
+            }
         }
     }
 }
@@ -603,6 +670,8 @@ mod release {
                 access_findings,
                 rehearsal,
                 missing_keys: Vec::new(),
+                missing_secrets: Vec::new(),
+                conformance: orbital_core::release::Conformed::NotDeclared,
             })
     }
 
@@ -645,6 +714,583 @@ mod release {
                 approval.release == release.id && (approval.by == Approver::Customer) == needs_customer
             });
             prop_assert_eq!(promote(&release, change, approval.as_ref()).is_ok(), checks_pass && approved);
+        }
+    }
+}
+
+// ---- 밖에서 넣는 비밀 ----
+
+mod secrets {
+    use std::collections::BTreeSet;
+
+    use orbital_core::manifest::{Manifest, Secrets, Service, ServiceAuth, ServiceKind};
+    use orbital_core::name::{Ident, SecretName};
+    use orbital_core::release::{
+        Approval, Approver, Blocker, BuiltBy, Change, Rehearsed, Release, ReleaseId, blockers,
+        promote,
+    };
+    use orbital_core::secrets::missing_secrets;
+    use proptest::prelude::*;
+
+    const NAMES: [&str; 3] = ["BANK_API_KEY", "MAP_KEY", "MAIL_TOKEN"];
+
+    proptest! {
+        #[test]
+        fn 넣지_않은_비밀이_하나라도_있으면_승격하지_못한다(
+            declared in proptest::array::uniform3(any::<bool>()),
+            filled in proptest::array::uniform3(any::<bool>()),
+        ) {
+            let pick = |mask: &[bool; 3]| -> Vec<SecretName> {
+                NAMES
+                    .iter()
+                    .zip(mask)
+                    .filter(|(_, on)| **on)
+                    .map(|(name, _)| SecretName::parse(name).unwrap())
+                    .collect()
+            };
+            let manifest = Manifest {
+                services: vec![Service {
+                    name: Ident::parse("web").unwrap(),
+                    kind: ServiceKind::Server,
+                    build: "true".to_owned(),
+                    start: Some("true".to_owned()),
+                    output: None,
+                    path: "/".to_owned(),
+                    roles: Vec::new(),
+                    auth: ServiceAuth::Optional,
+                }],
+                secrets: Secrets {
+                    generated: Vec::new(),
+                    external: pick(&declared),
+                },
+                ..Manifest::default()
+            }
+            .check()
+            .unwrap();
+            let filled: BTreeSet<SecretName> = pick(&filled).into_iter().collect();
+            let release = Release {
+                id: ReleaseId("r1".to_owned()),
+                built_by: BuiltBy::Layer,
+                access_findings: 0,
+                rehearsal: Rehearsed::Passed,
+                missing_keys: Vec::new(),
+                missing_secrets: missing_secrets(&manifest, &filled),
+                conformance: orbital_core::release::Conformed::NotDeclared,
+            };
+            // 구현을 부르지 않고 마스크에서 바로 기대값을 찾는다
+            let expected: Vec<Blocker> = NAMES
+                .iter()
+                .enumerate()
+                .filter(|(at, name)| declared[*at] && !filled.contains(&SecretName::parse(name).unwrap()))
+                .map(|(_, name)| Blocker::SecretMissing { secret: SecretName::parse(name).unwrap() })
+                .collect();
+            prop_assert_eq!(blockers(&release), expected.clone());
+            let approval = Approval { release: ReleaseId("r1".to_owned()), by: Approver::Customer };
+            prop_assert_eq!(
+                promote(&release, Change::CustomerRequest, Some(&approval)).is_ok(),
+                expected.is_empty()
+            );
+        }
+    }
+}
+
+// ---- 하위 도메인 ----
+
+mod hosts {
+    use orbital_core::host::{BaseDomain, HostTarget, judge_host};
+    use orbital_core::name::InstanceId;
+    use proptest::prelude::*;
+
+    /// 하위 도메인 자리에 올 조각. 머리말이 겹치는 식별자 둘을 두고, 모양이 틀린 것을 섞는다.
+    const LABELS: [&str; 12] = [
+        "k3f9x2ab",
+        "k3f9x2abc",
+        "k3f9x2ab-preview",
+        "k3f9x2abc-preview",
+        "K3F9X2AB",
+        "",
+        "x.k3f9x2ab",
+        "k3f9x2ab-preview-preview",
+        "short",
+        "-preview",
+        "k3f9x2ab.",
+        "k3f9x2ab-Preview",
+    ];
+    /// 기준 도메인 앞에 붙어 인스턴스로 가는 머리. 이 넷 말고는 어디로도 가지 않는다.
+    const HEADS: [(&str, &str, bool); 4] = [
+        ("k3f9x2ab.", "k3f9x2ab", false),
+        ("k3f9x2abc.", "k3f9x2abc", false),
+        ("k3f9x2ab-preview.", "k3f9x2ab", true),
+        ("k3f9x2abc-preview.", "k3f9x2abc", true),
+    ];
+    const SEPARATORS: [&str; 3] = [".", "", ".."];
+    const BASES: [&str; 2] = ["orbital.test", "orbital.test:7480"];
+    const SUFFIXES: [&str; 8] = [
+        "orbital.test",
+        "orbital.test:7480",
+        "orbital.test:7481",
+        "evilorbital.test",
+        "orbital.test.",
+        "test",
+        "orbital.test.other",
+        "",
+    ];
+
+    proptest! {
+        #[test]
+        fn 어떤_호스트든_기준_도메인_아래의_한_조각이_아니면_어느_인스턴스로도_가지_않는다(
+            label in 0..LABELS.len(),
+            separator in 0..SEPARATORS.len(),
+            suffix in 0..SUFFIXES.len(),
+            base in 0..BASES.len(),
+        ) {
+            let head = format!("{}{}", LABELS[label], SEPARATORS[separator]);
+            let host = format!("{head}{}", SUFFIXES[suffix]);
+            let base_text = BASES[base];
+            // 오라클: 꼬리가 기준 도메인과 한 글자도 다르지 않고, 그 앞이 인스턴스 하나의 머리와 한 글자도 다르지 않을 때만 간다
+            let expected = HEADS
+                .iter()
+                .find(|(known, _, _)| SUFFIXES[suffix] == base_text && head == *known)
+                .map(|(_, id, preview)| {
+                    let instance = InstanceId::parse(id).unwrap();
+                    if *preview { HostTarget::Preview(instance) } else { HostTarget::Production(instance) }
+                });
+            let base = BaseDomain::parse(base_text).unwrap();
+            prop_assert_eq!(judge_host(&host, &base), expected, "{}", host);
+        }
+
+        #[test]
+        fn 어떤_호스트든_인스턴스로_간다면_그_호스트는_그_인스턴스의_하위_도메인_그대로다(
+            host in "[a-zA-Z0-9.:-]{0,32}",
+            base in 0..BASES.len(),
+        ) {
+            let base = BaseDomain::parse(BASES[base]).unwrap();
+            if let Some(target) = judge_host(&host, &base) {
+                let canonical = match &target {
+                    HostTarget::Production(instance) => format!("{}.{base}", instance.as_str()),
+                    HostTarget::Preview(instance) => format!("{}-preview.{base}", instance.as_str()),
+                };
+                prop_assert_eq!(host, canonical);
+            }
+        }
+    }
+}
+
+// ---- rollout ----
+
+mod rollout {
+    use orbital_core::name::InstanceId;
+    use orbital_core::release::Change;
+    use orbital_core::rollout::{Event, Progress, Rollout, Status};
+    use orbital_core::scope::{Action, Capability, OrganizationId, Request, Token, Verdict, judge};
+    use proptest::prelude::*;
+
+    /// 머리말이 겹치는 식별자를 섞는다. 마지막 것은 rollout 에 들지 않는 인스턴스로 쓴다.
+    const POOL: [&str; 5] = ["k3f9x2ab", "k3f9x2abc", "zzzzzzzz", "aaaaaaaa", "outsider"];
+
+    fn id(text: &str) -> InstanceId {
+        InstanceId::parse(text).unwrap()
+    }
+
+    /// 인스턴스 둘에서 넷까지를 물결 셋 가운데 하나에 넣는다. 빈 물결은 걷는다.
+    fn waves() -> impl Strategy<Value = Vec<Vec<InstanceId>>> {
+        proptest::collection::vec(0usize..3, 2..=4).prop_map(|places| {
+            let mut waves: Vec<Vec<InstanceId>> = vec![Vec::new(); 3];
+            for (at, wave) in places.iter().enumerate() {
+                waves[*wave].push(id(POOL[at]));
+            }
+            waves.retain(|wave| !wave.is_empty());
+            waves
+        })
+    }
+
+    /// 사건 하나의 재료: (갈래, 인스턴스의 자리, 권한 검사가 통과했나, 다른 change 인가).
+    type Raw = (u8, usize, bool, bool);
+
+    fn raw() -> impl Strategy<Value = Raw> {
+        // 갈래: 0..=2 적용 · 프리뷰 · 검사, 3..=4 승격, 5 되돌려짐, 6 다시 열기, 7 거두기(드물게)
+        (
+            prop_oneof![
+                6 => 0u8..=2,
+                3 => 3u8..=4,
+                1 => Just(5u8),
+                1 => Just(6u8),
+                1 => Just(7u8),
+            ],
+            0usize..5,
+            any::<bool>(),
+            prop_oneof![4 => Just(false), 1 => Just(true)],
+        )
+    }
+
+    /// 재료를 사건으로 옮긴다. 검사의 적합성 테스트 결과는 인스턴스마다 정한 `conforms` 를 따른다.
+    fn event(raw: Raw, conforms: &[bool; 5], cancel: bool) -> Event {
+        let (kind, at, access, other) = raw;
+        let instance = id(POOL[at]);
+        match kind {
+            0 => Event::Applied { instance },
+            1 => Event::Previewed { instance },
+            2 => Event::Checked {
+                instance,
+                access_passed: access,
+                conformance_passed: conforms[at],
+            },
+            3 | 4 => Event::Promoted {
+                instance,
+                change: if other {
+                    Change::FeatureUpdate
+                } else {
+                    Change::SecurityUpdate
+                },
+            },
+            5 => Event::RolledBack { instance },
+            7 if cancel => Event::Cancel,
+            _ => Event::Resume,
+        }
+    }
+
+    fn start(waves: Vec<Vec<InstanceId>>) -> Rollout {
+        Rollout::new(
+            "todo".to_owned(),
+            "a".repeat(40),
+            Change::SecurityUpdate,
+            waves,
+        )
+        .unwrap()
+    }
+
+    fn promoted_count(rollout: &Rollout) -> usize {
+        rollout
+            .progress
+            .values()
+            .filter(|state| **state == Progress::Promoted)
+            .count()
+    }
+
+    proptest! {
+        #[test]
+        fn 멈춘_rollout_에서는_사건이_어떤_순서로_와도_새_승격이_없다(
+            waves in waves(),
+            raws in proptest::collection::vec(raw(), 0..60),
+            conforms in proptest::array::uniform5(prop_oneof![3 => Just(true), 1 => Just(false)]),
+        ) {
+            let mut rollout = start(waves);
+            for raw in raws {
+                let event = event(raw, &conforms, false);
+                let before = promoted_count(&rollout);
+                let halted = rollout.status == Status::Halted;
+                if let Ok(next) = rollout.step(&event) {
+                    if halted {
+                        prop_assert!(promoted_count(&next) <= before, "{:?}", event);
+                    }
+                    rollout = next;
+                }
+            }
+        }
+
+        #[test]
+        fn 적합성_테스트를_통과하지_않은_인스턴스는_사건이_어떤_순서로_와도_승격에_닿지_못한다(
+            waves in waves(),
+            raws in proptest::collection::vec(raw(), 0..60),
+            conforms in proptest::array::uniform5(any::<bool>()),
+        ) {
+            let mut rollout = start(waves);
+            for raw in raws {
+                if let Ok(next) = rollout.step(&event(raw, &conforms, true)) {
+                    rollout = next;
+                }
+                // 오라클: 적합성 테스트를 한 번도 통과하지 못하는 인스턴스는 `promoted` 가 아니다
+                for (at, name) in POOL.iter().enumerate() {
+                    if !conforms[at] {
+                        prop_assert_ne!(rollout.progress.get(&id(name)), Some(&Progress::Promoted));
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn 뒤_물결은_앞_물결이_모두_오른_뒤에만_오른다(
+            waves in waves(),
+            raws in proptest::collection::vec(raw(), 0..80),
+            conforms in proptest::array::uniform5(prop_oneof![5 => Just(true), 1 => Just(false)]),
+        ) {
+            let mut rollout = start(waves.clone());
+            for raw in raws {
+                let Ok(next) = rollout.step(&event(raw, &conforms, false)) else {
+                    continue;
+                };
+                // 새로 오른 인스턴스가 있으면, 그 앞 물결은 모두 이미 올라 있었다
+                for (wave, members) in waves.iter().enumerate() {
+                    for instance in members {
+                        let newly = next.progress.get(instance) == Some(&Progress::Promoted)
+                            && rollout.progress.get(instance) != Some(&Progress::Promoted);
+                        if newly {
+                            for earlier in waves.iter().take(wave).flatten() {
+                                prop_assert_eq!(rollout.progress.get(earlier), Some(&Progress::Promoted));
+                            }
+                        }
+                    }
+                }
+                rollout = next;
+            }
+        }
+    }
+
+    fn capability() -> impl Strategy<Value = Capability> {
+        prop_oneof![
+            Just(Capability::Source),
+            Just(Capability::Preview),
+            Just(Capability::Rehearse),
+            Just(Capability::SecretsRequest)
+        ]
+    }
+
+    /// 토큰에 적어 보낼 능력의 이름. rollout 을 다루는 능력처럼 보이는 이름을 섞는다.
+    fn word() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just("source"),
+            Just("preview"),
+            Just("rehearse"),
+            Just("secrets_request"),
+            Just("rollout"),
+            Just("rollout_manage"),
+            Just("rollouts"),
+            Just("resume"),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn 어떤_토큰으로도_rollout_을_만들거나_다시_여는_능력을_얻지_못한다(
+            can in proptest::collection::btree_set(capability(), 0..=4),
+            token_instance in 0usize..2,
+            request_instance in 0usize..2,
+            at in 0u64..6,
+            words in proptest::collection::vec(word(), 0..5),
+        ) {
+            let token = Token {
+                organization: OrganizationId("org_a".to_owned()),
+                instance: id(POOL[token_instance]),
+                can,
+                expires_at: 5,
+            };
+            let request = Request {
+                organization: OrganizationId("org_a".to_owned()),
+                instance: id(POOL[request_instance]),
+                action: Action::RolloutManage,
+                at,
+            };
+            prop_assert_ne!(judge(&token, &request), Verdict::Allow);
+            // rollout 을 다루는 능력의 이름을 적어 보낸 토큰은 읽히지 않는다
+            let text = serde_json::json!({
+                "organization": "org_a",
+                "instance": "k3f9x2ab",
+                "can": words,
+                "expires_at": 5,
+            })
+            .to_string();
+            let known = words
+                .iter()
+                .all(|word| matches!(*word, "source" | "preview" | "rehearse" | "secrets_request"));
+            let parsed = serde_json::from_str::<Token>(&text);
+            prop_assert_eq!(parsed.is_ok(), known);
+            if let Ok(parsed) = parsed {
+                let request = Request {
+                    organization: parsed.organization.clone(),
+                    instance: parsed.instance.clone(),
+                    action: Action::RolloutManage,
+                    at: 0,
+                };
+                prop_assert_ne!(judge(&parsed, &request), Verdict::Allow);
+            }
+        }
+    }
+}
+
+/// 백업과 복구 훈련의 판정.
+mod backup {
+    use orbital_core::backup::{BaseBackup, Check, Checked, DrillVerdict, judge_drill, prune};
+    use orbital_core::name::InstanceId;
+    use orbital_core::scope::{
+        Action, Capability, DenyReason, OrganizationId, Request, Token, Verdict, judge,
+    };
+    use proptest::prelude::*;
+
+    fn check() -> impl Strategy<Value = Check> {
+        prop_oneof![
+            Just(Check::ClusterStarted),
+            Just(Check::MarkBeforeKept),
+            Just(Check::MarkAfterGone),
+            Just(Check::Records),
+            prop_oneof![Just("k3f9x2ab"), Just("k3f9x2abc")].prop_flat_map(|instance| {
+                prop_oneof![
+                    Just(Check::Database {
+                        instance: instance.to_owned()
+                    }),
+                    Just(Check::Fingerprint {
+                        instance: instance.to_owned()
+                    }),
+                    Just(Check::Roles {
+                        instance: instance.to_owned()
+                    }),
+                ]
+            }),
+            Just(Check::Moved {
+                database: "i_k3f9x2ab".to_owned()
+            }),
+        ]
+    }
+
+    /// 통과한 확인이 훨씬 자주 나오게 해서 「하나만 어긋난」 경우가 자주 나온다.
+    fn checked() -> impl Strategy<Value = Checked> {
+        (check(), prop::bool::weighted(0.9)).prop_map(|(check, passed)| Checked { check, passed })
+    }
+
+    proptest! {
+        #[test]
+        fn 훈련은_확인이_하나라도_어긋나면_통과하지_못한다(checks in proptest::collection::vec(checked(), 0..12)) {
+            let failed: Vec<Check> = checks
+                .iter()
+                .filter(|checked| !checked.passed)
+                .map(|checked| checked.check.clone())
+                .collect();
+            let verdict = judge_drill(&checks);
+            if checks.is_empty() || !failed.is_empty() {
+                prop_assert_eq!(verdict, DrillVerdict::Failed { failed });
+            } else {
+                prop_assert_eq!(verdict, DrillVerdict::Passed);
+            }
+        }
+    }
+
+    const DAY: u64 = 86_400_000;
+
+    /// 기반 백업의 목록. 다 뜬 때가 보관 기간의 경계 근처에 자주 오게 좁힌다.
+    fn backups() -> impl Strategy<Value = Vec<BaseBackup>> {
+        proptest::collection::vec(
+            prop_oneof![
+                0u64..40 * DAY,
+                Just(16 * DAY),
+                Just(16 * DAY + 1),
+                Just(16 * DAY - 1)
+            ],
+            0..8,
+        )
+        .prop_map(|times| {
+            times
+                .into_iter()
+                .enumerate()
+                .map(|(index, finished_at)| BaseBackup {
+                    id: format!("b{index}"),
+                    started_at: finished_at.saturating_sub(5),
+                    finished_at,
+                    // 조각은 다 뜬 때를 따라 커진다(하루에 한 조각)
+                    start_wal: format!("00000001000000000000{:04X}", finished_at / DAY),
+                    segment_bytes: 1024 * 1024,
+                })
+                .collect()
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn 보관_기간이_지난_백업만_지우고_마지막_기반_백업은_언제나_남긴다(backups in backups()) {
+            // 지금은 30일, 보관 기간은 14일이다. 16일보다 앞에 다 뜬 것이 지난 것이다
+            let now = 30 * DAY;
+            let keep_for = 14 * DAY;
+            let pruning = prune(&backups, now, keep_for);
+            let newest = backups.iter().map(|backup| backup.finished_at).max();
+            let mut newest_kept = false;
+            for backup in &backups {
+                let gone = pruning.backups.contains(&backup.id);
+                let expired = backup.finished_at + keep_for < now;
+                if Some(backup.finished_at) == newest {
+                    // 가장 새 것과 같은 때에 뜬 것 가운데 하나는 반드시 남는다
+                    newest_kept |= !gone;
+                } else {
+                    prop_assert_eq!(gone, expired, "{:?}", backup);
+                }
+            }
+            prop_assert!(backups.is_empty() || newest_kept);
+            // WAL 은 남는 가장 오랜 기반 백업이 시작하는 조각 앞까지만 지운다
+            let oldest_kept = backups
+                .iter()
+                .filter(|backup| !pruning.backups.contains(&backup.id))
+                .map(|backup| backup.start_wal.clone())
+                .min();
+            prop_assert_eq!(pruning.wal_before, oldest_kept);
+        }
+    }
+
+    const POOL: [&str; 2] = ["k3f9x2ab", "k3f9x2abc"];
+
+    fn capability() -> impl Strategy<Value = Capability> {
+        prop_oneof![
+            Just(Capability::Source),
+            Just(Capability::Preview),
+            Just(Capability::Rehearse),
+            Just(Capability::SecretsRequest)
+        ]
+    }
+
+    /// 토큰에 적어 보낼 능력의 이름. 되살리기를 다루는 능력처럼 보이는 이름을 섞는다.
+    fn word() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just("source"),
+            Just("preview"),
+            Just("rehearse"),
+            Just("secrets_request"),
+            Just("restore"),
+            Just("restore_instance"),
+            Just("backup"),
+            Just("drill"),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn 어떤_토큰으로도_인스턴스를_되살리는_능력을_얻지_못한다(
+            can in proptest::collection::btree_set(capability(), 0..=4),
+            token_instance in 0usize..2,
+            request_instance in 0usize..2,
+            at in 0u64..6,
+            words in proptest::collection::vec(word(), 0..5),
+        ) {
+            let token = Token {
+                organization: OrganizationId("org_a".to_owned()),
+                instance: InstanceId::parse(POOL[token_instance]).unwrap(),
+                can,
+                expires_at: 5,
+            };
+            let request = Request {
+                organization: OrganizationId("org_a".to_owned()),
+                instance: InstanceId::parse(POOL[request_instance]).unwrap(),
+                action: Action::RestoreInstance,
+                at,
+            };
+            prop_assert_ne!(judge(&token, &request), Verdict::Allow);
+            // 되살리기를 다루는 능력의 이름을 적어 보낸 토큰은 읽히지 않는다
+            let text = serde_json::json!({
+                "organization": "org_a",
+                "instance": "k3f9x2ab",
+                "can": words,
+                "expires_at": 5,
+            })
+            .to_string();
+            let known = words
+                .iter()
+                .all(|word| matches!(*word, "source" | "preview" | "rehearse" | "secrets_request"));
+            let parsed = serde_json::from_str::<Token>(&text);
+            prop_assert_eq!(parsed.is_ok(), known);
+            if let Ok(parsed) = parsed {
+                let request = Request {
+                    organization: parsed.organization.clone(),
+                    instance: parsed.instance.clone(),
+                    action: Action::RestoreInstance,
+                    at: 0,
+                };
+                prop_assert_eq!(judge(&parsed, &request), Verdict::Deny(DenyReason::ServiceKeyOnly));
+            }
         }
     }
 }

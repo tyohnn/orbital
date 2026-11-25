@@ -1,0 +1,18 @@
+# 되살리기를 재는 앱. 사용자마다의 메모를 둔다. 회원은 자기 메모만, 관리자는 모두 읽는다
+
+[[service]]
+name = "web"
+kind = "server"
+build = "node --check server.js"
+start = "node server.js"
+path = "/"
+roles = ["member", "admin"]
+
+[database]
+schemas = ["ledger"]
+migrations = "db/migrations"
+roles = ["member", "admin"]
+
+[auth]
+methods = ["email_link"]
+login_path = "/login"

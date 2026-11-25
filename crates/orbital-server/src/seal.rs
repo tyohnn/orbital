@@ -43,6 +43,11 @@ pub fn binding(organization: &str, field: &str) -> String {
     format!("orbital/settings/v1\n{organization}\n{field}")
 }
 
+/// 금고에 둔 비밀의 봉인이 무엇의 것인지. 조직 · 인스턴스 · 단계 · 이름이 하나라도 다르면 같은 열쇠로도 풀리지 않는다.
+pub fn secret_binding(organization: &str, instance: &str, stage: &str, name: &str) -> String {
+    format!("orbital/secrets/v1\n{organization}\n{instance}\n{stage}\n{name}")
+}
+
 /// 봉인한다. 운영체제의 무작위 값을 얻지 못하면 `None` 이다.
 pub fn seal(key: &SealKey, bound_to: &str, plain: &str) -> Option<String> {
     let mut nonce = [0u8; NONCE];
@@ -116,6 +121,28 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn 비밀의_봉인은_조직_인스턴스_단계_이름_가운데_하나라도_다르면_풀리지_않는다() {
+        let bound = secret_binding("factory", "i123", "production", "BANK_API_KEY");
+        assert_eq!(
+            bound,
+            "orbital/secrets/v1\nfactory\ni123\nproduction\nBANK_API_KEY"
+        );
+        let sealed = seal(&key(1), &bound, "sk_live_bank").unwrap();
+        assert_eq!(
+            open(&key(1), &bound, &sealed).as_deref(),
+            Some("sk_live_bank")
+        );
+        for other in [
+            secret_binding("other", "i123", "production", "BANK_API_KEY"),
+            secret_binding("factory", "i124", "production", "BANK_API_KEY"),
+            secret_binding("factory", "i123", "preview", "BANK_API_KEY"),
+            secret_binding("factory", "i123", "production", "MAP_KEY"),
+        ] {
+            assert_eq!(open(&key(1), &other, &sealed), None, "{other}");
+        }
     }
 
     #[test]

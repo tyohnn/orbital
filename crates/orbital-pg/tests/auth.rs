@@ -769,10 +769,10 @@ fn orbital_me_는_자기_한_줄만_돌려주고_orbital_users_는_directory_의
     ));
 }
 
-// ---- 예행연습 · 되돌릴 지점 · 검사 ----
+// ---- 리허설 · 되돌릴 지점 · 검사 ----
 
 #[test]
-fn 예행연습의_사본과_되돌릴_지점은_사용자와_세션을_함께_갖는다() {
+fn 리허설의_사본과_되돌릴_지점은_사용자와_세션을_함께_갖는다() {
     let mut bench = bench!();
     let mut store = bench.store();
     let (kim, session) = sign_in(&mut store, "kim@example.com", &["member"]);
@@ -869,7 +869,7 @@ fn auth_를_선언하지_않은_인스턴스에는_orbital_auth_도_인증_역�
     ));
 }
 
-// ---- 횟수 제한 · 세션을 본 시각 · 미리보기의 씨앗 사용자 ----
+// ---- 횟수 제한 · 세션을 본 시각 · 프리뷰의 씨앗 사용자 ----
 
 #[test]
 fn 같은_이메일로_1분_안에_다시_요청하면_링크가_만들어지지_않는다() {
@@ -961,4 +961,97 @@ fn 씨앗_사용자는_u_모양이_아닌_식별자로_들어가고_그_database
         store.start_session("u1", NOW + 3),
         Err(AuthError::UserDisabled)
     ));
+}
+
+// ---- 쓰고 남은 줄 ----
+
+#[test]
+fn 쓰고_남은_표와_만료된_링크는_지워진다() {
+    use orbital_core::oauth::Accepted;
+    use orbital_core::sweep::LEFTOVER_RETENTION;
+    use orbital_pg::oauth::s256;
+
+    let bench = bench!();
+    let mut store = bench.store();
+    // 지금(NOW): 김이 링크로 들어오고(링크 · 세션), 로그아웃한 세션 하나와 살아 있는 세션 하나를 둔다
+    let (kim, old_session) = sign_in(&mut store, "kim@example.com", &["member"]);
+    store.revoke(&old_session, NOW + 2).unwrap();
+    let (live_session, _) = store.start_session(&kim, NOW + 3).unwrap();
+    // Google 로그인의 표, MCP 의 인가 요청 · 코드 · 토큰(access 1시간, refresh 30일)
+    store
+        .issue_google_ticket("kim@example.com", "google-sub", "/", &[1; 32], NOW)
+        .unwrap();
+    let redirect = "https://client.example/callback".to_owned();
+    let client = store
+        .register_client(
+            "registered",
+            "클라이언트",
+            std::slice::from_ref(&redirect),
+            None,
+            NOW,
+        )
+        .unwrap();
+    let verifier = "v".repeat(43);
+    let accepted = Accepted {
+        client_id: client.clone(),
+        redirect_uri: redirect.clone(),
+        code_challenge: s256(&verifier),
+        resource: "https://app.example/mcp".to_owned(),
+        scope: "mcp".to_owned(),
+        state: None,
+    };
+    let request = store.open_request(&kim, &accepted, NOW).unwrap();
+    let location = store
+        .decide(&request, &kim, true, "https://app.example", NOW)
+        .unwrap();
+    let code = location
+        .split(['?', '&'])
+        .find_map(|pair| pair.strip_prefix("code="))
+        .and_then(Secret::parse)
+        .expect("승인의 주소에 코드가 없습니다");
+    store
+        .exchange_code(&code, &verifier, &client, &redirect, None, NOW)
+        .unwrap();
+    // 만료가 하루가 되지 않은 동안은 아무것도 지우지 않는다
+    let soon = NOW + 60 * 60;
+    store
+        .invite("lee@example.com", &[ident("member")], soon)
+        .unwrap();
+    store
+        .request_link("lee@example.com", "/", &secret(8), soon)
+        .unwrap()
+        .unwrap();
+    for (table, count) in [
+        ("email_link", 2),
+        ("google_ticket", 1),
+        ("oauth_request", 1),
+        ("oauth_code", 1),
+        ("session", 2),
+        ("oauth_token", 2),
+    ] {
+        assert_eq!(bench.count(table), count, "{table}");
+    }
+
+    // 이틀 뒤 이가 새 링크로 들어온다(새 줄을 적는다). 쓴 지 오래됐거나 만료된 줄은 함께 지워진다
+    let later = NOW + 2 * LEFTOVER_RETENTION;
+    let link = store
+        .request_link("lee@example.com", "/", &secret(7), later)
+        .unwrap()
+        .unwrap();
+    store.enter(&link, &secret(7), later + 1).unwrap();
+    for (table, count) in [
+        // 이가 방금 받은 링크 하나
+        ("email_link", 1),
+        ("google_ticket", 0),
+        ("oauth_request", 0),
+        ("oauth_code", 0),
+        // 김의 살아 있는 세션과 이의 새 세션. 로그아웃한 세션은 지워졌다
+        ("session", 2),
+        // 만료 전인 refresh 토큰은 남는다(다시 쓰이면 그 승인을 거두는 근거다)
+        ("oauth_token", 1),
+    ] {
+        assert_eq!(bench.count(table), count, "{table}");
+    }
+    // 살아 있는 세션은 그대로 읽힌다
+    assert!(store.session(&live_session, later + 2).unwrap().is_some());
 }

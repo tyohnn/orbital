@@ -67,6 +67,9 @@ pub trait Runner: Send + Sync {
     fn build(&self, job: &Job<'_>) -> Result<(), RunError>;
     /// 서버를 띄운다. 요청을 받을 준비가 됐는지는 부르는 쪽이 포트로 확인한다.
     fn start(&self, job: &Job<'_>) -> Result<Box<dyn Running>, RunError>;
+    /// 끝나는 명령(적합성 테스트)을 `limit` 안에 끝까지 돌린다. 넘으면 낳은 프로세스까지 멈추고 [`RunError::TimedOut`] 이다.
+    /// 빌드와 같은 자리에서 같은 격리로 돈다.
+    fn check(&self, job: &Job<'_>, limit: Duration) -> Result<(), RunError>;
 }
 
 /// 개발용 실행기. 이 기계의 프로세스로 돌린다. 격리하지 않는다.
@@ -202,10 +205,10 @@ impl Drop for LocalProcess {
     }
 }
 
-impl Runner for LocalRunner {
-    fn build(&self, job: &Job<'_>) -> Result<(), RunError> {
+impl LocalRunner {
+    fn finish(job: &Job<'_>, limit: Duration) -> Result<(), RunError> {
         let mut child = Self::spawn(job)?;
-        match wait_until(&mut child, self.build_timeout) {
+        match wait_until(&mut child, limit) {
             Some(status) if status.success() => Ok(()),
             Some(status) => Err(RunError::Failed {
                 code: status.code(),
@@ -215,6 +218,16 @@ impl Runner for LocalRunner {
                 Err(RunError::TimedOut)
             }
         }
+    }
+}
+
+impl Runner for LocalRunner {
+    fn build(&self, job: &Job<'_>) -> Result<(), RunError> {
+        Self::finish(job, self.build_timeout)
+    }
+
+    fn check(&self, job: &Job<'_>, limit: Duration) -> Result<(), RunError> {
+        Self::finish(job, limit)
     }
 
     fn start(&self, job: &Job<'_>) -> Result<Box<dyn Running>, RunError> {

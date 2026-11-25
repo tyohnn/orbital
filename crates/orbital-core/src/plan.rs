@@ -21,11 +21,30 @@ use crate::name::{Ident, InstanceId, TableRef};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Names {
     instance: InstanceId,
+    /// 인스턴스의 database 대신 세울 자리. 되살릴 DB 를 옆 이름으로 세울 때만 있다([`Names::staged`]).
+    staged: Option<String>,
 }
 
 impl Names {
     pub fn new(instance: InstanceId) -> Self {
-        Self { instance }
+        Self {
+            instance,
+            staged: None,
+        }
+    }
+
+    /// 역할의 이름은 그대로 두고 database 만 `<머리말>_<꼬리>` 로 바꾼 이름들. 되살리기가 그 시점의 DB 를 이 자리에 레이어의 계획으로
+    /// 세운 뒤 운영 자리와 바꿔 넣는다. 꼬리는 소문자 · 숫자 · 밑줄만 받고, 머리말과 합쳐 63자를 넘지 않아야 한다.
+    pub fn staged(&self, tail: &str) -> Option<Self> {
+        let fine = !tail.is_empty()
+            && tail
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            && self.prefix().len() + 1 + tail.len() <= 63;
+        fine.then(|| Self {
+            instance: self.instance.clone(),
+            staged: Some(format!("{}_{tail}", self.prefix())),
+        })
     }
 
     pub fn instance(&self) -> &InstanceId {
@@ -38,7 +57,7 @@ impl Names {
     }
 
     pub fn database(&self) -> String {
-        self.prefix()
+        self.staged.clone().unwrap_or_else(|| self.prefix())
     }
 
     pub fn owner(&self) -> String {
@@ -603,6 +622,23 @@ pub(crate) mod tests {
                 set: true,
             }]
         );
+    }
+
+    #[test]
+    fn 옆_이름의_database_는_역할의_이름을_그대로_두고_database_만_바꾼다() {
+        let names = Names::new(InstanceId::parse("k3f9x2ab").unwrap());
+        let staged = names.staged("rs_0a1b").unwrap();
+        assert_eq!(staged.database(), "i_k3f9x2ab_rs_0a1b");
+        assert_eq!(staged.owner(), names.owner());
+        assert_eq!(staged.migrator(), names.migrator());
+        assert_eq!(staged.prefix(), names.prefix());
+        assert!(names.staged("x\"; DROP").is_none());
+        assert!(names.staged("").is_none());
+        assert!(names.staged(&"a".repeat(60)).is_none());
+        let steps = provision(&staged, &manifest());
+        assert!(steps.contains(&Step::CreateDatabase {
+            name: "i_k3f9x2ab_rs_0a1b".to_owned()
+        }));
     }
 
     #[test]

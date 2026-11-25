@@ -34,7 +34,7 @@ import type { CallToolResult } from "@modelcontextprotocol/client";
 import { createOrbital } from "@harmony/orbital/server";
 import type { Orbital } from "@harmony/orbital/server";
 
-import { CARD_META } from "../src/card.ts";
+import { CARD_META, ENTRY_META } from "../src/card.ts";
 import { packageFiles, zip } from "../src/pack.ts";
 import { CARD_URI, TOOLS } from "../src/tools.ts";
 
@@ -56,6 +56,10 @@ let factory: ChildProcess | undefined;
 let relay: HttpServer | undefined;
 /** 레이어의 주소(중계). 팩토리와 에이전트가 이 주소로 붙는다 */
 let layer = "";
+/** 레이어의 바깥 주소(중계를 거치지 않는다). 사람의 브라우저(카드)가 입력 표로 값을 보내는 곳이다 */
+let direct = "";
+/** 중계를 지난 모든 요청과 답의 본문 */
+const through: string[] = [];
 let origin = "";
 let orbital: Orbital;
 /** 팩토리가 service key 로 레이어에 보낸 요청 */
@@ -112,7 +116,7 @@ function wordAfter(text: string, marker: string): string
     return text.split(marker)[1]?.trim().split(/\s+/)[0] ?? "";
 }
 
-/** 에이전트가 고쳐 올리고 미리보기를 세운 뒤 승격을 요청한다. 요청한 release 를 돌려준다 */
+/** 에이전트가 고쳐 올리고 프리뷰를 세운 뒤 승격을 요청한다. 요청한 release 를 돌려준다 */
 async function shipChange(workspace: Workspace, folder: string, edit: (source: string) => string, message: string): Promise<string>
 {
     const work = join(scratch, folder);
@@ -137,7 +141,7 @@ async function startFactory(): Promise<void>
     const port = await freePort();
     origin = `http://127.0.0.1:${port}`;
     factory = spawn(process.execPath, [join(here, "src/main.ts")], {
-        env: { PATH: process.env.PATH ?? "", ORBITAL_URL: layer, ORBITAL_SERVICE_KEY: SERVICE_KEY, FACTORY_PORT: String(port), FACTORY_HOME: home },
+        env: { PATH: process.env.PATH ?? "", ORBITAL_URL: layer, ORBITAL_PUBLIC_URL: direct, ORBITAL_SERVICE_KEY: SERVICE_KEY, FACTORY_PORT: String(port), FACTORY_HOME: home },
         stdio: ["ignore", "pipe", "pipe"],
     });
     factory.stdout?.on("data", (chunk: Buffer) => { logs += chunk.toString("utf8"); });
@@ -280,6 +284,7 @@ before(async () =>
     home = join(scratch, "factory");
 
     const listen = `127.0.0.1:${await freePort()}`;
+    direct = `http://${listen}`;
     orbitald = spawn(bin("orbitald"), [], {
         stdio: "ignore",
         env: {
@@ -290,6 +295,10 @@ before(async () =>
             // 팩토리의 메일 키 없이 운영에 올린다. 개발용 메일함을 명시해 켠다
             ORBITAL_DEV_MAIL: "outbox",
             ORBITAL_LISTEN: listen,
+            // 비밀을 봉인하는 열쇠. 테스트에만 쓰는 값이다
+            ORBITAL_SEAL_KEY: "07".repeat(32),
+            // 입력 표의 주소가 이 아래에 선다. 카드는 중계(팩토리와 에이전트가 붙는 자리)를 거치지 않고 레이어에 바로 닿는다
+            ORBITAL_PUBLIC_URL: direct,
         },
     });
     orbital = createOrbital({ url: `http://${listen}`, serviceKey: SERVICE_KEY });
@@ -304,6 +313,7 @@ before(async () =>
         request.on("end", () =>
         {
             const body = Buffer.concat(chunks);
+            through.push(body.toString("utf8"));
             const headers: Record<string, string> = {};
             for (const name of ["authorization", "content-type"])
             {
@@ -322,8 +332,10 @@ before(async () =>
             fetch(`http://${listen}${request.url ?? "/"}`, { method, headers, ...(method === "GET" || method === "HEAD" ? {} : { body }) })
                 .then(async (answer) =>
                 {
+                    const bytes = Buffer.from(await answer.arrayBuffer());
+                    through.push(bytes.toString("utf8"));
                     response.writeHead(answer.status, { "content-type": answer.headers.get("content-type") ?? "application/octet-stream" });
-                    response.end(Buffer.from(await answer.arrayBuffer()));
+                    response.end(bytes);
                 })
                 .catch(() =>
                 {
@@ -553,7 +565,7 @@ test("승인하기는 화면 전용 도구라 모델에게 주는 도구 목록�
     const tools = (await client.listTools()).tools;
     const approve = tools.find((tool) => tool.name === "promotion_approve");
 
-    assert.deepEqual(tools.filter((tool) => modelVisible(tool._meta)).map((tool) => tool.name).sort(), ["production_status", "promotion_show", "workspace_open"]);
+    assert.deepEqual(tools.filter((tool) => modelVisible(tool._meta)).map((tool) => tool.name).sort(), ["production_status", "promotion_show", "secret_request", "workspace_open"]);
     // 화면은 부를 수 있다
     assert.deepEqual((approve?._meta as { ui?: { visibility?: unknown } } | undefined)?.ui?.visibility, ["app"]);
 
@@ -636,7 +648,7 @@ test("레이어가 승격을 거절하면 그 까닭을 사람이 읽는 문장�
     const client = await platform(await connect("alice"));
     const before = structured<{ release: string; url: string }>(await call(client, "production_status"));
 
-    // 미리보기에서는 뜨고 운영에서만 뜨지 않는 서버를 올린다
+    // 프리뷰에서는 뜨고 운영에서만 뜨지 않는 서버를 올린다
     await shipChange(alice, "alice", (source) => `if (process.env.ORBITAL_STAGE === "production") process.exit(1);\n${source.replace("version: 3", "version: 4")}`, "운영에서 뜨지 않는다");
     const seen = approveButton(cardOf(await call(client, "promotion_show")));
     assert.ok(seen !== undefined);
@@ -676,6 +688,139 @@ test("service key 는 어떤 도구의 답 · 오류 · 로그에도 실리지 �
     assert.ok(!logs.includes(SERVICE_KEY), "팩토리의 로그에 service key 가 있습니다");
     // 고객과 인스턴스의 짝을 둔 파일에도 없다
     assert.ok(!readFileSync(join(home, "customers.json"), "utf8").includes(SERVICE_KEY));
+});
+
+// ---- 비밀 ----
+
+/** 어디에 새어도 찾을 수 있게 드문 글자로 지은 값 */
+const BANK = "sk_live_bank_factory_T9wKq2Zm";
+const BANK_PREVIEW = "sk_test_bank_factory_R3vBn8Xc";
+
+/** dave 의 에이전트가 `[secrets] external` 에 은행의 키를 선언하고 프리뷰를 세운다. 한 번만 한다 */
+let daveReady: Promise<Workspace> | undefined;
+function daveDeclares(): Promise<Workspace>
+{
+    daveReady ??= (async () =>
+    {
+        const opened = structured<Workspace>(await call(await platform(await connect("dave")), "workspace_open"));
+        await agent(scratch, opened, "clone", "dave");
+        const work = join(scratch, "dave");
+        const manifest = readFileSync(join(work, "orbital.toml"), "utf8");
+        writeFileSync(join(work, "orbital.toml"), manifest.replace("generated = [\"SESSION_KEY\"]", "generated = [\"SESSION_KEY\"]\nexternal = [\"BANK_API_KEY\"]"));
+        git(work, "commit", "--quiet", "-am", "은행의 키를 밖에서 넣는다고 선언한다");
+        await agent(work, opened, "push");
+        await agent(work, opened, "preview");
+        return opened;
+    })();
+    return daveReady;
+}
+
+/** 카드가 하듯이: 화면 전용 도구로 입력 표를 받고, 그 주소(레이어)로 값을 바로 보낸다 */
+async function cardSends(client: Client, stage: "preview" | "production", value: string): Promise<{ url: string; status: number; opened: CallToolResult }>
+{
+    const opened = await call(client, "secret_entry_open", { name: "BANK_API_KEY", stage });
+    const entry = opened._meta?.[ENTRY_META] as { url?: unknown } | undefined;
+    assert.equal(typeof entry?.url, "string", JSON.stringify(opened));
+    const url = entry?.url as string;
+    const sent = await fetch(url, { method: "POST", headers: { origin: "https://card.example", "content-type": "application/json" }, body: JSON.stringify({ value }) });
+    return { url, status: sent.status, opened };
+}
+
+test("에이전트가 비밀을 요청하면 입력 카드가 돌아온다", { skip }, async () =>
+{
+    const workspace = await daveDeclares();
+    const client = await platform(await connect("dave"));
+
+    // 선언하지 않은 이름은 무엇을 고칠지와 함께 거절된다
+    const undeclared = await call(client, "secret_request", { name: "MAP_KEY", reason: "지도를 그립니다" });
+    assert.equal(undeclared.isError, true);
+    assert.match(textOf(undeclared), /\[secrets\] external/);
+
+    const shown = await call(client, "secret_request", { name: "BANK_API_KEY", reason: "송금 기능이 은행 API 를 부릅니다" });
+    assert.equal(shown.isError, undefined, textOf(shown));
+    assert.deepEqual(structured(shown), { name: "BANK_API_KEY", preview: false, production: false });
+    assert.match(textOf(shown), /값을 묻거나/);
+    const html = cardOf(shown);
+    assert.ok(html.includes("<code>BANK_API_KEY</code>"));
+    assert.ok(html.includes("송금 기능이 은행 API 를 부릅니다"));
+    assert.ok(html.includes(`data-stage="production"`) && html.includes(`data-stage="preview"`), "단계마다 칸이 있어야 합니다");
+    assert.ok(html.includes("프리뷰의 값은 에이전트가 볼 수 있으니 시험용 키를 넣으세요"));
+    // 카드는 화면 프레임으로 서고, 입력 표는 아직 없다
+    const tool = (await client.listTools()).tools.find((each) => each.name === "secret_request");
+    assert.deepEqual((tool?._meta as { ui?: unknown } | undefined)?.ui, { resourceUri: CARD_URI });
+    assert.equal(shown._meta?.[ENTRY_META], undefined);
+    // 레이어에 요청이 적혔다
+    const [secret] = await orbital.secrets.list(workspace.instance);
+    assert.equal(secret?.requested?.reason, "송금 기능이 은행 API 를 부릅니다");
+});
+
+test("입력 표를 내는 도구는 모델에게 보이지 않는다", { skip }, async () =>
+{
+    await daveDeclares();
+    const client = await platform(await connect("dave"));
+    const tools = (await client.listTools()).tools;
+    const open = tools.find((tool) => tool.name === "secret_entry_open");
+    assert.ok(open !== undefined);
+    assert.equal(modelVisible(open._meta), false);
+    assert.deepEqual((open._meta as { ui?: { visibility?: unknown } } | undefined)?.ui?.visibility, ["app"]);
+    assert.ok(tools.filter((tool) => modelVisible(tool._meta)).every((tool) => tool.name !== "secret_entry_open"));
+
+    // 화면이 부르면 표가 든 주소는 화면에만 가는 _meta 에 온다. 모델이 읽는 글과 structuredContent 에는 없다
+    const opened = await call(client, "secret_entry_open", { name: "BANK_API_KEY", stage: "preview" });
+    const url = (opened._meta?.[ENTRY_META] as { url: string }).url;
+    const ticket = url.split("/").at(-1) ?? "";
+    assert.equal(ticket.length, 64);
+    assert.ok(!textOf(opened).includes(ticket));
+    assert.ok(!JSON.stringify(opened.structuredContent).includes(ticket));
+});
+
+test("카드가 보낸 값은 팩토리 서버를 지나지 않고 레이어에 닿는다", { skip }, async () =>
+{
+    const workspace = await daveDeclares();
+    const client = await platform(await connect("dave"));
+
+    // 카드는 레이어의 바깥 주소에만 닿을 수 있다(CSP)
+    const frame = (await client.readResource({ uri: CARD_URI })).contents[0];
+    const csp = (frame?._meta as { ui?: { csp?: { connectDomains?: string[] } } } | undefined)?.ui?.csp;
+    assert.deepEqual(csp?.connectDomains, [direct]);
+
+    for (const [stage, value] of [["production", BANK], ["preview", BANK_PREVIEW]] as const)
+    {
+        const { url, status } = await cardSends(client, stage, value);
+        assert.equal(status, 200);
+        assert.equal(new URL(url).origin, direct);
+        assert.notEqual(new URL(url).origin, origin);
+        assert.notEqual(new URL(url).origin, new URL(layer).origin);
+    }
+    const [secret] = await orbital.secrets.list(workspace.instance);
+    assert.deepEqual([secret?.preview.set, secret?.production.set], [true, true]);
+    // 팩토리가 레이어에 보낸 것과, 팩토리와 레이어 사이를 지난 모든 것에 값이 없다
+    const relayed = [...through, JSON.stringify(sent)].join("\n");
+    for (const value of [BANK, BANK_PREVIEW])
+    {
+        assert.ok(!relayed.includes(value), `팩토리와 레이어 사이에 \`${value}\` 가 지났습니다`);
+    }
+    // 다시 요청한 카드는 두 칸이 찼다고 보인다
+    const again = await call(client, "secret_request", { name: "BANK_API_KEY", reason: "송금 기능이 은행 API 를 부릅니다" });
+    assert.deepEqual(structured(again), { name: "BANK_API_KEY", preview: true, production: true });
+});
+
+test("도구의 답과 팩토리의 로그에 값이 실리지 않는다", { skip }, async () =>
+{
+    await daveDeclares();
+    const client = await platform(await connect("dave"));
+    // 값을 바꾸고, 틀린 단계와 틀린 이름으로도 불러 본다
+    const { status } = await cardSends(client, "production", `${BANK}-2`);
+    assert.equal(status, 200);
+    assert.equal((await call(client, "secret_entry_open", { name: "BANK_API_KEY", stage: "staging" })).isError, true);
+    assert.equal((await call(client, "secret_entry_open", { name: "MAP_KEY", stage: "production" })).isError, true);
+    await call(client, "secret_request", { name: "BANK_API_KEY", reason: "다시" });
+
+    const everything = [...received, logs, readFileSync(join(home, "customers.json"), "utf8"), ...through].join("\n");
+    for (const value of [BANK, BANK_PREVIEW])
+    {
+        assert.ok(!everything.includes(value), `\`${value}\` 가 새었습니다`);
+    }
 });
 
 /** 저장 방식(stored)의 ZIP 을 읽는다. 중앙 디렉터리를 따라 이름과 내용을 꺼내고 CRC 를 견준다 */
@@ -720,7 +865,7 @@ function frontmatter(body: string): Record<string, string>
 test("패키지는 MCP 서버 하나와 스킬 하나를 묶고 훅이 없다 — 하모니와 클로드가 같은 ZIP 을 받는다", () =>
 {
     const files = unzip(zip(packageFiles()));
-    assert.deepEqual([...files.keys()].sort(), [".claude-plugin/plugin.json", ".mcp.json", "plugin.json", "skills/orbital-dev/SKILL.md", "skills/orbital-dev/references/auth.md"]);
+    assert.deepEqual([...files.keys()].sort(), [".claude-plugin/plugin.json", ".mcp.json", "plugin.json", "skills/orbital-dev/SKILL.md", "skills/orbital-dev/references/auth.md", "skills/orbital-dev/references/secrets.md"]);
     assert.ok(![...files.keys()].some((path) => path.startsWith("hooks/")));
 
     // 하모니(os-playground 의 `readBundle`)가 보는 것: 앱 번호와 버전, 훅이 없음, MCP 서버 하나의 원격 주소

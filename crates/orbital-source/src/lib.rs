@@ -122,6 +122,23 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAIN: &str = "refs/heads/main";
 const BASE: &str = "refs/orbital/base";
 const INCOMING: &str = "refs/orbital/incoming";
+/// 앱(위쪽)에서 받아 둔 commit. 업데이트 하나마다 `refs/orbital/upstream/<commit>` 하나다.
+const UPSTREAM: &str = "refs/orbital/upstream";
+/// 앱의 버전들을 받아 오는 자리.
+const APP: &str = "refs/orbital/app";
+/// 열린 rollout 의 업데이트 commit. 묶음에 함께 담겨, 에이전트가 받은 저장소에서 `origin/update` 로 보인다.
+const UPDATE: &str = "refs/heads/update";
+
+/// 레이어가 업데이트를 합쳐 본 결과.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Merged {
+    /// `main` 이 이미 업데이트를 담고 있다. 아무것도 하지 않았다.
+    Already(Commit),
+    /// 충돌 없이 합쳐 새 commit 을 `main` 에 세웠다.
+    Merged(Commit),
+    /// 충돌했다. 저장소를 건드리지 않았다. 충돌한 파일의 이름이다.
+    Conflicts(Vec<String>),
+}
 
 /// 레이어의 코드 저장소들이 사는 폴더.
 #[derive(Debug, Clone)]
@@ -252,11 +269,13 @@ impl SourceStore {
     /// `HEAD` 를 함께 담는다. 빠지면 받은 쪽의 `git clone` 이 어느 브랜치를 꺼낼지 몰라 빈 작업 폴더가 된다.
     pub fn bundle(&self, instance: &InstanceId) -> Result<Vec<u8>, Error> {
         let path = self.existing(instance)?;
-        Self::output(
-            Self::git(&path).args(["bundle", "create", "--quiet", "-", "HEAD", MAIN]),
-            "묶음을 만들",
-        )?
-        .ok_or(failed("묶음을 만들"))
+        let mut command = Self::git(&path);
+        command.args(["bundle", "create", "--quiet", "-", "HEAD", MAIN]);
+        // 열린 rollout 의 업데이트가 있으면 함께 담는다. 에이전트가 충돌을 풀 때 `git merge origin/update` 로 쓴다
+        if Self::resolve(&path, UPDATE)?.is_some() {
+            command.arg(UPDATE);
+        }
+        Self::output(&mut command, "묶음을 만들")?.ok_or(failed("묶음을 만들"))
     }
 
     /// 에이전트가 올린 묶음을 받는다. `main` 의 이력을 잇는 것만 받고, 받으면 `main` 이 그 끝으로 옮겨 간다.
@@ -397,6 +416,230 @@ impl SourceStore {
         }
     }
 
+    /// `ancestor` 가 `commit` 의 조상(같은 것 포함)인가. 둘 다 이 저장소에 있어야 한다. 없으면 `false` 다.
+    pub fn descends(
+        &self,
+        instance: &InstanceId,
+        commit: &Commit,
+        ancestor: &Commit,
+    ) -> Result<bool, Error> {
+        let path = self.existing(instance)?;
+        Self::is_ancestor(&path, ancestor, commit)
+    }
+
+    fn is_ancestor(path: &Path, ancestor: &Commit, commit: &Commit) -> Result<bool, Error> {
+        Ok(Self::git(path)
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                ancestor.as_str(),
+                commit.as_str(),
+            ])
+            .stdout(Stdio::null())
+            .status()
+            .map_err(|_| failed("이력을 견주"))?
+            .success())
+    }
+
+    /// 앱(위쪽)의 commit 하나를 이 인스턴스의 저장소로 받아 둔다. 이 commit 을 열린 rollout 의 업데이트로 묶음에 담는다.
+    ///
+    /// 앱의 저장소에서 그 commit 을 담은 버전(브랜치 · 태그)을 모두 받고, 받은 commit 을 `refs/orbital/upstream/` 에 적는다.
+    pub fn fetch_upstream(
+        &self,
+        instance: &InstanceId,
+        app: &Path,
+        commit: &Commit,
+    ) -> Result<(), Error> {
+        let path = self.existing(instance)?;
+        Self::output(
+            Self::git(&path)
+                .args(["fetch", "--quiet", "--no-tags", "--force"])
+                .arg(app)
+                .arg(format!("refs/heads/*:{APP}/heads/*"))
+                .arg(format!("refs/tags/*:{APP}/tags/*")),
+            "앱의 업데이트를 받",
+        )?
+        .ok_or(failed("앱의 업데이트를 받"))?;
+        if Self::resolve(&path, commit.as_str())?.is_none() {
+            return Err(Error::NoSuchCommit);
+        }
+        for name in [format!("{UPSTREAM}/{commit}"), UPDATE.to_owned()] {
+            Self::output(
+                Self::git(&path).args(["update-ref", &name, commit.as_str()]),
+                "업데이트를 적",
+            )?
+            .ok_or(failed("업데이트를 적"))?;
+        }
+        Ok(())
+    }
+
+    /// 묶음에 담던 업데이트를 뺀다. rollout 을 거뒀을 때 부른다. 받아 둔 commit 은 남긴다.
+    pub fn clear_update(&self, instance: &InstanceId) -> Result<(), Error> {
+        let path = self.existing(instance)?;
+        let _ = Self::output(
+            Self::git(&path).args(["update-ref", "-d", UPDATE]),
+            "업데이트를 빼",
+        )?;
+        Ok(())
+    }
+
+    /// `commit` 이 담은 위쪽 commit 가운데 가장 새 것. 갈라진 기준점과 받아 둔 업데이트 가운데, 다른 후보의 조상이 아닌 것을 고른다.
+    pub fn newest_upstream(
+        &self,
+        instance: &InstanceId,
+        commit: &Commit,
+    ) -> Result<Option<Commit>, Error> {
+        let path = self.existing(instance)?;
+        let listed = Self::output(
+            Self::git(&path).args(["for-each-ref", "--format=%(objectname)", UPSTREAM]),
+            "받아 둔 업데이트를 읽",
+        )?
+        .unwrap_or_default();
+        let mut candidates: Vec<Commit> = String::from_utf8_lossy(&listed)
+            .lines()
+            .filter_map(Commit::parse)
+            .collect();
+        if let Some(base) = Self::resolve(&path, BASE)? {
+            candidates.push(base);
+        }
+        let mut contained = Vec::new();
+        for candidate in candidates {
+            if !contained.contains(&candidate) && Self::is_ancestor(&path, &candidate, commit)? {
+                contained.push(candidate);
+            }
+        }
+        for candidate in &contained {
+            let mut newest = true;
+            for other in &contained {
+                if other != candidate && Self::is_ancestor(&path, candidate, other)? {
+                    newest = false;
+                    break;
+                }
+            }
+            if newest {
+                return Ok(Some(candidate.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `main` 에 업데이트 commit 을 기계적으로 합친다(`git merge` 와 같은 판정). 에이전트를 돌리지 않는다.
+    ///
+    /// 충돌이 없으면 합친 commit 을 `main` 에 세우고, 충돌하면 저장소를 건드리지 않고 충돌한 파일의 이름만 돌려준다.
+    pub fn merge(&self, instance: &InstanceId, update: &Commit) -> Result<Merged, Error> {
+        let path = self.existing(instance)?;
+        let head = Self::resolve(&path, MAIN)?.ok_or(failed("최신 commit 을 찾"))?;
+        if Self::resolve(&path, update.as_str())?.is_none() {
+            return Err(Error::NoSuchCommit);
+        }
+        if Self::is_ancestor(&path, update, &head)? {
+            return Ok(Merged::Already(head));
+        }
+        let output = Self::git(&path)
+            .args([
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                "-z",
+                head.as_str(),
+                update.as_str(),
+            ])
+            .output()
+            .map_err(|_| failed("업데이트를 합쳐 보"))?;
+        let mut parts = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned());
+        let tree = parts.next().unwrap_or_default();
+        match output.status.code() {
+            Some(0) => {}
+            Some(1) => {
+                let mut files: Vec<String> = parts.collect();
+                files.sort();
+                files.dedup();
+                return Ok(Merged::Conflicts(files));
+            }
+            _ => return Err(failed("업데이트를 합쳐 보")),
+        }
+        if !(tree.len() == 40 && tree.chars().all(|c| c.is_ascii_hexdigit())) {
+            return Err(failed("업데이트를 합쳐 보"));
+        }
+        let message = format!("Orbital: 업데이트 {} 를 합칩니다", &update.as_str()[..12]);
+        let made = Self::output(
+            Self::git(&path)
+                .env("GIT_AUTHOR_NAME", "Orbital")
+                .env("GIT_AUTHOR_EMAIL", "layer@orbital.invalid")
+                .env("GIT_COMMITTER_NAME", "Orbital")
+                .env("GIT_COMMITTER_EMAIL", "layer@orbital.invalid")
+                .args([
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    head.as_str(),
+                    "-p",
+                    update.as_str(),
+                    "-m",
+                    &message,
+                ]),
+            "합친 commit 을 만들",
+        )?
+        .and_then(|bytes| Commit::parse(&String::from_utf8_lossy(&bytes)))
+        .ok_or(failed("합친 commit 을 만들"))?;
+        // 그사이 다른 올리기가 main 을 옮겼으면 실패한다
+        Self::output(
+            Self::git(&path).args(["update-ref", MAIN, made.as_str(), head.as_str()]),
+            "main 을 옮기",
+        )?
+        .ok_or(Error::NotFastForward)?;
+        Ok(Merged::Merged(made))
+    }
+
+    /// commit 하나에서 폴더 하나를 꺼내 `into` 아래 같은 자리에 둔다. 적합성 테스트의 자리에 위쪽의 폴더를 놓을 때 쓴다.
+    /// 폴더가 그 commit 에 없으면 `Ok(false)` 다.
+    pub fn export_folder(
+        &self,
+        instance: &InstanceId,
+        commit: &Commit,
+        folder: &str,
+        into: &Path,
+    ) -> Result<bool, Error> {
+        let path = self.known(instance, commit)?;
+        let folder = checked(folder)?;
+        let spec = format!("{commit}:{folder}");
+        let present = Self::git(&path)
+            .args(["cat-file", "-e", &spec])
+            .stdout(Stdio::null())
+            .status()
+            .map_err(|_| failed("폴더를 찾"))?
+            .success();
+        if !present {
+            return Ok(false);
+        }
+        fs::create_dir_all(into).map_err(|_| failed("꺼낼 폴더를 만들"))?;
+        let mut archive = Self::git(&path)
+            .args(["archive", "--format=tar", commit.as_str(), "--", folder])
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|_| failed("폴더를 꺼내"))?;
+        let stream = archive.stdout.take().ok_or(failed("폴더를 꺼내"))?;
+        let unpacked = Command::new("tar")
+            .arg("-x")
+            .arg("-C")
+            .arg(into)
+            .stdin(stream)
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|_| failed("폴더를 풀"))?;
+        let archived = archive.wait().map_err(|_| failed("폴더를 꺼내"))?;
+        if archived.success() && unpacked.success() {
+            Ok(true)
+        } else {
+            Err(failed("폴더를 꺼내"))
+        }
+    }
+
     /// 인스턴스의 저장소를 지운다. 되돌릴 수 없다.
     pub fn destroy(&self, instance: &InstanceId) -> Result<(), Error> {
         let path = self.path(instance);
@@ -404,6 +647,38 @@ impl SourceStore {
             fs::remove_dir_all(path).map_err(|_| failed("저장소를 지우"))?;
         }
         Ok(())
+    }
+}
+
+/// 앱(스캐폴드)의 저장소에서 commit 하나를 찾는다. `reference` 가 없으면 `main` 의 끝이다.
+pub fn app_commit(repository: &Path, reference: Option<&str>) -> Result<Commit, Error> {
+    if !repository.join("HEAD").is_file() {
+        return Err(Error::NoSuchCommit);
+    }
+    let name = match reference {
+        None => MAIN,
+        Some(text) => Commit::parse(text)
+            .map(|_| text)
+            .ok_or(Error::NoSuchCommit)?,
+    };
+    let commit = SourceStore::resolve(repository, name)?.ok_or(Error::NoSuchCommit)?;
+    // 앱의 버전(브랜치 · 태그)에서 닿는 commit 만 받는다. 저장소에 떠도는 객체는 업데이트가 아니다
+    let reachable = SourceStore::output(
+        SourceStore::git(repository).args([
+            "for-each-ref",
+            "--contains",
+            commit.as_str(),
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/tags",
+        ]),
+        "앱의 버전을 읽",
+    )?
+    .is_some_and(|bytes| !bytes.is_empty());
+    if reachable {
+        Ok(commit)
+    } else {
+        Err(Error::NoSuchCommit)
     }
 }
 

@@ -683,7 +683,7 @@ fn 행_단위_규칙은_연결의_업무_역할을_안다() {
     assert_eq!(role, "employee");
 }
 
-// ---- 예행연습과 되돌리기 ----
+// ---- 리허설과 되돌리기 ----
 
 fn databases(bench: &Bench) -> Vec<String> {
     let mut client = bench.admin.connect_as("postgres", "postgres").unwrap();
@@ -700,7 +700,7 @@ fn databases(bench: &Bench) -> Vec<String> {
 }
 
 #[test]
-fn 예행연습은_숫자만_돌려주고_운영은_그대로다() {
+fn 리허설은_숫자만_돌려주고_운영은_그대로다() {
     let mut bench = bench!();
     let result = bench
         .admin
@@ -742,7 +742,7 @@ fn 예행연습은_숫자만_돌려주고_운영은_그대로다() {
 }
 
 #[test]
-fn 예행연습의_사본은_끝나면_지워진다() {
+fn 리허설의_사본은_끝나면_지워진다() {
     let mut bench = bench!();
     bench
         .admin
@@ -759,7 +759,7 @@ fn 예행연습의_사본은_끝나면_지워진다() {
 }
 
 #[test]
-fn 실패한_예행연습은_몇_번째에서_멈췄는지와_sqlstate_만_돌려준다() {
+fn 실패한_리허설은_몇_번째에서_멈췄는지와_sqlstate_만_돌려준다() {
     let mut bench = bench!();
     let result = bench
         .admin
@@ -891,7 +891,7 @@ fn role_exists(bench: &Bench, name: &str) -> bool {
 }
 
 #[test]
-fn 예행연습의_마이그레이션이_역할을_되돌려도_관리_권한을_얻지_못한다() {
+fn 리허설의_마이그레이션이_역할을_되돌려도_관리_권한을_얻지_못한다() {
     let mut bench = bench!();
     let intruder = format!("{}_x_intruder", bench.names.prefix());
     let attack = format!("RESET ROLE; CREATE ROLE \"{intruder}\" SUPERUSER LOGIN");

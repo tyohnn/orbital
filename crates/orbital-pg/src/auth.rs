@@ -18,7 +18,8 @@ use orbital_core::google::ticket_expires_at;
 use orbital_core::manifest::{Signup, ValidManifest};
 use orbital_core::name::Ident;
 use orbital_core::plan::Names;
-use postgres::{Client, Transaction};
+use orbital_core::sweep::{Leftover, sweep_before};
+use postgres::{Client, GenericClient, Transaction};
 use sha2::{Digest, Sha256};
 
 use crate::{Admin, Error, pg, quote};
@@ -364,6 +365,14 @@ CREATE TABLE IF NOT EXISTS orbital_auth.oauth_token (
 CREATE INDEX IF NOT EXISTS oauth_token_grant ON orbital_auth.oauth_token (grant_id);
 CREATE INDEX IF NOT EXISTS oauth_token_code ON orbital_auth.oauth_token (code_hash);
 CREATE INDEX IF NOT EXISTS oauth_grant_user ON orbital_auth.oauth_grant (user_id);
+-- 쓰고 남은 줄을 새 줄을 적을 때마다 치운다. 표 전체를 훑지 않게 만료 시각에 색인을 둔다
+CREATE INDEX IF NOT EXISTS email_link_expires ON orbital_auth.email_link (expires_at);
+CREATE INDEX IF NOT EXISTS google_ticket_expires ON orbital_auth.google_ticket (expires_at);
+CREATE INDEX IF NOT EXISTS oauth_request_expires ON orbital_auth.oauth_request (expires_at);
+CREATE INDEX IF NOT EXISTS oauth_code_expires ON orbital_auth.oauth_code (expires_at);
+CREATE INDEX IF NOT EXISTS session_expires ON orbital_auth.session (expires_at);
+CREATE INDEX IF NOT EXISTS session_revoked ON orbital_auth.session (revoked_at) WHERE revoked_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS oauth_token_expires ON orbital_auth.oauth_token (expires_at);
 
 REVOKE ALL ON ALL TABLES IN SCHEMA orbital_auth FROM PUBLIC;
 
@@ -487,7 +496,7 @@ impl Admin {
             .map_err(pg("로그인의 표를 두기를 마무리"))
     }
 
-    /// 미리보기의 DB 에 씨앗 사용자를 넣는다. **운영에는 부르지 않는다.** 마이그레이션 뒤, 씨앗 데이터의 SQL 앞에 부른다.
+    /// 프리뷰의 DB 에 씨앗 사용자를 넣는다. **운영에는 부르지 않는다.** 마이그레이션 뒤, 씨앗 데이터의 SQL 앞에 부른다.
     ///
     /// 씨앗 사용자의 식별자(`u1` 같은)는 `u_` 모양이 아니다. 그래서 씨앗 사용자가 있을 때만 이 database 의 식별자 규칙을
     /// 「`u_` 모양이거나 선언의 이름 모양(`Ident`)」으로 넓힌다. 운영 DB 의 규칙은 넓어지지 않는다.
@@ -582,6 +591,38 @@ impl AuthStore {
 pub struct AuthStore {
     pub(crate) client: Client,
     pub(crate) manifest: ValidManifest,
+}
+
+/// 쓰고 남은 줄이 있는 표. 글자로 고정한 이름이라 SQL 에 바로 넣는다.
+fn leftover_table(kind: Leftover) -> &'static str {
+    match kind {
+        Leftover::EmailLink => "orbital_auth.email_link",
+        Leftover::GoogleTicket => "orbital_auth.google_ticket",
+        Leftover::OauthRequest => "orbital_auth.oauth_request",
+        Leftover::OauthCode => "orbital_auth.oauth_code",
+        Leftover::Session => "orbital_auth.session",
+        Leftover::OauthToken => "orbital_auth.oauth_token",
+    }
+}
+
+/// 쓰고 남은 줄을 지운다. 새 줄을 적는 자리(링크 · Google 의 표 · 세션 · 인가 요청)가 같은 연결에서 함께 부른다.
+/// 어느 줄을 지울지는 core 의 `sweep` 이 정한다(만료나, 세션이면 거둔 때에서 하루가 지난 줄).
+pub(crate) fn sweep(client: &mut impl GenericClient, now: u64) -> Result<(), AuthError> {
+    let before = seconds(sweep_before(now));
+    for kind in Leftover::ALL {
+        let table = leftover_table(kind);
+        let sql = if kind.counts_revocation() {
+            format!(
+                "DELETE FROM {table} WHERE expires_at <= to_timestamp($1::bigint) OR revoked_at <= to_timestamp($1::bigint)"
+            )
+        } else {
+            format!("DELETE FROM {table} WHERE expires_at <= to_timestamp($1::bigint)")
+        };
+        client
+            .execute(sql.as_str(), &[&before])
+            .map_err(db("쓰고 남은 줄을 지우"))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn seconds(now: u64) -> i64 {
@@ -699,6 +740,7 @@ impl AuthStore {
         if !may_create_link(unix(last), now) {
             return Ok(None);
         }
+        sweep(&mut transaction, now)?;
         let token = Secret::generate()?;
         transaction
             .execute(
@@ -797,6 +839,7 @@ impl AuthStore {
         browser_hash: &[u8],
         now: u64,
     ) -> Result<Secret, AuthError> {
+        sweep(&mut self.client, now)?;
         let ticket = Secret::generate()?;
         self.client
             .execute(
@@ -909,7 +952,7 @@ impl AuthStore {
         })
     }
 
-    /// 링크 없이 사용자의 세션을 만든다. **미리보기의 router 만 부른다**(씨앗 사용자로 들어가기). 운영의 router 에는 이 길이 없다.
+    /// 링크 없이 사용자의 세션을 만든다. **프리뷰의 router 만 부른다**(씨앗 사용자로 들어가기). 운영의 router 에는 이 길이 없다.
     pub fn start_session(
         &mut self,
         user_id: &str,
@@ -1189,6 +1232,7 @@ fn create_session(
     user_id: &str,
     now: u64,
 ) -> Result<Secret, AuthError> {
+    sweep(transaction, now)?;
     let session = Secret::generate()?;
     transaction
         .execute(

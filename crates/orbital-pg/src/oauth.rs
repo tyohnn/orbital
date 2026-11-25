@@ -17,7 +17,7 @@ use orbital_core::oauth::{
 use postgres::Transaction;
 use sha2::{Digest, Sha256};
 
-use crate::auth::{AuthError, AuthStore, Secret, SessionUser, db, random_id, seconds, unix};
+use crate::auth::{AuthError, AuthStore, Secret, SessionUser, db, random_id, seconds, sweep, unix};
 
 /// 인가 서버가 아는 클라이언트.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +239,7 @@ impl AuthStore {
         request: &Accepted,
         now: u64,
     ) -> Result<Secret, AuthError> {
+        sweep(&mut self.client, now)?;
         let id = Secret::generate()?;
         self.client
             .execute(

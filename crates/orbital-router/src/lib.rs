@@ -1,4 +1,5 @@
-//! router. 인스턴스(미리보기나 운영)마다 하나가 포트 하나를 듣는다.
+//! router. 인스턴스(프리뷰나 운영)마다 하나가 선다. 포트 하나를 듣거나([`serve`]), 레이어의 주소 하나를 하위 도메인으로 나눠 듣는다([`serve_hosts`]).
+//! 서버 서비스는 요청이 없으면 자고 첫 요청에 깬다([`AppServer`]).
 //!
 //! 요청을 선언의 서비스 `path` 가운데 가장 길게 맞는 서비스로 가른다. 서버 서비스에는 HTTP/1.1 로 흘려보내고, 정적 서비스는
 //! 빌드 결과의 폴더에서 파일을 내준다. `/_orbital/` 은 router 가 직접 답한다(로그인의 뒤쪽).
@@ -15,24 +16,25 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full, Limited};
-use hyper::body::Incoming;
+use hyper::body::{Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use orbital_core::auth::{
     Admission, InvitationRefusal, LinkRefusal, SESSION_TTL, admit, route, safe_next, same_origin,
     static_file, wants_page,
 };
+use orbital_core::host::{BaseDomain, HostTarget, judge_host};
 use orbital_core::manifest::{Auth, ValidManifest};
 use orbital_core::oauth::is_mcp_path;
 use orbital_core::plan::Names;
@@ -72,6 +74,8 @@ const HOP_BY_HOP: [&str; 9] = [
 ];
 
 mod oauth;
+mod wake;
+pub use wake::{AppServer, Starter, WakeFailure};
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
@@ -111,7 +115,7 @@ impl std::fmt::Display for MailFailure {
     }
 }
 
-/// 로그인 링크를 보내는 것. 운영에서는 팩토리의 키로 보내고([`Resend`]), 개발용은 보내는 대신 쌓는다. 미리보기의 router 는 부르지 않는다.
+/// 로그인 링크를 보내는 것. 운영에서는 팩토리의 키로 보내고([`Resend`]), 개발용은 보내는 대신 쌓는다. 프리뷰의 router 는 부르지 않는다.
 pub trait Mailer: Send + Sync {
     /// 한 통을 보낸다. 실패해도 링크 요청의 답은 같고, router 는 까닭의 갈래만 기록에 남긴다.
     fn send(&self, mail: Mail) -> Result<(), MailFailure>;
@@ -307,25 +311,29 @@ impl DocumentFetcher for HttpsFetcher {
 
 // ---- 설정 ----
 
-/// router 가 선 자리. 씨앗 사용자로 들어가는 길은 미리보기에만 있다.
+/// router 가 선 자리. 씨앗 사용자로 들어가는 길은 프리뷰에만 있다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Preview,
     Production,
 }
 
-/// 서비스 하나가 요청을 받는 자리. 이 주소는 router 만 알고 밖에 알리지 않는다.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 서비스 하나가 요청을 받는 자리. 서버의 포트는 router 만 알고 밖에 알리지 않는다.
+#[derive(Clone)]
 pub enum Target {
-    Server { port: u16 },
-    Static { folder: PathBuf },
+    /// 서버 서비스. 자고 있으면 첫 요청에 깨운다.
+    Server(Arc<AppServer>),
+    Static {
+        folder: PathBuf,
+    },
 }
 
 /// 인증 역할의 연결을 새로 여는 것.
 pub type Connect = Arc<dyn Fn() -> Result<AuthStore, AuthError> + Send + Sync>;
 
 pub struct Config {
-    /// router 의 바깥 주소(`http://127.0.0.1:4100`). 링크의 주소와 `Origin` 검사가 이것을 쓴다. 요청의 `Host` 는 믿지 않는다.
+    /// router 의 바깥 주소(`http://127.0.0.1:4100` 이거나 하위 도메인 `https://<인스턴스>.<기준 도메인>`).
+    /// 링크의 주소 · `Origin` 검사 · OAuth 의 발급자가 이것을 쓴다. 요청의 `Host` 로 짓지 않는다.
     pub origin: String,
     pub manifest: ValidManifest,
     pub names: Names,
@@ -336,7 +344,7 @@ pub struct Config {
     pub auth: Option<Connect>,
     pub mailer: Arc<dyn Mailer>,
     pub stage: Stage,
-    /// 미리보기의 씨앗 사용자. 이 식별자로만 링크 없이 들어간다.
+    /// 프리뷰의 씨앗 사용자. 이 식별자로만 링크 없이 들어간다.
     pub seed_users: Vec<String>,
     /// 요청마다 한 줄(메서드, 질의를 뗀 경로, 상태)을 적는 파일.
     pub log: Option<PathBuf>,
@@ -383,7 +391,7 @@ impl Pool {
         };
         let pool = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            // 연결이 끊겼으면(운영 DB 의 문을 잠깐 닫는 예행연습 같은) 한 번만 새로 열어 다시 한다
+            // 연결이 끊겼으면(운영 DB 의 문을 잠깐 닫는 리허설 같은) 한 번만 새로 열어 다시 한다
             for _ in 0..2 {
                 let idle = pool.idle.lock().ok().and_then(|mut idle| idle.pop());
                 let mut store = match idle {
@@ -625,40 +633,177 @@ fn query_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 struct State {
     config: Config,
     pool: Option<Arc<Pool>>,
-    client: Client<HttpConnector, Body>,
-    log: Mutex<()>,
+    log: Arc<Mutex<()>>,
 }
 
-/// 요청을 듣는다. 이 future 를 내리면(abort) 붙어 있던 연결도 모두 내린다.
-pub async fn serve(listener: TcpListener, config: Config) -> std::io::Result<()> {
-    let pool = config.auth.clone().map(|connect| {
-        Arc::new(Pool {
-            connect,
-            idle: Mutex::new(Vec::new()),
-            permits: Semaphore::new(POOL_SIZE),
-        })
-    });
-    let state = Arc::new(State {
-        config,
-        pool,
-        // 앱으로 가는 연결은 살려 두고 다시 쓴다
-        client: Client::builder(TokioExecutor::new()).build_http(),
-        log: Mutex::new(()),
-    });
+/// 기록의 파일과 그 자물쇠. 요청 밖에서 도는 일이 들고 다닌다.
+#[derive(Clone)]
+struct Note {
+    log: Option<PathBuf>,
+    lock: Arc<Mutex<()>>,
+}
+
+impl Note {
+    /// 한 줄을 적는다. 값(받는 주소 · 링크 · 키)을 싣지 않는 갈래와 이름만 넘긴다.
+    fn line(&self, text: &str) {
+        let Some(log) = &self.log else {
+            return;
+        };
+        let _guard = self.lock.lock();
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log) {
+            let _ = writeln!(file, "{text}");
+        }
+    }
+}
+
+/// 인스턴스(프리뷰나 운영) 하나의 router. 포트 하나를 듣거나([`serve`]), 여러 인스턴스가 주소 하나를 나눠 듣는다([`serve_hosts`]).
+#[derive(Clone)]
+pub struct Router {
+    state: Arc<State>,
+}
+
+impl Router {
+    pub fn new(config: Config) -> Self {
+        let pool = config.auth.clone().map(|connect| {
+            Arc::new(Pool {
+                connect,
+                idle: Mutex::new(Vec::new()),
+                permits: Semaphore::new(POOL_SIZE),
+            })
+        });
+        let log = Arc::new(Mutex::new(()));
+        let note = Note {
+            log: config.log.clone(),
+            lock: Arc::clone(&log),
+        };
+        for target in config.targets.values() {
+            if let Target::Server(server) = target {
+                server.attach(note.clone());
+            }
+        }
+        Self {
+            state: Arc::new(State { config, pool, log }),
+        }
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+/// 받은 연결마다 요청을 듣는다. 요청마다 어느 router 가 답할지 `pick` 이 고른다. 이 future 를 내리면(abort) 붙어 있던 연결도 모두 내린다.
+async fn accept<F>(listener: TcpListener, pick: Arc<F>) -> std::io::Result<()>
+where
+    F: Fn(&Request<Incoming>) -> Option<Router> + Send + Sync + 'static,
+{
     let mut connections = JoinSet::new();
     loop {
         let (stream, _) = listener.accept().await?;
         while connections.try_join_next().is_some() {}
-        let state = Arc::clone(&state);
+        let pick = Arc::clone(&pick);
         connections.spawn(async move {
-            let service = service_fn(move |request| {
-                let state = Arc::clone(&state);
-                async move { Ok::<_, Infallible>(state.handle(request).await) }
+            let service = service_fn(move |request: Request<Incoming>| {
+                let router = pick(&request);
+                async move {
+                    Ok::<_, Infallible>(match router {
+                        Some(router) => router.state.handle(request).await,
+                        None => error(StatusCode::NOT_FOUND, "not_found"),
+                    })
+                }
             });
             let _ = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
                 .await;
         });
+    }
+}
+
+/// 인스턴스 하나의 router 가 포트 하나를 듣는다(기준 도메인을 주지 않은 레이어).
+pub async fn serve(listener: TcpListener, config: Config) -> std::io::Result<()> {
+    let router = Router::new(config);
+    accept(
+        listener,
+        Arc::new(move |_: &Request<Incoming>| Some(router.clone())),
+    )
+    .await
+}
+
+/// 인스턴스마다의 하위 도메인. 주소 하나에서 `Host` 로 router 를 고른다.
+pub struct Hosts {
+    base: BaseDomain,
+    routers: RwLock<BTreeMap<HostTarget, Router>>,
+}
+
+impl Hosts {
+    pub fn new(base: BaseDomain) -> Arc<Self> {
+        Arc::new(Self {
+            base,
+            routers: RwLock::new(BTreeMap::new()),
+        })
+    }
+
+    /// 그 곳의 router 를 세운다. 앞의 것은 바뀐다.
+    pub fn insert(&self, target: HostTarget, router: &Router) {
+        if let Ok(mut routers) = self.routers.write() {
+            routers.insert(target, router.clone());
+        }
+    }
+
+    /// 그 곳의 router 가 이것일 때만 걷는다. 뒤에 세운 것을 앞의 것이 걷지 않게 한다.
+    pub fn remove(&self, target: &HostTarget, router: &Router) {
+        if let Ok(mut routers) = self.routers.write()
+            && routers.get(target).is_some_and(|known| known.same(router))
+        {
+            routers.remove(target);
+        }
+    }
+
+    /// 요청이 가는 router. `Host` 머리말만 글자 그대로 보고(`X-Forwarded-Host` 같은 것은 믿지 않는다), 판정은 core 가 한다.
+    /// 요청 줄에 주소를 적었으면(absolute-form) 그 주소가 `Host` 와 같아야 한다.
+    fn pick(&self, request: &Request<Incoming>) -> Option<Router> {
+        let host = request.headers().get(header::HOST)?.to_str().ok()?;
+        if let Some(authority) = request.uri().authority()
+            && authority.as_str() != host
+        {
+            return None;
+        }
+        let target = judge_host(host, &self.base)?;
+        self.routers.read().ok()?.get(&target).cloned()
+    }
+}
+
+/// 주소 하나에서 모든 인스턴스의 요청을 받고 `Host` 로 가른다. 모르는 호스트와 기준 도메인 자체는 404 다.
+pub async fn serve_hosts(listener: TcpListener, hosts: Arc<Hosts>) -> std::io::Result<()> {
+    accept(
+        listener,
+        Arc::new(move |request: &Request<Incoming>| hosts.pick(request)),
+    )
+    .await
+}
+
+/// 서비스에 들어가 있는 동안의 표를 쥔 답의 본문. 본문이 끝까지 나가 떨어질 때 처리 중인 수가 준다.
+struct Held {
+    inner: Body,
+    _visit: wake::Visit,
+}
+
+impl hyper::body::Body for Held {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+        Pin::new(&mut self.inner).poll_frame(context)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -682,14 +827,11 @@ impl State {
         }
     }
 
-    /// 메일을 보내지 못했을 때 한 줄. 갈래와 상태만 적는다.
-    fn record_mail(&self, failure: MailFailure) {
-        let Some(log) = &self.config.log else {
-            return;
-        };
-        let _guard = self.log.lock();
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log) {
-            let _ = writeln!(file, "MAIL {failure}");
+    /// 기록에 한 줄을 더하는 것. 요청과 따로 도는 일(뒤에서 보내는 메일)이 들고 간다.
+    fn note(&self) -> Note {
+        Note {
+            log: self.config.log.clone(),
+            lock: Arc::clone(&self.log),
         }
     }
 
@@ -752,9 +894,9 @@ impl State {
         };
         // MCP 의 주소는 쿠키를 보지 않고 Bearer 토큰만 본다. 다른 사이트가 사용자의 쿠키로 MCP 를 부르지 못하게 한다
         if is_mcp_path(manifest, &path)
-            && let Target::Server { port } = target
+            && let Target::Server(server) = target
         {
-            return self.mcp_request(request, *port).await;
+            return self.mcp_request(request, server).await;
         }
         let user = match self.signed_in(request.headers()).await {
             Ok(user) => user,
@@ -778,7 +920,7 @@ impl State {
             Target::Static { folder } => {
                 Self::file(folder, &path, &service.path, request.method()).await
             }
-            Target::Server { port } => self.forward(request, *port, user.as_ref()).await,
+            Target::Server(server) => self.forward(request, server, user.as_ref()).await,
         }
     }
 
@@ -847,13 +989,24 @@ impl State {
         response
     }
 
-    /// 서버 서비스로 흘려보낸다. 본문은 버퍼에 담지 않는다.
+    /// 서버 서비스로 흘려보낸다. 본문은 버퍼에 담지 않는다. 서비스가 자고 있으면 깨운 뒤에 넘기고, 깨우지 못하면 503 이다.
     async fn forward(
         &self,
         request: Request<Incoming>,
-        port: u16,
+        server: &Arc<AppServer>,
         signed: Option<&Signed>,
     ) -> Response<Body> {
+        let visit = match server.enter().await {
+            Ok(visit) => visit,
+            Err(_) => {
+                let mut response = error(StatusCode::SERVICE_UNAVAILABLE, "waking");
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+                return response;
+            }
+        };
+        let port = visit.port;
         let (mut parts, body) = request.into_parts();
         clean_request_headers(&mut parts.headers);
         if let Some(Signed {
@@ -887,11 +1040,15 @@ impl State {
         };
         parts.uri = uri;
         let upstream = Request::from_parts(parts, body.boxed());
-        match self.client.request(upstream).await {
+        match visit.client.clone().request(upstream).await {
             Ok(answer) => {
                 let (mut parts, body) = answer.into_parts();
                 clean_response_headers(&mut parts.headers);
-                Response::from_parts(parts, body.boxed())
+                let held = Held {
+                    inner: body.boxed(),
+                    _visit: visit,
+                };
+                Response::from_parts(parts, held.boxed())
             }
             Err(_) => error(StatusCode::BAD_GATEWAY, "bad_gateway"),
         }
@@ -973,7 +1130,7 @@ impl State {
             .run(move |store| store.request_link(&asked, &next, &browser, now()))
             .await;
         match made {
-            // 미리보기에서는 메일을 보내지 않는다. 미리보기의 사람은 씨앗 사용자로 들어간다
+            // 프리뷰에서는 메일을 보내지 않는다. 프리뷰의 사람은 씨앗 사용자로 들어간다
             Ok(Some(_)) if self.config.stage == Stage::Preview => {}
             Ok(Some(token)) => {
                 let mail = Mail {
@@ -985,13 +1142,14 @@ impl State {
                     ),
                 };
                 let mailer = Arc::clone(&self.config.mailer);
-                // 발송기는 동기 HTTP 라 일꾼을 막지 않게 따로 돌린다. 보내지 못해도 답은 같다
-                let sent = tokio::task::spawn_blocking(move || mailer.send(mail))
-                    .await
-                    .unwrap_or(Err(MailFailure::Unreachable));
-                if let Err(failure) = sent {
-                    self.record_mail(failure);
-                }
+                let note = self.note();
+                // 답을 먼저 보내고 메일은 뒤에서 보낸다. 발송을 기다리면 초대된 쪽만 늦어져 걸린 시간으로 초대 여부를 짐작할 수 있다.
+                // 발송기는 동기 HTTP 라 일꾼을 막지 않게 따로 돌린다. 보내지 못해도 답은 같고, 기록에는 갈래와 상태만 남긴다
+                tokio::task::spawn_blocking(move || {
+                    if let Err(failure) = mailer.send(mail) {
+                        note.line(&format!("MAIL {failure}"));
+                    }
+                });
             }
             // 초대받지 않았거나, 막혔거나, 1분 안에 다시 왔다. 답은 같다
             Ok(None) | Err(StoreError::Refused(_)) => {}
@@ -1151,7 +1309,7 @@ impl State {
         let Some(user) = body["user"].as_str().map(str::to_owned) else {
             return error(StatusCode::BAD_REQUEST, "bad_request");
         };
-        // 씨앗 사용자만 된다. 미리보기에서 초대받아 들어온 사람은 링크로 들어온다
+        // 씨앗 사용자만 된다. 프리뷰에서 초대받아 들어온 사람은 링크로 들어온다
         if !self.config.seed_users.contains(&user) {
             return error(StatusCode::NOT_FOUND, "no_such_user");
         }

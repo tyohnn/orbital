@@ -24,6 +24,46 @@ pub struct Manifest {
     /// 레이어가 운영하는 로그인(Orbital Auth). 없으면 레이어는 로그인에 관여하지 않는다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
+    /// 적합성 테스트. 포크가 어떻게 고쳐졌든 통과해야 하는, 팩토리가 정한 테스트다.
+    /// 레이어는 포크의 것이 아니라 위쪽(앱의 commit)의 이 칸과 폴더로 돌린다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conformance: Option<Conformance>,
+}
+
+/// 적합성 테스트의 선언. 둘 다 있어야 한다.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Conformance {
+    /// 돌릴 명령. 프리뷰의 주소(`ORBITAL_PREVIEW_URL`)만 받는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    /// 테스트가 든 폴더. 저장소 안의 상대 경로다. 위쪽의 이 폴더만 빈 자리에 놓고 돌린다. 포크의 트리는 놓지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<String>,
+}
+
+impl Conformance {
+    /// 저장소 안의 폴더를 가리키는가. 절대 경로 · `..` · 빈 조각 · `.` · 옵션으로 읽힐 수 있는 것 · `.git` 은 받지 않는다.
+    pub fn inside_repository(files: &str) -> bool {
+        !files.is_empty()
+            && !files.starts_with('/')
+            && !files.starts_with('-')
+            && !files.contains('\\')
+            && !files.contains(':')
+            && !files.contains('\0')
+            && files
+                .trim_end_matches('/')
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != ".." && part != ".git")
+    }
+
+    /// 검증을 지난 선언의 명령과 폴더. 폴더 끝의 `/` 는 떼어 낸다.
+    pub fn parts(&self) -> Option<(&str, &str)> {
+        match (&self.run, &self.files) {
+            (Some(run), Some(files)) => Some((run.as_str(), files.trim_end_matches('/'))),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,7 +207,7 @@ pub struct Database {
     /// 업무 역할. 권한은 권한 표가 정한다.
     #[serde(default)]
     pub roles: Vec<Ident>,
-    /// 미리보기 DB 에 넣을 가짜 데이터.
+    /// 프리뷰 DB 에 넣을 가짜 데이터.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<String>,
 }
@@ -187,35 +227,93 @@ pub struct Secrets {
 #[serde(tag = "problem", rename_all = "snake_case")]
 pub enum ManifestProblem {
     NoService,
-    DuplicateService { service: Ident },
-    ServiceNameTooLong { service: Ident },
-    ServerNeedsStart { service: Ident },
-    StaticNeedsOutput { service: Ident },
-    StaticHasRoles { service: Ident },
-    PathNotAbsolute { service: Ident },
-    DuplicatePath { path: String },
-    UndeclaredRole { service: Ident, role: Ident },
-    DuplicateRole { role: Ident },
-    DuplicateSchema { schema: Ident },
+    DuplicateService {
+        service: Ident,
+    },
+    ServiceNameTooLong {
+        service: Ident,
+    },
+    ServerNeedsStart {
+        service: Ident,
+    },
+    StaticNeedsOutput {
+        service: Ident,
+    },
+    StaticHasRoles {
+        service: Ident,
+    },
+    PathNotAbsolute {
+        service: Ident,
+    },
+    DuplicatePath {
+        path: String,
+    },
+    UndeclaredRole {
+        service: Ident,
+        role: Ident,
+    },
+    DuplicateRole {
+        role: Ident,
+    },
+    DuplicateSchema {
+        schema: Ident,
+    },
     RolesWithoutSchema,
-    ScheduleUnknownService { service: Ident },
-    ScheduleNotServer { service: Ident },
-    SchedulePathOutsideService { service: Ident, path: String },
-    ScheduleBadCron { cron: String },
-    DuplicateSecret { secret: SecretName },
-    AuthRequiredWithoutAuth { service: Ident },
+    ScheduleUnknownService {
+        service: Ident,
+    },
+    ScheduleNotServer {
+        service: Ident,
+    },
+    SchedulePathOutsideService {
+        service: Ident,
+        path: String,
+    },
+    ScheduleBadCron {
+        cron: String,
+    },
+    DuplicateSecret {
+        secret: SecretName,
+    },
+    AuthRequiredWithoutAuth {
+        service: Ident,
+    },
     AuthNoMethod,
-    AuthUnknownMethod { method: String },
-    LoginPathOutsideServices { path: String },
-    LayerPath { path: String },
-    DirectoryUndeclaredRole { role: Ident },
-    DefaultRoleUndeclared { role: Ident },
+    AuthUnknownMethod {
+        method: String,
+    },
+    LoginPathOutsideServices {
+        path: String,
+    },
+    LayerPath {
+        path: String,
+    },
+    DirectoryUndeclaredRole {
+        role: Ident,
+    },
+    DefaultRoleUndeclared {
+        role: Ident,
+    },
     OpenSignupWithoutDefaultRoles,
     DefaultRolesWithoutOpenSignup,
-    McpUnknownService { service: Ident },
-    McpNotServer { service: Ident },
-    McpPathOutsideService { path: String },
-    ConsentPathOutsideServices { path: String },
+    McpUnknownService {
+        service: Ident,
+    },
+    McpNotServer {
+        service: Ident,
+    },
+    McpPathOutsideService {
+        path: String,
+    },
+    ConsentPathOutsideServices {
+        path: String,
+    },
+    /// `[conformance]` 에 `run` 과 `files` 가 함께 있지 않다.
+    ConformanceIncomplete,
+    /// 적합성 테스트의 폴더가 저장소 밖을 가리킨다.
+    ConformanceOutside {
+        files: String,
+    },
 }
 
 impl fmt::Display for ManifestProblem {
@@ -340,6 +438,14 @@ impl fmt::Display for ManifestProblem {
             Self::OpenSignupWithoutDefaultRoles => write!(
                 f,
                 "`signup = \"open\"` 이면 처음 들어온 사람이 가질 역할이 있어야 합니다. `[auth].default_roles` 를 적어 주세요"
+            ),
+            Self::ConformanceIncomplete => write!(
+                f,
+                "`[conformance]` 에는 명령(`run`)과 테스트의 폴더(`files`)를 함께 적어야 합니다. 빠진 칸을 적어 주세요"
+            ),
+            Self::ConformanceOutside { files } => write!(
+                f,
+                "적합성 테스트의 폴더 `{files}` 는 저장소 안의 상대 경로여야 합니다(`/` 로 시작하거나 `..` · `.git` 을 쓸 수 없습니다). `conformance` 처럼 저장소 안의 폴더로 적어 주세요"
             ),
             Self::DefaultRolesWithoutOpenSignup => write!(
                 f,
@@ -485,6 +591,22 @@ impl Manifest {
             if schedule.cron.split_whitespace().count() != 5 {
                 problems.push(ManifestProblem::ScheduleBadCron {
                     cron: schedule.cron.clone(),
+                });
+            }
+        }
+
+        if let Some(conformance) = &self.conformance {
+            let blank =
+                |text: &Option<String>| text.as_deref().is_none_or(|text| text.trim().is_empty());
+            if blank(&conformance.run) || blank(&conformance.files) {
+                problems.push(ManifestProblem::ConformanceIncomplete);
+            }
+            if let Some(files) = &conformance.files
+                && !files.trim().is_empty()
+                && !Conformance::inside_repository(files)
+            {
+                problems.push(ManifestProblem::ConformanceOutside {
+                    files: files.clone(),
                 });
             }
         }
@@ -1133,5 +1255,49 @@ directory = ["manager"]
             .replace("output = \"web/dist\"\n", "")
             .replace("cron = \"0 9 25 * *\"", "cron = \"daily\"");
         assert_eq!(problems(&text).len(), 3);
+    }
+
+    #[test]
+    fn 적합성_테스트의_폴더는_저장소_밖을_가리키지_못한다() {
+        let with = |files: &str| {
+            format!(
+                "{NEST_VITE}\n[conformance]\nrun = \"node conformance/check.js\"\nfiles = \"{files}\"\n"
+            )
+        };
+        // 저장소 안의 폴더는 받는다(들어가는 끝)
+        for inside in ["conformance", "tests/conformance", "conformance/"] {
+            assert!(parse(&with(inside)).check().is_ok(), "{inside}");
+        }
+        // 밖이나 저장소 전체, git 의 폴더, 옵션으로 읽힐 것은 받지 않는다(들어가지 않는 끝)
+        for outside in [
+            "/etc",
+            "../conformance",
+            "conformance/../..",
+            "a//b",
+            ".",
+            "./conformance",
+            ".git",
+            "-x",
+            "c:tests",
+        ] {
+            assert_eq!(
+                problems(&with(outside)),
+                vec![ManifestProblem::ConformanceOutside {
+                    files: outside.to_owned(),
+                }],
+                "{outside}"
+            );
+        }
+        // 명령과 폴더는 함께 있어야 한다
+        let no_files = format!("{NEST_VITE}\n[conformance]\nrun = \"node check.js\"\n");
+        assert_eq!(
+            problems(&no_files),
+            vec![ManifestProblem::ConformanceIncomplete]
+        );
+        let no_run = format!("{NEST_VITE}\n[conformance]\nfiles = \"conformance\"\n");
+        assert_eq!(
+            problems(&no_run),
+            vec![ManifestProblem::ConformanceIncomplete]
+        );
     }
 }

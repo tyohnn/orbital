@@ -1,0 +1,19 @@
+[package]
+name = "orbital-backup"
+description = "Orbital 의 백업 어댑터. 기반 백업과 WAL 보관, 옆에 세운 클러스터로의 시점 복구, database 하나 옮기기를 Postgres 의 도구로 한다"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+orbital-core = { path = "../orbital-core" }
+postgres.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

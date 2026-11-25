@@ -5,12 +5,17 @@
 
 pub mod access;
 pub mod auth;
+pub mod backup;
 pub mod check;
 pub mod describe;
 pub mod google;
+pub mod host;
 pub mod manifest;
 pub mod name;
 pub mod oauth;
 pub mod plan;
 pub mod release;
+pub mod rollout;
 pub mod scope;
+pub mod secrets;
+pub mod sweep;

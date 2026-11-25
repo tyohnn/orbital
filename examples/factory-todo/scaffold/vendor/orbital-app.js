@@ -84,7 +84,7 @@ function texts(value         )
 
 /**
  * Google 로 들어가는 주소. 로그인 화면의 단추가 브라우저를 이리로 보낸다(`location.href = googleSignInUrl("/cards")`).
- * 선언의 `[auth].methods` 에 `google` 이 있고 운영일 때만 열린다. 미리보기와 팩토리가 Google 키를 넣지 않은 운영에서는 404 다.
+ * 선언의 `[auth].methods` 에 `google` 이 있고 운영일 때만 열린다. 프리뷰와 팩토리가 Google 키를 넣지 않은 운영에서는 404 다.
  * 들어오지 못하면 레이어가 `login_path?error=<코드>` 로 돌려보낸다(`not_invited` · `unverified` · `expired` · `used` · `other_browser` · `denied` · `unavailable` · `invalid`).
  */
 export function googleSignInUrl(next = "/", origin = "")        

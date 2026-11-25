@@ -795,6 +795,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "orbital-backup"
+version = "0.0.0"
+dependencies = [
+ "orbital-core",
+ "postgres",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "url",
+]
+
+[[package]]
 name = "orbital-cli"
 version = "0.0.0"
 dependencies = [
@@ -855,6 +867,7 @@ dependencies = [
  "hyper-util",
  "orbital-core",
  "orbital-pg",
+ "orbital-run",
  "serde_json",
  "tokio",
  "ureq",
@@ -875,6 +888,7 @@ dependencies = [
  "chacha20poly1305",
  "getrandom 0.4.3",
  "hmac 0.12.1",
+ "orbital-backup",
  "orbital-core",
  "orbital-pg",
  "orbital-proxy",

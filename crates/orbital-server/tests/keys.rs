@@ -261,6 +261,8 @@ struct FakeResend {
     sent: Mutex<Vec<Sent>>,
     /// 돌려줄 상태. 기본은 200 이다.
     status: Mutex<u16>,
+    /// 답하기 전에 기다리는 시간. 느린 발송기를 흉내 낸다.
+    delay: Mutex<Duration>,
 }
 
 #[derive(Default)]
@@ -299,6 +301,8 @@ fn serve_resend(fake: Arc<FakeResend>) -> String {
                 reply(request, 404, &json!({ "name": "not_found" }));
                 continue;
             }
+            let delay = *fake.delay.lock().unwrap();
+            std::thread::sleep(delay);
             fake.sent.lock().unwrap().push(Sent {
                 authorization: header_of(&request, "authorization").unwrap_or_default(),
                 user_agent: header_of(&request, "user-agent"),
@@ -563,7 +567,7 @@ impl Bench {
         preview
     }
 
-    /// 미리보기 → 승격 요청 → 승격. 둘의 답을 돌려준다.
+    /// 프리뷰 → 승격 요청 → 승격. 둘의 답을 돌려준다.
     fn try_ship(&self, key: &str, instance: &str) -> (Value, (u16, Value), (u16, Value)) {
         let token = self.token(key, instance);
         let preview = self.preview(instance, &token);
@@ -616,6 +620,18 @@ impl Bench {
             .collect()
     }
 
+    /// 그 이메일로 `count` 통이 갈 때까지 기다린다. 메일은 링크 요청의 답을 보낸 뒤에 뒤에서 나간다.
+    fn wait_sent_to(&self, email: &str, count: usize) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(10) {
+            if self.sent_to(email).len() >= count {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
     fn ask_link(origin: &str, email: &str, browser: Option<&str>) -> Reply {
         let mut headers = vec![("Origin", origin), ("Content-Type", "application/json")];
         if let Some(browser) = browser {
@@ -635,6 +651,9 @@ impl Bench {
         let asked = Self::ask_link(origin, email, None);
         assert_eq!(asked.status, 202, "{}", asked.body);
         let browser = asked.cookie("__Host-orbital-browser");
+        // 메일은 답을 보낸 뒤에 뒤에서 나간다
+        let before = self.sent_to(email).len();
+        assert!(self.wait_sent_to(email, before.max(1)));
         let mail = self
             .sent_to(email)
             .pop()
@@ -740,6 +759,18 @@ impl Bench {
 
     fn count(&self, instance: &str, sql: &str) -> i64 {
         self.database(instance).query_one(sql, &[]).unwrap().get(0)
+    }
+
+    /// 기록에 그 글이 적힐 때까지 기다렸다가 기록을 돌려준다. 메일의 실패는 답을 보낸 뒤에 적힌다.
+    fn wait_logs(&self, needle: &str) -> String {
+        let started = std::time::Instant::now();
+        loop {
+            let logs = self.logs();
+            if logs.contains(needle) || started.elapsed() > Duration::from_secs(10) {
+                return logs;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn logs(&self) -> String {
@@ -886,14 +917,14 @@ fn google_키를_넣지_않은_팩토리의_google_로그인은_운영에_오르
 }
 
 #[test]
-fn 키가_없어도_미리보기는_서고_메일은_나가지_않는다() {
+fn 키가_없어도_프리뷰는_서고_메일은_나가지_않는다() {
     let mut bench = bench!(false);
     let instance = bench.instance(FACTORY, "gcards");
     let token = bench.token(FACTORY, &instance);
     let preview = bench.preview(&instance, &token);
     let origin = preview["services"][0]["url"].as_str().unwrap().to_owned();
     assert_eq!(texts(&preview["blockers"]).len(), 2, "{preview}");
-    // 미리보기의 씨앗 사용자로 들어가는 길은 그대로 있다
+    // 프리뷰의 씨앗 사용자로 들어가는 길은 그대로 있다
     let seeded = http(
         "POST",
         &origin,
@@ -903,7 +934,7 @@ fn 키가_없어도_미리보기는_서고_메일은_나가지_않는다() {
     );
     assert_eq!(seeded.status, 302, "{}", seeded.everything());
 
-    // 키를 넣은 뒤에도 미리보기의 링크 요청은 같은 202 이고 메일은 나가지 않는다
+    // 키를 넣은 뒤에도 프리뷰의 링크 요청은 같은 202 이고 메일은 나가지 않는다
     bench.put_mail(FACTORY, MAIL_KEY, "login@factory.example");
     for email in ["u1@example.test", "u2@example.test"] {
         let asked = Bench::ask_link(&origin, email, None);
@@ -995,9 +1026,10 @@ fn 넣은_키의_값은_어떤_답과_로그와_오류에도_돌아오지_않는
             .map(String::as_str),
         Some(CLIENT_SECRET)
     );
+    assert!(bench.wait_sent_to("kim@example.com", 1));
     assert_eq!(bench.sent()[0].authorization, format!("Bearer {MAIL_KEY}"));
 
-    let logs = bench.logs();
+    let logs = bench.wait_logs("MAIL rejected 401");
     assert!(logs.contains("MAIL rejected 401"), "{logs}");
     assert!(!logs.contains("kim@example.com"), "{logs}");
     let all = format!(
@@ -1192,6 +1224,8 @@ fn 다른_팩토리의_키로는_메일이_나가지_않는다() {
         Bench::ask_link(&theirs_live, "lee@example.com", None).status,
         202
     );
+    assert!(bench.wait_sent_to("kim@example.com", 1));
+    assert!(bench.wait_sent_to("lee@example.com", 1));
     let kim = bench.sent_to("kim@example.com");
     let lee = bench.sent_to("lee@example.com");
     assert_eq!((kim.len(), lee.len()), (1, 1));
@@ -1211,9 +1245,34 @@ fn 다른_팩토리의_키로는_메일이_나가지_않는다() {
         .unwrap();
     let asked = Bench::ask_link(&theirs_live, "lee@example.com", None);
     assert_eq!(asked.status, 202);
+    assert!(
+        bench
+            .wait_logs("MAIL not_configured")
+            .contains("MAIL not_configured")
+    );
     assert_eq!(bench.sent_to("lee@example.com").len(), 1);
     assert_eq!(bench.sent().len(), 2);
-    assert!(bench.logs().contains("MAIL not_configured"));
+}
+
+#[test]
+fn 링크_요청의_답은_메일_발송을_기다리지_않는다() {
+    let mut bench = bench!(false);
+    bench.put_mail(FACTORY, MAIL_KEY, "login@factory.example");
+    let (instance, live) = bench.ship(FACTORY, "cards");
+    bench.invite(FACTORY, &instance, "kim@example.com");
+    // 발송기가 3초 뒤에야 답한다. 초대된 이메일의 답도 그만큼 늦어지면 걸린 시간으로 초대 여부를 짐작할 수 있다
+    *bench.resend.delay.lock().unwrap() = Duration::from_secs(3);
+    let started = std::time::Instant::now();
+    let invited = Bench::ask_link(&live, "kim@example.com", None);
+    let took = started.elapsed();
+    assert_eq!(invited.status, 202, "{}", invited.everything());
+    assert!(
+        took < Duration::from_millis(1500),
+        "답이 {took:?} 걸렸습니다"
+    );
+    // 메일은 뒤에서 나간다
+    assert!(bench.sent_to("kim@example.com").is_empty());
+    assert!(bench.wait_sent_to("kim@example.com", 1));
 }
 
 #[test]
@@ -1240,8 +1299,9 @@ fn 메일을_보내지_못해도_링크_요청의_답은_같다() {
     };
     assert_eq!(names(&failed), names(&stranger));
     // Resend 는 한 번 불렸고 거절했다. 기록에는 갈래와 상태만 있다
+    assert!(bench.wait_sent_to("kim@example.com", 1));
     assert_eq!(bench.sent_to("kim@example.com").len(), 1);
-    let logs = bench.logs();
+    let logs = bench.wait_logs("MAIL rejected 500");
     assert!(logs.contains("MAIL rejected 500"), "{logs}");
     assert!(!logs.contains("kim@example.com"));
     assert!(!logs.contains("token="));
@@ -1523,7 +1583,7 @@ fn 위조하거나_만료된_state_로는_콜백이_아무것도_하지_않는�
         hex(serde_json::to_string(&claims).unwrap().as_bytes()),
         parts[2]
     );
-    // 레이어의 열쇠로 서명했어도 만료된 것과 미리보기의 것은 받지 않는다
+    // 레이어의 열쇠로 서명했어도 만료된 것과 프리뷰의 것은 받지 않는다
     let key = fs::read(bench.home.join("token.key")).unwrap();
     claims.next = "/cards".to_owned();
     let mut expired = claims.clone();
@@ -1575,7 +1635,7 @@ fn 위조하거나_만료된_state_로는_콜백이_아무것도_하지_않는�
 }
 
 #[test]
-fn 미리보기에는_google_로그인이_없다() {
+fn 프리뷰에는_google_로그인이_없다() {
     let mut bench = bench!(false);
     bench.put_mail(FACTORY, MAIL_KEY, "login@factory.example");
     bench.put_google(FACTORY);
@@ -1617,6 +1677,12 @@ fn 개발용_메일함은_명시해_켠_레이어에서만_키_없이_운영에_
     let (instance, live) = dev.ship(FACTORY, "cards");
     dev.invite(FACTORY, &instance, "kim@example.com");
     assert_eq!(Bench::ask_link(&live, "kim@example.com", None).status, 202);
+    let started = std::time::Instant::now();
+    while Outbox::read(&dev.home.join(OUTBOX)).is_empty()
+        && started.elapsed() < Duration::from_secs(10)
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let mails = Outbox::read(&dev.home.join(OUTBOX));
     assert_eq!(mails.len(), 1);
     assert_eq!(mails[0].to, "kim@example.com");

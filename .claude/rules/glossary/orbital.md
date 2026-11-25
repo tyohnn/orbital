@@ -21,17 +21,25 @@ paths:
 | 마이그레이션 역할 | 레이어가 배포하는 동안만 들어가 스키마를 바꾸는 역할 | `Names::migrator` |
 | 계획 | DB 에 세울 것을 적은 단계의 목록 | `Step`, `provision`, `grants` |
 | 권한 검사 | 실제 DB 가 선언과 권한 표에 정확히 맞는지 보는 일. 승격의 관문 | `Snapshot`, `Finding`, `check::judge` |
-| 토큰 | 에이전트의 작업 한 번 동안의 권한. 인스턴스 하나, 미리보기까지 | `Token`, `Capability`, `scope::judge` |
-| 예행연습 | 운영 DB 의 사본에 마이그레이션을 미리 돌리는 일. 숫자만 돌아온다 | `orbital-pg` |
+| 토큰 | 에이전트의 작업 한 번 동안의 권한. 인스턴스 하나, 프리뷰까지 | `Token`, `Capability`, `scope::judge` |
+| 리허설 | 운영 DB 의 사본에 마이그레이션을 미리 돌리는 일. 숫자만 돌아온다 | `orbital-pg` |
 | 서명된 신원 | router 가 세션을 확인해 서명한 것(`v2`: 사람 · 세션 · 업무 역할). 요청마다 60초짜리로 앱에 싣는다. 행 단위 규칙은 이것만 읽는다 | `orbital-pg::identity`, `Claims` |
 | 역할 제한 정책 | `[auth]` 를 선언한 인스턴스의 표마다 레이어가 두는 제한하는 정책. 연결의 업무 역할이 신원에 없으면 어떤 행도 내주지 않는다 | `Step::SetRolePolicy`, `orbital.granted()`, `ROLE_POLICY` |
-| router | 미리보기 · 운영마다 하나가 포트 하나를 듣고, 요청을 서비스로 가르고, 세션을 확인해 신원을 싣는 것. `/_orbital/` 은 직접 답한다 | `orbital-router`, `auth::route` |
-| 사용자 | 인스턴스의 앱에 로그인하는 사람. 인스턴스의 database 안 `orbital_auth` 에 있다. 씨앗 사용자는 미리보기에만 있다 | `SessionUser`, `User`, `SeedUser` |
+| router | 프리뷰 · 운영마다 하나가 서서(포트 하나, 또는 레이어의 주소 하나를 하위 도메인으로 나눠) 요청을 서비스로 가르고, 세션을 확인해 신원을 싣는 것. `/_orbital/` 은 직접 답한다 | `orbital-router`, `Router`, `auth::route` |
+| 기준 도메인 · 하위 도메인 | 레이어가 받는 도메인(`ORBITAL_BASE_DOMAIN`)과, 그 바로 아래 인스턴스마다의 한 조각(`<인스턴스>` 는 운영, `<인스턴스>-preview` 는 프리뷰). 그 주소가 인스턴스의 origin 이다 | `BaseDomain`, `HostTarget`, `judge_host`, `Hosts` |
+| 재우기 · 깨우기 | 요청이 없는 서버 서비스의 프로세스를 내리는 일(`ORBITAL_SLEEP_AFTER`, 기본 5분)과, 첫 요청에 다시 띄우는 일. 깨우지 못하면 503 | `AppServer`, `Starter`, `WakeFailure` |
+| 쓰고 남은 줄 | 만료됐거나 거둔 로그인 링크 · Google 의 표 · 인가 요청 · 코드 · 세션 · 토큰. 하루 뒤 새 줄을 적을 때 지운다 | `sweep`, `Leftover` |
+| 사용자 | 인스턴스의 앱에 로그인하는 사람. 인스턴스의 database 안 `orbital_auth` 에 있다. 씨앗 사용자는 프리뷰에만 있다 | `SessionUser`, `User`, `SeedUser` |
 | 초대 | 그 이메일이 들어올 수 있게 하고 처음 가질 업무 역할을 정한 것. 14일 동안 받아들여진다 | `AuthStore::invite`, `judge_invitation` |
-| 로그인 링크 | 메일로 가는 한 번 쓰는 주소. 운영에서만 팩토리의 키로 나가고 미리보기에서는 나가지 않는다. 15분, 요청한 브라우저에서만 열린다. 같은 이메일로는 1분에 하나 | `AuthStore::request_link` · `enter`, `judge_link` |
+| 로그인 링크 | 메일로 가는 한 번 쓰는 주소. 운영에서만 팩토리의 키로 나가고 프리뷰에서는 나가지 않는다. 15분, 요청한 브라우저에서만 열린다. 같은 이메일로는 1분에 하나 | `AuthStore::request_link` · `enter`, `judge_link` |
 | 세션 | 로그인한 브라우저의 쿠키(`__Host-orbital-session`)가 가리키는 것. 거두거나 사용자를 빼면 다음 요청부터 없는 것이다 | `AuthStore::session`, `judge_session` |
 | 팩토리의 설정 | 팩토리마다 한 벌인 로그인의 키(Resend 의 키 · 보내는 주소, Google 클라이언트). 비밀은 어떤 답에도 돌아오지 않는다. 없으면 그 로그인 방법은 운영에 오르지 못한다 | `Settings`, `PUT /v1/settings/auth`, `FactoryKey`, `missing_keys` |
 | 봉인 | 팩토리의 비밀을 기록에 두는 모양. 조직과 칸을 함께 묶어 다른 줄에 옮기면 풀리지 않는다. 열쇠는 기록 밖(`ORBITAL_SEAL_KEY`)에 있다 | `seal`, `SealKey` |
+| 밖에서 넣는 비밀 | 선언의 `[secrets] external` 에 이름만 적은 바깥 서비스의 키. 사람이 넣고, 앱은 같은 이름의 환경 변수로 받는다. 빌드와 마이그레이션에는 가지 않는다 | `Secrets::external`, `missing_secrets`, `Blocker::SecretMissing` |
+| 단계(stage) | 값이 들어가는 칸. 프리뷰(`preview`)와 운영(`production`) 둘이고 서로 넘어가지 않는다. 프리뷰의 값은 에이전트가 볼 수 있다고 본다 | `secrets::Stage` |
+| 금고(vault) | 밖에서 넣는 비밀을 인스턴스와 단계마다 봉인해 둔 것(`vault.json`, 0600). 조직 · 인스턴스 · 단계 · 이름을 함께 묶는다. 값을 읽는 API 는 없다 | `Vault`, `SecretValue`, `secret_binding` |
+| 입력 표(entry) | 사람의 브라우저가 값을 레이어에 바로 보내는 한 번 쓰는 주소. 인스턴스 · 이름 · 단계 하나에 묶이고 10분. sha256 으로만 둔다 | `Entry`, `judge_entry`, `/v1/secret-entries/{표}` |
+| 비밀의 요청 | 에이전트가 이름과 까닭만 적어 사람에게 입력을 부탁하는 것. 선언한 이름만 받는다 | `judge_request`, `Capability::SecretsRequest` |
 | 개발용 메일함 | 메일을 보내지 않고 `outbox.jsonl` 에 쌓는 것. 명시해 켠 레이어(`ORBITAL_DEV_MAIL=outbox`)에서만 메일 키를 대신한다 | `Outbox`, `Options::dev_mailbox` |
 | Google 로그인의 state · 표 | 레이어가 서명해 Google 에 넘기는 것(인스턴스 · `next` · 브라우저 표식과 `nonce` 의 해시, 10분)과, 콜백이 Google 계정을 확인한 뒤 인스턴스에 적는 한 번 쓰는 표(60초, 요청한 브라우저에서만) | `StateClaims`, `judge_state`, `judge_id_token`, `google_ticket`, `AuthStore::enter_google` |
 | 인가 서버 · 자원 서버 | MCP 의 인가에서 Orbital Auth 가 토큰을 내는 쪽(발급자는 router 의 주소), router 가 MCP 주소에서 토큰을 확인하는 쪽 | `orbital_core::oauth`, `orbital_router::oauth` |
@@ -44,8 +52,26 @@ paths:
 | 스캐폴드 | 팩토리가 올린 앱의 원본. 버전(태그)이 있고 인스턴스가 그 하나에서 갈라진다 | `receive_scaffold`, `SourceStore::create` |
 | 묶음 | 코드를 주고받는 git bundle. 에이전트가 받아 가서 고친 뒤 올린다 | `SourceStore::bundle` · `receive` |
 | release | commit 하나와 거기서 읽은 선언 · 권한 표 · 마이그레이션. 식별자가 commit 에 묶인다 | `ReleaseId`, `Assembled`, `release_id` |
-| 미리보기 | release 를 씨앗 데이터의 DB 와 함께 임시로 세운 것. 인스턴스마다 하나 | `Layer::preview` |
+| 프리뷰 | release 를 씨앗 데이터의 DB 와 함께 임시로 세운 것. 인스턴스마다 하나 | `Layer::preview` |
 | 승격 | 사람이 승인한 release 를 운영에 올리는 일. 팩토리의 서버만 부른다 | `release::promote`, `Layer::promote` |
 | 되돌릴 지점 | 승격 직전의 운영 DB 를 떠 둔 것 | `RestorePoint`, `Admin::mark` · `restore` |
 | service key | 팩토리의 서버가 쓰는 열쇠. 운영을 바꾸는 길은 이 열쇠에만 있다 | `Layer::organization` |
 | 실행기 | 빌드 명령을 돌리고 서버를 띄우는 자리. 갈아 끼운다 | `Runner`, `LocalRunner` |
+| 업데이트 | 팩토리가 스캐폴드(위쪽)에 올린 commit 하나. 인스턴스의 release 가 이 commit 을 조상으로 담으면 「적용됐다」고 본다 | `Rollout::update`, `SourceStore::fetch_upstream` · `descends` |
+| 밀기 · 당기기 | 업데이트를 인스턴스에 들이는 두 길. 법 · 보안 · 핵심 패키지는 팩토리가 밀고 팩토리가 승인한다. 기능 업데이트는 고객이 당기고 고객이 승인한다. 같은 기계다 | `Change`, `Change::approver` |
+| rollout | 업데이트 하나가 인스턴스마다 어디까지 갔는지(`waiting` → `applied` → `previewed` → `passed` → `promoted`, 어디서든 `failed`)를 갖고 관문을 지키는 것. 한 곳이 실패하면 멈추고(`halted`) 팩토리가 다시 열어야 이어진다. 레이어는 에이전트를 돌리지 않는다 | `Rollout`, `Progress`, `Event`, `Rollout::step` |
+| 물결 | rollout 의 인스턴스를 나눈 순서 있는 묶음. 앞 물결이 모두 오른 뒤에 뒤 물결이 오른다 | `Rollout::waves`, `Refusal::EarlierWave` |
+| 합치기 | 레이어가 인스턴스의 `main` 에 업데이트를 기계적으로 합치는 일(`git merge` 의 판정). 충돌하면 인스턴스를 건드리지 않고 충돌한 파일의 이름만 알린다 | `SourceStore::merge`, `Merged`, `Layer::apply_update` |
+| 적합성 테스트 | 인스턴스가 어떻게 고쳐졌든 통과해야 하는, 팩토리가 정한 테스트(`[conformance] run` · `files`). 위쪽의 선언과 폴더로 모든 프리뷰에서 돌고, 프리뷰의 주소만 받는다. 통과하지 못하면 오르지 못한다 | `Conformance`, `Conformed`, `Blocker::ConformanceFailed`, `Runner::check` |
+| 기반 백업 | 운영 클러스터 전체를 뜬 것(`pg_basebackup`). 레이어의 기록 묶음이 함께 든다. 다 뜬 때(`finished_at`) 뒤의 시점으로만 되살린다 | `BaseBackup`, `Store::base_backup` |
+| WAL 보관 | 운영 클러스터가 다 찬 WAL 조각을 `archive_command` 로 백업의 폴더(`<ORBITAL_BACKUP_DIR>/wal`)에 복사해 두는 것 | `Archive`, `LocalStore::archive_command` |
+| 보관의 표시 | commit 하나를 적고 WAL 을 넘겨 그 조각이 보관된 것을 본 뒤 적는 「이 시각까지는 되살릴 수 있다」 | `Seal`, `Store::seal` |
+| 시점 복구 | 기반 백업과 보관한 WAL 로 정한 시각의 클러스터를 되살리는 일. **옆에 세운 클러스터에만** 한다 | `judge_restore`, `Store::recover` |
+| 옆의 클러스터 | 시점 복구로 따로 세운 클러스터. 유닉스 소켓에서만 듣고 TCP 를 듣지 않으며 WAL 을 보관하지 않는다. 쓰고 나면 프로세스와 폴더를 걷는다 | `Cluster` |
+| 인스턴스 되살리기 | 옆에 그 시점의 클러스터를 세우고 인스턴스 하나의 database 를 운영 클러스터의 옆 이름에 레이어의 계획으로 다시 세워 바꿔 넣는 일. 앱의 정의는 마이그레이션 역할로, 로그인의 행은 인증 역할로 넣고 관리 권한으로는 풀지 않는다. 직전의 DB 는 되돌릴 지점으로 남는다. service key 로만 | `Layer::restore_instance`, `backup::rebuild`, `load_database`, `Names::staged`, `Action::RestoreInstance` |
+| 복구 훈련 | 표식 → 시점 → 표식 → 옆에 되살리기 → 확인 → 인스턴스 하나를 되살리기와 같은 절차로 임시 database 에 세워 보기 → 걷기 → 기록을 사람 손 없이 도는 한 번. 확인이 하나라도 어긋나면 실패다 | `drill`, `Check`, `judge_drill`, `DrillRecord`, `orbitald drill` |
+| 지문 | database 하나의 스키마 해시와 표마다의 행 수. 이름과 숫자만 있고 행의 값은 없다 | `Fingerprint`, `fingerprint` |
+| 잃을 수 있는 구간 | 훈련을 시작한 때 − 마지막으로 보관된 WAL 의 시각(초). 운영 클러스터를 잃으면 이만큼을 잃는다 | `DrillRecord::exposure_seconds` |
+| 낡은 훈련 | 마지막으로 통과한 훈련이 여드레를 넘겼거나 한 번도 통과하지 않은 것. 켠 레이어(`ORBITAL_REQUIRE_DRILL=1`)는 그동안 새 인스턴스만 받지 않는다 | `Freshness`, `freshness`, `DRILL_FRESH_FOR` |
+| 기록 묶음 | 기반 백업에 함께 넣는 레이어의 기록(`registry.json` · `settings.json` · `vault.json` · `sources` · `apps`). 열쇠(봉인 · service key · 토큰)는 넣지 않는다 | `RECORDS`, `pack` |
+| 보관 기간 | 기반 백업을 두는 기간(14일). 지난 것과 거기에만 딸린 WAL 을 지우되 마지막 기반 백업은 언제나 남긴다 | `prune`, `Pruning`, `KEEP_FOR` |

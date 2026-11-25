@@ -21,9 +21,9 @@ pub struct OrganizationId(pub String);
 pub enum Capability {
     /// 코드를 받고 올린다.
     Source,
-    /// 미리보기를 세우고, 그 로그와 DB(씨앗 데이터)를 본다. 승격을 요청한다.
+    /// 프리뷰를 세우고, 그 로그와 DB(씨앗 데이터)를 본다. 승격을 요청한다.
     Preview,
-    /// 운영 사본에 마이그레이션을 예행연습한다. 숫자만 돌아온다.
+    /// 운영 사본에 마이그레이션을 리허설한다. 숫자만 돌아온다.
     Rehearse,
     /// 사람에게 비밀의 입력을 요청한다. 값은 보지 못한다.
     SecretsRequest,
@@ -39,28 +39,45 @@ pub enum Action {
     PreviewDatabase,
     RequestPromotion,
     Rehearse,
+    /// 사람에게 비밀의 입력을 요청한다.
     SecretsRequest,
+    /// 비밀의 이름과 채워졌는지를 본다. 값은 싣지 않는다.
+    SecretsList,
     /// 여기부터는 운영이다. service key 로만 한다.
     Promote,
     ProductionLogs,
     ProductionDatabase,
+    /// 비밀의 값을 읽는다. 이 일을 하는 길은 레이어에 없다. 어떤 열쇠로도 값은 나가지 않는다.
     SecretsRead,
+    /// 비밀의 값을 넣거나 지우고, 사람의 입력 표를 받는다.
+    SecretsWrite,
+    /// 자기 인스턴스가 든 rollout 의 진행(그 인스턴스의 상태 · 업데이트 commit · 멈췄는지)을 본다.
+    RolloutView,
+    /// rollout 을 만들고, 합치기를 부르고, 다시 열고, 거둔다. service key 로만 한다.
+    RolloutManage,
+    /// 운영 DB 를 지난 시점으로 되살린다. service key 로만 한다.
+    RestoreInstance,
 }
 
 impl Action {
     /// 이 일에 필요한 능력. `None` 이면 토큰으로는 할 수 없는 일이다.
     pub fn needs(&self) -> Option<Capability> {
         match self {
-            Self::SourceRead | Self::SourceWrite => Some(Capability::Source),
+            // 업데이트를 받아 합치는 것이 코드의 일이다
+            Self::SourceRead | Self::SourceWrite | Self::RolloutView => Some(Capability::Source),
             Self::PreviewDeploy
             | Self::PreviewLogs
             | Self::PreviewDatabase
             | Self::RequestPromotion => Some(Capability::Preview),
             Self::Rehearse => Some(Capability::Rehearse),
-            Self::SecretsRequest => Some(Capability::SecretsRequest),
-            Self::Promote | Self::ProductionLogs | Self::ProductionDatabase | Self::SecretsRead => {
-                None
-            }
+            Self::SecretsRequest | Self::SecretsList => Some(Capability::SecretsRequest),
+            Self::Promote
+            | Self::ProductionLogs
+            | Self::ProductionDatabase
+            | Self::SecretsRead
+            | Self::SecretsWrite
+            | Self::RolloutManage
+            | Self::RestoreInstance => None,
         }
     }
 }
@@ -183,6 +200,8 @@ mod tests {
             Action::ProductionLogs,
             Action::ProductionDatabase,
             Action::SecretsRead,
+            Action::SecretsWrite,
+            Action::RestoreInstance,
         ] {
             assert_eq!(
                 judge(&token, &request(action)),

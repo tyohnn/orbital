@@ -1,4 +1,4 @@
-// 팩토리의 도구 넷. 누가 부르는지(고객)는 연결이 정하고, 도구의 인자로 받지 않는다.
+// 팩토리의 도구 여섯. 누가 부르는지(고객)는 연결이 정하고, 도구의 인자로 받지 않는다.
 //
 // | 도구 | 답 | 누가 |
 // |---|---|---|
@@ -6,6 +6,8 @@
 // | `promotion_show` | 승인 카드(화면). 기다리는 release, 권한이 바뀌는 문장, 실행될 마이그레이션 | 모델 · 화면 |
 // | `promotion_approve` | 카드가 보인 release 를 고객의 승인으로 운영에 올린다 | 화면 전용(`ui.visibility: ["app"]`) |
 // | `production_status` | 운영의 release 와 주소 | 모델 · 화면 |
+// | `secret_request` | 레이어에 비밀의 입력을 요청하고 입력 카드(화면)를 보인다 | 모델 · 화면 |
+// | `secret_entry_open` | 입력 카드가 값을 보낼 레이어의 입력 표(`_meta` 에만) | 화면 전용(`ui.visibility: ["app"]`) |
 //
 // ⚠ **service key 는 이 파일 밖(`main.ts` 가 만든 `Orbital`)에 있고 어떤 답에도 싣지 않는다.** 레이어의 오류는 `code` 와 `message` 만 옮기고,
 //   빌드와 서버의 로그(`details`)는 옮기지 않는다. 그 로그는 고객의 앱이 낸 것이라 데이터가 섞일 수 있다.
@@ -14,13 +16,15 @@
 //   지금 기다리는 release 가 같을 때만 올린다. 표는 한 번 쓰면 버린다.
 // ⚠ 승인하기는 화면 전용이다. 하모니는 `ui.visibility` 에 `model` 이 없는 도구를 모델의 도구 목록에서 뺀다(os-playground 의
 //   `packages/kernel/src/app-turn.ts`). 모델이 표를 볼 길도 없으므로 에이전트가 제 요청을 스스로 승인하지 못한다.
+// ⚠ **비밀의 값은 팩토리를 지나지 않는다.** 에이전트는 이름과 까닭만 요청하고, 입력 카드가 레이어의 입력 표 주소로 값을 바로 보낸다.
+//   입력 표의 주소는 화면에만 가는 `_meta` 에 싣고, 값을 받는 도구는 없다. 그래서 값이 도구 호출 기록에도 팩토리의 로그에도 남지 않는다.
 import { randomBytes } from "node:crypto";
 
 import { OrbitalError } from "@harmony/orbital/server";
 import type { Capability, Orbital, Production } from "@harmony/orbital/server";
 import type { CallToolResult, Tool } from "@modelcontextprotocol/server";
 
-import { CARD_META, renderCard } from "./card.ts";
+import { CARD_META, ENTRY_META, renderCard } from "./card.ts";
 import type { CardView, Live } from "./card.ts";
 import type { Customers } from "./customers.ts";
 
@@ -35,6 +39,8 @@ const APPROVAL_TTL_MS = 30 * 60 * 1000;
 export type ToolResult = CallToolResult;
 
 const EMPTY_INPUT: Tool["inputSchema"] = { type: "object", properties: {}, additionalProperties: false };
+/** 비밀의 이름. 레이어의 `SecretName` 과 같은 모양이다 */
+const SECRET_NAME = { type: "string", pattern: "^[A-Z][A-Z0-9_]{0,47}$" } as const;
 
 export const TOOLS: Tool[] = [
     {
@@ -78,6 +84,39 @@ export const TOOLS: Tool[] = [
         description: "Show which release of the user's app is live in production and where.",
         inputSchema: EMPTY_INPUT,
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    {
+        name: "secret_request",
+        title: "비밀 입력 요청",
+        description: "Ask the user to enter a secret (an API key the app needs) on an input card. Declare the name under `[secrets] external` in orbital.toml and run `orbital preview` first. Give the name and why the app needs it. Never ask for the value in chat and never write it in code: the app reads it from the environment variable of that name. The card sends the value straight to Orbital; you never see it.",
+        inputSchema: {
+            type: "object",
+            properties: { name: SECRET_NAME, reason: { type: "string", minLength: 1, maxLength: 500 } },
+            required: ["name", "reason"],
+            additionalProperties: false,
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        _meta: {
+            ui: { resourceUri: CARD_URI },
+            "openai/outputTemplate": CARD_URI,
+            "openai/widgetAccessible": true,
+            "openai/toolInvocation/invoking": "비밀 입력 카드를 여는 중",
+            "openai/toolInvocation/invoked": "비밀 입력 카드를 열었어요",
+        },
+    },
+    {
+        name: "secret_entry_open",
+        title: "비밀 입력 표 받기",
+        description: "Get a one-time address for the input card to send a secret value to Orbital. Called by the secret input card only.",
+        inputSchema: {
+            type: "object",
+            properties: { name: SECRET_NAME, stage: { type: "string", enum: ["preview", "production"] } },
+            required: ["name", "stage"],
+            additionalProperties: false,
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+        // ⚠ 화면 전용. 모델의 도구 목록에 서지 않는다. 표가 든 주소는 `_meta` 에만 싣는다
+        _meta: { ui: { visibility: ["app"] }, "openai/visibility": "private", "openai/widgetAccessible": true },
     },
 ];
 
@@ -130,9 +169,12 @@ function reasonOf(error: unknown): { reason: string; details: readonly string[] 
         case "denied":
         case "problems":
             return { reason: error.message, details: error.details };
+        // 레이어가 지은 까닭이다(봉인의 열쇠가 없음 같은). 값은 실리지 않는다
+        case "conflict":
+            return { reason: error.message, details: [] };
         case "build_failed":
         case "start_failed":
-            return { reason: `${error.message}. 운영은 앞의 모습 그대로입니다. 에이전트에게 미리보기를 다시 세워 확인해 달라고 해 주세요.`, details: [] };
+            return { reason: `${error.message}. 운영은 앞의 모습 그대로입니다. 에이전트에게 프리뷰를 다시 세워 확인해 달라고 해 주세요.`, details: [] };
         case "not_found":
             return { reason: "그 release 를 레이어에서 찾지 못했습니다. 카드를 다시 열어 주세요.", details: [] };
         default:
@@ -223,6 +265,61 @@ export function createFactory(options: FactoryOptions): Factory
         }
     };
 
+    const secretRequest = async (customer: string, args: Record<string, unknown>): Promise<ToolResult> =>
+    {
+        const instance = customers.find(customer);
+        if (instance === undefined)
+        {
+            return failed("아직 작업 공간이 없습니다. `workspace_open` 으로 작업을 열고 `[secrets] external` 에 이름을 적은 뒤 프리뷰를 세워 주세요.");
+        }
+        const name = typeof args.name === "string" ? args.name : "";
+        const reason = typeof args.reason === "string" ? args.reason : "";
+        try
+        {
+            await orbital.secrets.request(instance, name, { reason });
+        }
+        catch (error)
+        {
+            logFailure("secret_request", error);
+            const { reason: why, details } = reasonOf(error);
+            return failed([`요청을 적지 못했습니다. ${why}`, ...details].join("\n"));
+        }
+        const shown = (await orbital.secrets.list(instance)).find((secret) => secret.name === name);
+        const filled = { preview: shown?.preview.set === true, production: shown?.production.set === true };
+        options.log(`[factory-todo] 비밀의 입력을 요청했습니다: ${instance}`);
+        return answer(
+            "사람에게 비밀 입력 카드를 보였습니다. 사람이 카드에서 값을 넣습니다. 값을 묻거나 대화 · 코드에 적지 마세요. 앱은 같은 이름의 환경 변수로 읽습니다.",
+            { name, ...filled },
+            card({ kind: "secret", name, reason, ...filled }),
+        );
+    };
+
+    const secretEntryOpen = async (customer: string, args: Record<string, unknown>): Promise<ToolResult> =>
+    {
+        const instance = customers.find(customer);
+        const name = typeof args.name === "string" ? args.name : "";
+        const stage = args.stage === "preview" || args.stage === "production" ? args.stage : undefined;
+        if (instance === undefined || stage === undefined)
+        {
+            return failed("입력 카드에서 부른 것이 아닙니다. 카드를 다시 열어 주세요.");
+        }
+        try
+        {
+            const entry = await orbital.secrets.entry(instance, name, { stage });
+            // 표가 든 주소는 화면에만 간다. 모델이 읽는 글과 structuredContent 에는 싣지 않는다
+            return {
+                content: [text("입력 표를 열었습니다. 카드가 값을 레이어로 바로 보냅니다.")],
+                structuredContent: { name, stage, expires_at: entry.expiresAt },
+                _meta: { [ENTRY_META]: { url: entry.url, expires_at: entry.expiresAt } },
+            };
+        }
+        catch (error)
+        {
+            logFailure("secret_entry_open", error);
+            return failed(`입력 표를 받지 못했습니다. ${reasonOf(error).reason}`);
+        }
+    };
+
     const productionStatus = async (customer: string): Promise<ToolResult> =>
     {
         const instance = customers.find(customer);
@@ -251,6 +348,10 @@ export function createFactory(options: FactoryOptions): Factory
                         return await promotionApprove(customer, args);
                     case "production_status":
                         return await productionStatus(customer);
+                    case "secret_request":
+                        return await secretRequest(customer, args);
+                    case "secret_entry_open":
+                        return await secretEntryOpen(customer, args);
                     default:
                         return failed(`모르는 도구입니다: ${name}. 도구 목록에 있는 이름으로 불러 주세요.`);
                 }

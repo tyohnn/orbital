@@ -1,4 +1,4 @@
-//! 레이어의 동작. 인스턴스를 세우고, 코드를 받고, 그 commit 에서 직접 빌드해 미리보기를 세우고, 승인받은 release 를 운영에 올린다.
+//! 레이어의 동작. 인스턴스를 세우고, 코드를 받고, 그 commit 에서 직접 빌드해 프리뷰를 세우고, 승인받은 release 를 운영에 올린다.
 //!
 //! 판정은 core 가 한다(토큰의 범위, 권한 검사, 승격의 규칙). 여기서는 부품을 순서대로 부르고, 중간에 깨지면 앞의 모습으로 돌린다.
 //! 서버가 하나일 때의 모양이라 일을 하나씩 차례로 한다(자물쇠 하나).
@@ -6,35 +6,42 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read as _;
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orbital_core::access::Access;
 use orbital_core::auth::query_value;
 use orbital_core::check::{judge as judge_access, unguarded};
 use orbital_core::describe::changes;
 use orbital_core::google::{IdTokenRefusal, callback_url, judge_id_token, judge_state};
+use orbital_core::host::{BaseDomain, HostTarget, Scheme, origin as host_origin};
 use orbital_core::manifest::{ServiceKind, ValidManifest};
-use orbital_core::name::{Ident, InstanceId};
+use orbital_core::name::{Ident, InstanceId, SecretName};
 use orbital_core::oauth::registrable_redirect;
 use orbital_core::plan::Names;
 use orbital_core::release::{
-    Aftermath, Approval, Approver, BuiltBy, Change, FactoryKey, Migrations, PromoteDenied,
-    Rehearsed, Release, ReleaseId, after_promotion, blockers, missing_keys,
+    Aftermath, Approval, Approver, BuiltBy, Change, Conformed, FactoryKey, Migrations,
+    PromoteDenied, Rehearsed, Release, ReleaseId, after_promotion, blockers, missing_keys,
     promote as judge_promotion,
 };
 use orbital_core::scope::{
     Action, Capability, DenyReason, OrganizationId, Request, Token, Verdict, judge,
+};
+use orbital_core::secrets::{
+    Entry, EntryRefusal, Place, RequestProblem, Stage as SecretStage, ValueProblem,
+    entry_expires_at, judge_request, judge_value, missing_secrets, newly_received,
 };
 use orbital_pg::Admin;
 use orbital_pg::auth::AuthStore;
 use orbital_pg::rehearsal::RestorePoint;
 use orbital_proxy::{Route, serve};
 use orbital_router::{
-    Config as RouterConfig, Connect, DocumentFetcher, GoogleDoor, HttpsFetcher, Outbox, Resend,
-    SESSION_COOKIE, Stage as RouterStage, Target as RouterTarget, serve as serve_router,
+    AppServer, Config as RouterConfig, Connect, DocumentFetcher, GoogleDoor, Hosts, HttpsFetcher,
+    Outbox, Resend, Router, SESSION_COOKIE, Stage as RouterStage, Starter, Target as RouterTarget,
+    WakeFailure, serve as serve_router, serve_hosts,
 };
 use orbital_run::{Job, Runner, Running, free_port, wait_for_port};
 use orbital_source::assemble::{AssembleError, Assembled, assemble};
@@ -45,11 +52,20 @@ use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
+use crate::backup::BackupOptions;
 use crate::login::{Endpoints, FactoryGoogleDoor, FactoryMailer, exchange, sha256_hex};
 use crate::registry::{InstanceRecord, ProductionRecord, Registry, ReleaseRecord};
 use crate::seal::SealKey;
 use crate::settings::{Settings, SettingsError};
 use crate::token;
+use crate::vault::{RedeemError, SecretValue, Vault, VaultError};
+
+mod rollout;
+use orbital_core::rollout::Event as RolloutEvent;
+use rollout::refusal_text;
+pub use rollout::{
+    AgentRollout, ApplyReport, ConformanceReport, InstanceProgress, NewRollout, RolloutReport,
+};
 
 /// 일이 안 됐을 때 부른 쪽에 돌려주는 것. 에이전트가 읽고 고칠 수 있게 적는다.
 #[derive(Debug)]
@@ -74,6 +90,8 @@ pub enum Failure {
     /// 승격의 규칙이 막았다.
     Denied(PromoteDenied),
     Conflict(String),
+    /// 한 번 쓰는 것을 이미 썼거나 만료됐다(입력 표).
+    Gone(String),
     Internal(String),
 }
 
@@ -122,33 +140,150 @@ enum Stage {
     Production,
 }
 
+impl Stage {
+    /// 금고의 칸. 프리뷰는 프리뷰의 칸만, 운영은 운영의 칸만 읽는다.
+    fn vault(self) -> SecretStage {
+        match self {
+            Self::Preview => SecretStage::Preview,
+            Self::Production => SecretStage::Production,
+        }
+    }
+
+    fn of(stage: SecretStage) -> Self {
+        match stage {
+            SecretStage::Preview => Self::Preview,
+            SecretStage::Production => Self::Production,
+        }
+    }
+}
+
 struct LiveService {
     name: String,
     kind: ServiceKind,
     /// 밖에 알리는 주소. router 의 주소 + 서비스의 `path` 다.
     url: String,
-    process: Option<Box<dyn Running>>,
+    /// 서버 서비스의 프로세스를 재우고 깨우는 것. 정적 서비스에는 없다.
+    server: Option<Arc<AppServer>>,
     proxy: Option<JoinHandle<std::io::Result<()>>>,
 }
 
-/// 떠 있는 router. 내리면 듣기를 멈추고 붙어 있던 연결도 함께 내린다.
-struct RouterTask(JoinHandle<std::io::Result<()>>);
+/// 떠 있는 router. 내리면 요청을 받지 않는다.
+enum Front {
+    /// 인스턴스마다 포트 하나를 듣는다. 내리면 듣기를 멈추고 붙어 있던 연결도 함께 내린다.
+    Port(JoinHandle<std::io::Result<()>>),
+    /// 레이어의 주소 하나에서 하위 도메인으로 가른다. 내리면 그 하위 도메인을 표에서 걷는다.
+    Host {
+        hosts: Arc<Hosts>,
+        target: HostTarget,
+        router: Router,
+    },
+}
 
-impl Drop for RouterTask {
+impl Drop for Front {
     fn drop(&mut self) {
-        self.0.abort();
+        match self {
+            Self::Port(task) => task.abort(),
+            Self::Host {
+                hosts,
+                target,
+                router,
+            } => hosts.remove(target, router),
+        }
     }
 }
 
 /// 띄운 서비스들과 그 앞의 router.
 struct Launched {
     services: Vec<LiveService>,
-    router: RouterTask,
+    router: Front,
     /// router 의 바깥 주소.
     origin: String,
 }
 
-/// 띄울 자리. 미리보기와 운영이 이름 · 비밀 · 서명의 열쇠를 따로 갖는다.
+/// 하위 도메인을 쓰는 레이어의 자리. 주소 하나를 듣고 `Host` 로 인스턴스를 가른다.
+struct Hosted {
+    hosts: Arc<Hosts>,
+    address: SocketAddr,
+    base: BaseDomain,
+    scheme: Scheme,
+    _task: JoinHandle<std::io::Result<()>>,
+}
+
+impl Drop for Hosted {
+    fn drop(&mut self) {
+        self._task.abort();
+    }
+}
+
+/// 서버 서비스의 프로세스를 띄우는 것. router 가 자는 서비스를 깨울 때도 부른다.
+struct ServiceStarter {
+    runner: Arc<dyn Runner>,
+    folder: PathBuf,
+    command: String,
+    env: Vec<(String, String)>,
+    /// 밖에서 넣는 비밀. 띄울 때마다 금고에서 읽어, 값을 바꾼 뒤 깬 프로세스는 새 값을 받는다.
+    external: External,
+    log: PathBuf,
+    wake_timeout: Duration,
+}
+
+/// 서버 서비스에 건넬 밖에서 넣는 비밀의 자리. 프리뷰는 프리뷰의 칸만, 운영은 운영의 칸만 읽는다.
+struct External {
+    vault: Arc<Vault>,
+    organization: String,
+    instance: InstanceId,
+    stage: SecretStage,
+    names: Vec<SecretName>,
+}
+
+impl Starter for ServiceStarter {
+    fn start(&self, port: u16) -> Result<Box<dyn Running>, WakeFailure> {
+        let mut env = vec![("PORT".to_owned(), port.to_string())];
+        env.extend(self.env.iter().cloned());
+        let external = &self.external;
+        env.extend(
+            external
+                .vault
+                .values(
+                    &external.organization,
+                    &external.instance,
+                    external.stage,
+                    &external.names,
+                )
+                .into_iter()
+                .map(|(name, value)| (name.as_str().to_owned(), value.expose().to_owned())),
+        );
+        let mut process = self
+            .runner
+            .start(&Job {
+                folder: &self.folder,
+                command: &self.command,
+                env: &env,
+                log: &self.log,
+            })
+            .map_err(|_| WakeFailure::Refused)?;
+        // 포트가 열리기를 기다린다. 그 전에 프로세스가 끝나면 더 기다리지 않는다
+        let deadline = Instant::now() + self.wake_timeout;
+        loop {
+            if wait_for_port(port, Duration::from_millis(100)) {
+                if process.alive() {
+                    return Ok(process);
+                }
+                return Err(WakeFailure::Exited);
+            }
+            if !process.alive() {
+                process.stop();
+                return Err(WakeFailure::Exited);
+            }
+            if Instant::now() >= deadline {
+                process.stop();
+                return Err(WakeFailure::TimedOut);
+            }
+        }
+    }
+}
+
+/// 띄울 자리. 프리뷰와 운영이 이름 · 비밀 · 서명의 열쇠를 따로 갖는다.
 struct Stand<'a> {
     names: &'a Names,
     generated: &'a BTreeMap<String, String>,
@@ -162,8 +297,8 @@ struct Stand<'a> {
 
 impl Drop for LiveService {
     fn drop(&mut self) {
-        if let Some(mut process) = self.process.take() {
-            process.stop();
+        if let Some(server) = self.server.take() {
+            server.close();
         }
         if let Some(proxy) = self.proxy.take() {
             proxy.abort();
@@ -171,17 +306,17 @@ impl Drop for LiveService {
     }
 }
 
-/// 떠 있는 것 하나(미리보기이거나 운영). 서비스가 먼저 내려가고 router 가 뒤에 내려간다.
+/// 떠 있는 것 하나(프리뷰이거나 운영). 서비스가 먼저 내려가고 router 가 뒤에 내려간다.
 struct Live {
     release: String,
     /// router 의 바깥 주소. Google 의 콜백이 한 번 쓰는 표를 들고 이리로 보낸다.
     origin: String,
     names: Names,
     manifest: ValidManifest,
-    /// 미리보기의 씨앗 사용자. 운영에는 없다.
+    /// 프리뷰의 씨앗 사용자. 운영에는 없다.
     seed_users: Vec<String>,
     services: Vec<LiveService>,
-    _router: RouterTask,
+    _router: Front,
 }
 
 /// 운영에 올리려는 release 하나와 그것이 설 자리.
@@ -235,6 +370,10 @@ pub struct PreviewReport {
     pub blockers: Vec<String>,
     /// 실패는 아니지만 알아 둘 것. 로그인을 레이어에 맡겼는데 행 단위 규칙을 꺼서 역할 제한이 걸리지 않는 표.
     pub notices: Vec<String>,
+    /// 밖에서 넣는 비밀 가운데 프리뷰의 값이 없어 환경 변수 없이 선 것의 이름. 사람에게 입력을 요청한다.
+    pub missing_secrets: Vec<String>,
+    /// 위쪽이 정한 적합성 테스트의 결과. 위쪽이 선언하지 않았으면 `null` 이다.
+    pub conformance: Option<ConformanceReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -265,7 +404,46 @@ pub struct PendingPromotion {
     pub changes: Vec<String>,
     /// 운영에 아직 돌지 않은 마이그레이션의 이름.
     pub migrations: Vec<String>,
+    /// 이번 변경으로 앱이 새로 받게 되는 밖에서 넣는 비밀의 이름. 지금의 운영과 견준다.
+    pub new_secrets: Vec<String>,
+    /// 이 release 가 담은 업데이트의 열린 rollout. 없으면 `null` 이다.
+    pub rollout: Option<String>,
 }
+
+/// 비밀 하나의 모습. 값은 싣지 않는다(지문도 길이도 없다).
+#[derive(Debug, Clone, Serialize)]
+pub struct SecretReport {
+    pub name: String,
+    /// 이 인스턴스의 release(프리뷰로 세운 것과 운영의 것) 가운데 밖에서 넣는다고 선언한 것이 있는가.
+    pub declared: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<RequestedReport>,
+    pub preview: SlotReport,
+    pub production: SlotReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestedReport {
+    pub reason: String,
+    pub at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SlotReport {
+    pub set: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_at: Option<u64>,
+}
+
+/// 사람이 값을 넣을 입력 표. 주소에 표가 실려 있다. 10분 안에 한 번 쓴다.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryTicket {
+    pub url: String,
+    pub expires_at: u64,
+}
+
+/// 지금 시각(유닉스 초)을 주는 것. 테스트가 갈아 끼운다.
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 pub struct Options {
     /// 레이어가 저장소 · 빌드 · 기록을 두는 폴더.
@@ -283,6 +461,28 @@ pub struct Options {
     pub dev_mailbox: bool,
     /// Resend 와 Google 의 주소. 테스트가 가짜 서버로 갈아 끼운다.
     pub endpoints: Endpoints,
+    /// 마지막 요청이 끝난 뒤 이만큼 요청이 없으면 서버 서비스의 프로세스를 내린다(`ORBITAL_SLEEP_AFTER`, 기본 5분).
+    pub sleep_after: Duration,
+    /// 서버 서비스를 띄우고 포트가 열리기를 기다리는 시간. 넘으면 띄우지 못한 것이다(기본 30초).
+    pub wake_timeout: Duration,
+    /// 인스턴스마다의 하위 도메인. 없으면 인스턴스마다 포트 하나를 낸다(개발과 지금의 테스트).
+    pub hosting: Option<Hosting>,
+    /// 비밀의 입력 표와 요청이 읽는 시계. 테스트가 갈아 끼워 표의 만료를 잰다.
+    pub clock: Clock,
+    /// 적합성 테스트의 제한 시간(기본 120초). 넘으면 멈추고 실패로 적는다.
+    pub conformance_timeout: Duration,
+    /// 백업과 복구 훈련(`ORBITAL_BACKUP_DIR`). 없으면 백업하지 않고, 인스턴스를 되살리는 길은 409 로 답한다.
+    pub backup: Option<BackupOptions>,
+}
+
+/// 하위 도메인으로 인스턴스를 가르는 레이어의 설정.
+pub struct Hosting {
+    /// 모든 인스턴스의 요청을 받는 주소(`ORBITAL_ROUTER_LISTEN`).
+    pub listen: String,
+    /// 기준 도메인(`ORBITAL_BASE_DOMAIN`). `<인스턴스>.<기준 도메인>` 이 운영, `<인스턴스>-preview.<기준 도메인>` 이 프리뷰다.
+    pub base: BaseDomain,
+    /// 바깥의 스킴(`ORBITAL_PUBLIC_SCHEME`). TLS 는 레이어 앞에서 끝난다고 본다.
+    pub scheme: Scheme,
 }
 
 impl Options {
@@ -302,6 +502,12 @@ impl Options {
             public_url: "http://127.0.0.1:7400".to_owned(),
             dev_mailbox: false,
             endpoints: Endpoints::default(),
+            sleep_after: Duration::from_secs(5 * 60),
+            wake_timeout: Duration::from_secs(30),
+            hosting: None,
+            clock: Arc::new(now),
+            conformance_timeout: Duration::from_secs(120),
+            backup: None,
         }
     }
 }
@@ -312,6 +518,9 @@ pub struct Layer {
     pg_url: String,
     /// 팩토리의 설정(메일 · Google 의 키). 봉인한 글로만 파일에 있다.
     settings: Arc<Settings>,
+    /// 밖에서 넣는 비밀의 금고. 봉인한 글로만 파일에 있다.
+    vault: Arc<Vault>,
+    clock: Clock,
     /// 개발용 메일함. 명시해 켰을 때만 있다.
     outbox: Option<Arc<Outbox>>,
     public_url: String,
@@ -320,11 +529,25 @@ pub struct Layer {
     documents: Arc<dyn DocumentFetcher>,
     upstream: String,
     sources: SourceStore,
-    runner: Box<dyn Runner>,
+    runner: Arc<dyn Runner>,
+    sleep_after: Duration,
+    wake_timeout: Duration,
+    conformance_timeout: Duration,
+    /// 하위 도메인을 쓸 때만 있다.
+    hosted: Option<Hosted>,
     runtime: Runtime,
     token_key: Vec<u8>,
     service_keys: Vec<([u8; 32], String)>,
+    /// 백업을 켠 레이어에만 있다.
+    backup: Option<Backup>,
     inner: Mutex<Inner>,
+}
+
+/// 백업을 두는 곳과 그 설정.
+struct Backup {
+    store: Box<dyn orbital_backup::Store>,
+    keep_for: Duration,
+    require_drill: bool,
 }
 
 /// 사용자 목록의 한 줄. 팩토리의 관리 화면이 세운다.
@@ -364,6 +587,8 @@ fn auth_failure(error: orbital_pg::auth::AuthError) -> Failure {
 pub const OUTBOX: &str = "outbox.jsonl";
 /// 팩토리의 설정 파일. `ORBITAL_HOME` 아래에 둔다.
 pub const SETTINGS: &str = "settings.json";
+/// 밖에서 넣는 비밀의 금고. `ORBITAL_HOME` 아래에 둔다.
+pub const VAULT: &str = "vault.json";
 
 fn digest(text: &str) -> [u8; 32] {
     Sha256::digest(text.as_bytes()).into()
@@ -377,12 +602,37 @@ fn blocker_text(blocker: &orbital_core::release::Blocker) -> String {
             format!("권한 검사에서 어긋남이 {findings}개 나왔습니다")
         }
         Blocker::RehearsalNotRun => {
-            "마이그레이션의 예행연습을 아직 돌리지 않았습니다. `orbital rehearse` 로 돌려 주세요"
+            "마이그레이션의 리허설을 아직 돌리지 않았습니다. `orbital rehearse` 로 돌려 주세요"
                 .to_owned()
         }
-        Blocker::RehearsalFailed => "마이그레이션의 예행연습이 실패했습니다".to_owned(),
+        Blocker::RehearsalFailed => "마이그레이션의 리허설이 실패했습니다".to_owned(),
         Blocker::KeyMissing { key } => key_text(*key),
+        Blocker::SecretMissing { secret } => secret_text(secret),
+        Blocker::ConformanceFailed { outcome } => conformance_text(*outcome),
     }
+}
+
+/// 적합성 테스트를 통과하지 못해 막힌 까닭. 테스트는 위쪽의 것이라 고쳐도 소용없고, 포크의 코드를 고쳐야 함을 밝힌다.
+pub fn conformance_text(outcome: Conformed) -> String {
+    let how = match outcome {
+        Conformed::Failed => "실패했습니다",
+        Conformed::TimedOut => "제한 시간 안에 끝나지 않았습니다",
+        Conformed::NotRun => {
+            "돌지 못했습니다(위쪽의 테스트 폴더를 꺼내지 못했거나 명령을 시작하지 못했습니다)"
+        }
+        Conformed::NotDeclared | Conformed::Passed => "통과했습니다",
+    };
+    format!(
+        "팩토리가 정한 적합성 테스트가 {how}. 테스트는 위쪽(앱)의 것으로 돌아서 포크에서 테스트를 고치거나 지워도 바뀌지 않습니다. 프리뷰의 `conformance.output` 을 보고 앱의 코드를 고친 뒤 프리뷰를 다시 세워 주세요"
+    )
+}
+
+/// 밖에서 넣는 비밀의 운영 값이 없어 막힌 까닭. 에이전트가 고칠 수 없는 일임을 밝힌다.
+pub fn secret_text(secret: &SecretName) -> String {
+    format!(
+        "비밀 `{secret}` 의 운영 값이 없습니다. 에이전트가 고칠 수 없는 일입니다. 에이전트는 값을 묻거나 코드에 적지 말고 사람에게 입력을 요청하고(`POST /v1/instances/{{id}}/secrets/{secret}/request`), 사람이 입력 카드에서 운영의 값을 넣어야 운영에 오릅니다",
+        secret = secret.as_str()
+    )
 }
 
 /// 팩토리의 키가 없어 막힌 까닭. 에이전트가 고칠 수 없는 일임을 밝힌다.
@@ -431,10 +681,60 @@ impl Layer {
             }
         };
 
+        let vault = Vault::open(options.home.join(VAULT), options.seal_key.clone())?;
         let settings = Settings::open(options.home.join(SETTINGS), options.seal_key)?;
-        Ok(Self {
+        let runtime =
+            Runtime::new().map_err(|_| "proxy 의 런타임을 띄우지 못했습니다".to_owned())?;
+        let hosted = match options.hosting {
+            None => None,
+            Some(hosting) => {
+                let listener = runtime
+                    .block_on(TcpListener::bind(&hosting.listen))
+                    .map_err(|_| format!("`{}` 에서 듣지 못했습니다", hosting.listen))?;
+                let address = listener
+                    .local_addr()
+                    .map_err(|_| "router 의 주소를 읽지 못했습니다".to_owned())?;
+                let hosts = Hosts::new(hosting.base.clone());
+                let task = runtime.spawn(serve_hosts(listener, Arc::clone(&hosts)));
+                Some(Hosted {
+                    hosts,
+                    address,
+                    base: hosting.base,
+                    scheme: hosting.scheme,
+                    _task: task,
+                })
+            }
+        };
+        let backup = match options.backup {
+            None => None,
+            Some(backup) => {
+                let tools = orbital_backup::Tools::find().map_err(|error| error.to_string())?;
+                let store = orbital_backup::LocalStore::open(tools, backup.root)
+                    .map_err(|error| format!("백업의 폴더를 열지 못했습니다. {error}"))?;
+                // 운영 클러스터가 WAL 을 보관하지 않으면 시점 복구가 되지 않는다. 적을 명령을 알린다
+                let archiving = postgres::Client::connect(&options.pg_url, postgres::NoTls)
+                    .and_then(|mut client| client.query_one("SHOW archive_mode", &[]))
+                    .map(|row| row.get::<_, String>(0) != "off")
+                    .unwrap_or(false);
+                if !archiving {
+                    return Err(format!(
+                        "운영 클러스터가 WAL 을 보관하지 않습니다. postgresql.conf 에 `archive_mode = on` 과 `archive_command = '{}'` 를 적고 클러스터를 다시 띄워 주세요",
+                        store.archive_command().replace('\'', "''")
+                    ));
+                }
+                Some(Backup {
+                    store: Box::new(store),
+                    keep_for: backup.keep_for,
+                    require_drill: backup.require_drill,
+                })
+            }
+        };
+        let layer = Self {
+            backup,
             sources: SourceStore::new(options.home.join("sources")),
             settings: Arc::new(settings),
+            vault: Arc::new(vault),
+            clock: options.clock,
             outbox: options
                 .dev_mailbox
                 .then(|| Arc::new(Outbox::new(options.home.join(OUTBOX)))),
@@ -443,9 +743,12 @@ impl Layer {
             documents: Arc::new(HttpsFetcher),
             pg_url: options.pg_url,
             upstream,
-            runner: options.runner,
-            runtime: Runtime::new()
-                .map_err(|_| "proxy 의 런타임을 띄우지 못했습니다".to_owned())?,
+            runner: Arc::from(options.runner),
+            sleep_after: options.sleep_after,
+            wake_timeout: options.wake_timeout,
+            conformance_timeout: options.conformance_timeout,
+            hosted,
+            runtime,
             token_key,
             service_keys: options
                 .service_keys
@@ -458,6 +761,118 @@ impl Layer {
                 live: BTreeMap::new(),
             }),
             home: options.home,
+        };
+        layer.restore();
+        Ok(layer)
+    }
+
+    /// 하위 도메인을 쓰는 레이어가 모든 인스턴스의 요청을 받는 주소. 포트마다 주소를 내는 레이어에는 없다.
+    pub fn router_address(&self) -> Option<SocketAddr> {
+        self.hosted.as_ref().map(|hosted| hosted.address)
+    }
+
+    /// 관리 서버가 다시 떴을 때 기록에서 운영 중인 인스턴스의 router 를 「자는」 상태로 다시 세운다. 첫 요청에 깬다.
+    ///
+    /// 기록(`registry.json`)의 운영 release · 서명의 열쇠 · 레이어가 만든 비밀과, 레이어가 빌드한 폴더를 믿는다.
+    /// 빌드한 폴더가 없으면 그 commit 에서 다시 빌드한다. 프리뷰는 되살리지 않는다(다시 세우면 된다).
+    /// 되살리지 못한 인스턴스는 건너뛰고 식별자와 갈래만 알린다.
+    fn restore(&self) {
+        let mut inner = self.lock();
+        let records: Vec<(String, InstanceRecord)> = inner
+            .registry
+            .state
+            .instances
+            .iter()
+            .filter(|(_, record)| record.production.is_some())
+            .map(|(id, record)| (id.clone(), record.clone()))
+            .collect();
+        // 프리뷰는 되살리지 않는다. 앞의 관리 서버가 세워 둔 프리뷰의 database 를 걷는다
+        let previews: Vec<(String, String)> = inner
+            .registry
+            .state
+            .instances
+            .iter()
+            .filter_map(|(id, record)| record.preview.clone().map(|preview| (id.clone(), preview)))
+            .collect();
+        for (id, preview) in previews {
+            let destroyed = InstanceId::parse(&preview)
+                .map_err(internal)
+                .and_then(|preview| inner.admin.destroy(&Names::new(preview)).map_err(internal));
+            match destroyed {
+                Ok(()) => {
+                    if let Some(record) = inner.registry.state.instances.get_mut(&id) {
+                        record.preview = None;
+                    }
+                }
+                Err(_) => eprintln!("orbitald: {id} 의 앞 프리뷰 database 를 걷지 못했습니다"),
+            }
+        }
+        if inner.registry.save().is_err() {
+            eprintln!("orbitald: 레이어의 기록을 적지 못했습니다");
+        }
+        for (id, record) in records {
+            let Ok(instance) = InstanceId::parse(&id) else {
+                continue;
+            };
+            match self.revive(&instance, &record) {
+                Ok(live) => {
+                    inner.live.insert((id, Stage::Production), live);
+                }
+                Err(failure) => {
+                    let kind = match failure {
+                        Failure::BuildFailed { .. } => "build_failed",
+                        Failure::StartFailed { .. } => "start_failed",
+                        Failure::Denied(_) => "secret_missing",
+                        _ => "internal",
+                    };
+                    eprintln!("orbitald: 운영 {id} 를 되살리지 못했습니다({kind})");
+                }
+            }
+        }
+    }
+
+    fn revive(&self, instance: &InstanceId, record: &InstanceRecord) -> Outcome<Live> {
+        let production = record
+            .production
+            .as_ref()
+            .ok_or_else(|| internal("운영의 기록이 없습니다"))?;
+        let commit = record
+            .releases
+            .get(&production.release)
+            .and_then(|release| Commit::parse(&release.commit))
+            .ok_or_else(|| internal("운영의 release 를 찾지 못했습니다"))?;
+        let assembled = self.assembled(instance, &commit)?;
+        // 운영의 비밀이 금고에서 풀리지 않으면(열쇠가 바뀌었거나 줄이 빠졌으면) 값 없이 세우지 않는다
+        let missing = self.missing_secrets(&record.organization, instance, &assembled.manifest);
+        if !missing.is_empty() {
+            return Err(Failure::Denied(PromoteDenied::Blocked {
+                blockers: missing
+                    .into_iter()
+                    .map(|secret| orbital_core::release::Blocker::SecretMissing { secret })
+                    .collect(),
+            }));
+        }
+        let folder = self.build(instance, &assembled)?;
+        let names = Names::new(instance.clone());
+        let identity_key = token::unhex(&production.identity_key)
+            .ok_or_else(|| internal("서명의 열쇠를 읽지 못했습니다"))?;
+        let stand = Stand {
+            names: &names,
+            generated: &production.generated,
+            identity_key: &identity_key,
+            stage: Stage::Production,
+            organization: &record.organization,
+            app: &record.app,
+        };
+        let launched = self.launch(instance, &assembled, &folder, &stand, false)?;
+        Ok(Live {
+            release: production.release.clone(),
+            origin: launched.origin,
+            names,
+            manifest: assembled.manifest.clone(),
+            seed_users: Vec::new(),
+            services: launched.services,
+            _router: launched.router,
         })
     }
 }
@@ -512,6 +927,12 @@ impl Layer {
         }
     }
 
+    /// 인스턴스가 길에 없는 일(rollout 을 만들거나 다시 여는 일)을 토큰이 두드렸을 때, 토큰이 발급받은 인스턴스로 판정한다.
+    pub fn authorize_own(&self, bearer: &str, action: Action) -> Outcome<()> {
+        let token = token::verify(&self.token_key, bearer).ok_or(Failure::Unauthorized)?;
+        self.authorize(bearer, &token.instance, action)
+    }
+
     fn owned<'a>(
         inner: &'a mut Inner,
         organization: &str,
@@ -563,6 +984,8 @@ impl Layer {
         if !scaffold.join("HEAD").is_file() {
             return Err(Failure::NotFound);
         }
+        // 복구 훈련이 통과한 뒤에만 새 고객의 데이터를 받는다
+        self.require_fresh_drill()?;
         let mut inner = self.lock();
         let instance = fresh_id('i')?;
         self.sources
@@ -617,15 +1040,26 @@ impl Layer {
     }
 
     pub fn push(&self, instance: &InstanceId, bundle: &[u8]) -> Outcome<Commit> {
-        let _guard = self.lock();
-        self.sources
+        let mut inner = self.lock();
+        let commit = self
+            .sources
             .receive(instance, bundle)
             .map_err(|error| match error {
                 SourceError::BadBundle | SourceError::NotFastForward => {
                     Failure::Problems(vec![error.to_string()])
                 }
                 other => internal(other),
-            })
+            })?;
+        // 에이전트가 업데이트를 합쳐(충돌을 풀어) 올렸으면 적용된 것이다
+        self.track(
+            &mut inner,
+            instance,
+            &commit,
+            &[RolloutEvent::Applied {
+                instance: instance.clone(),
+            }],
+        )?;
+        Ok(commit)
     }
 
     fn assembled(&self, instance: &InstanceId, commit: &Commit) -> Outcome<Assembled> {
@@ -686,22 +1120,40 @@ impl Layer {
 
     /// 빌드한 것을 띄운다. 서버 서비스마다 proxy 를 하나 세우고, 앱에는 그 주소와 레이어가 만든 비밀만 건넨다.
     /// 서비스들 앞에 router 를 세운다. 밖에서는 router 의 주소로만 닿는다.
+    ///
+    /// `wake` 면 서버 서비스를 지금 띄워 실제로 뜨는지 확인한다(프리뷰와 승격). 아니면 자는 채로 세워 첫 요청에 깨운다
+    /// (관리 서버가 다시 떴을 때). 어느 쪽이든 요청이 없으면 정한 시간 뒤에 잔다.
     fn launch(
         &self,
         instance: &InstanceId,
         assembled: &Assembled,
         folder: &Path,
         stand: &Stand<'_>,
+        wake: bool,
     ) -> Outcome<Launched> {
         let (names, generated, stage) = (stand.names, stand.generated, stand.stage);
-        let listener = self
-            .runtime
-            .block_on(TcpListener::bind("127.0.0.1:0"))
-            .map_err(internal)?;
-        let origin = format!(
-            "http://127.0.0.1:{}",
-            listener.local_addr().map_err(internal)?.port()
-        );
+        // 하위 도메인을 쓰면 레이어의 주소 하나가 받고, 아니면 인스턴스마다 포트 하나를 듣는다
+        let (listener, origin, host) = match &self.hosted {
+            Some(hosted) => {
+                let target = match stage {
+                    Stage::Preview => HostTarget::Preview(instance.clone()),
+                    Stage::Production => HostTarget::Production(instance.clone()),
+                };
+                let origin = host_origin(hosted.scheme, &hosted.base, &target);
+                (None, origin, Some(target))
+            }
+            None => {
+                let listener = self
+                    .runtime
+                    .block_on(TcpListener::bind("127.0.0.1:0"))
+                    .map_err(internal)?;
+                let origin = format!(
+                    "http://127.0.0.1:{}",
+                    listener.local_addr().map_err(internal)?.port()
+                );
+                (Some(listener), origin, None)
+            }
+        };
         let url = |path: &str| format!("{origin}{}", path.trim_end_matches('/'));
         let mut services = Vec::new();
         let mut targets = BTreeMap::new();
@@ -722,17 +1174,16 @@ impl Layer {
                     name: service.name.to_string(),
                     kind: service.kind,
                     url: url(&service.path),
-                    process: None,
+                    server: None,
                     proxy: None,
                 });
                 continue;
             }
 
-            let port = free_port().ok_or_else(|| internal("빈 포트를 찾지 못했습니다"))?;
+            // 포트(`PORT`)는 띄울 때마다 새로 받는다. 자고 깨면 바뀐다
             let mut env = vec![
-                ("PORT".to_owned(), port.to_string()),
                 ("HOST".to_owned(), "127.0.0.1".to_owned()),
-                // 미리보기에서 메일을 보내지 않는 것처럼, 앱이 어디에 섰는지에 따라 달리 굴 일이 있다
+                // 프리뷰에서 메일을 보내지 않는 것처럼, 앱이 어디에 섰는지에 따라 달리 굴 일이 있다
                 (
                     "ORBITAL_STAGE".to_owned(),
                     match stage {
@@ -781,42 +1232,44 @@ impl Layer {
                 &assembled.release,
                 &format!("{label}-{}", service.name),
             );
-            let command = service.start.as_deref().unwrap_or_default();
-            let failed = |log: &Path| Failure::StartFailed {
-                service: service.name.to_string(),
-                log: tail(log),
-            };
-            let mut live = LiveService {
+            let starter = Arc::new(ServiceStarter {
+                runner: Arc::clone(&self.runner),
+                folder: folder.to_path_buf(),
+                command: service.start.clone().unwrap_or_default(),
+                env,
+                external: External {
+                    vault: Arc::clone(&self.vault),
+                    organization: stand.organization.to_owned(),
+                    instance: instance.clone(),
+                    stage: stage.vault(),
+                    names: assembled.manifest.get().secrets.external.clone(),
+                },
+                log: log.clone(),
+                wake_timeout: self.wake_timeout,
+            });
+            let server = AppServer::new(
+                service.name.as_str(),
+                Arc::clone(&starter) as Arc<dyn Starter>,
+                self.sleep_after,
+                self.wake_timeout,
+                self.runtime.handle().clone(),
+            );
+            let live = LiveService {
                 name: service.name.to_string(),
                 kind: service.kind,
                 url: url(&service.path),
-                process: None,
+                server: Some(Arc::clone(&server)),
                 proxy,
             };
-            let mut process = self
-                .runner
-                .start(&Job {
-                    folder,
-                    command,
-                    env: &env,
-                    log: &log,
-                })
-                .map_err(|_| failed(&log))?;
-            // 포트가 열리기를 기다린다. 그 전에 프로세스가 끝나면 더 기다리지 않는다
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            let up = loop {
-                if wait_for_port(port, Duration::from_millis(100)) {
-                    break process.alive();
-                }
-                if !process.alive() || std::time::Instant::now() >= deadline {
-                    break false;
-                }
-            };
-            live.process = Some(process);
-            if !up {
-                return Err(failed(&log));
+            if wake {
+                let port = free_port().ok_or_else(|| internal("빈 포트를 찾지 못했습니다"))?;
+                let process = starter.start(port).map_err(|_| Failure::StartFailed {
+                    service: service.name.to_string(),
+                    log: tail(&log),
+                })?;
+                server.adopt(process, port);
             }
-            targets.insert(service.name.to_string(), RouterTarget::Server { port });
+            targets.insert(service.name.to_string(), RouterTarget::Server(server));
             services.push(live);
         }
 
@@ -837,7 +1290,7 @@ impl Layer {
             );
             Arc::new(move || AuthStore::connect(&url, &names, &manifest)) as Connect
         });
-        // 메일과 Google 은 팩토리의 키로 한다. 미리보기의 router 는 메일을 보내지 않고 Google 의 문이 없다
+        // 메일과 Google 은 팩토리의 키로 한다. 프리뷰의 router 는 메일을 보내지 않고 Google 의 문이 없다
         let mailer = Arc::new(FactoryMailer {
             settings: Arc::clone(&self.settings),
             organization: stand.organization.to_owned(),
@@ -878,7 +1331,21 @@ impl Layer {
             log: Some(log),
             documents: Arc::clone(&self.documents),
         };
-        let router = RouterTask(self.runtime.spawn(serve_router(listener, config)));
+        let router = match (listener, host, &self.hosted) {
+            (Some(listener), _, _) => {
+                Front::Port(self.runtime.spawn(serve_router(listener, config)))
+            }
+            (None, Some(target), Some(hosted)) => {
+                let router = Router::new(config);
+                hosted.hosts.insert(target.clone(), &router);
+                Front::Host {
+                    hosts: Arc::clone(&hosted.hosts),
+                    target,
+                    router,
+                }
+            }
+            _ => return Err(internal("router 를 세울 자리가 없습니다")),
+        };
         Ok(Launched {
             services,
             router,
@@ -886,7 +1353,7 @@ impl Layer {
         })
     }
 
-    /// 씨앗 사용자의 식별자. 미리보기에만 있다.
+    /// 씨앗 사용자의 식별자. 프리뷰에만 있다.
     fn seed_ids(assembled: &Assembled, stage: Stage) -> Vec<String> {
         if stage == Stage::Preview {
             assembled
@@ -918,6 +1385,29 @@ impl Layer {
             .collect()
     }
 
+    /// 운영에 올라 있는 release 가 밖에서 넣는다고 선언한 비밀. 운영이 없으면 비어 있다.
+    fn production_external(
+        &self,
+        instance: &InstanceId,
+        record: &InstanceRecord,
+    ) -> Outcome<Vec<SecretName>> {
+        let Some(production) = &record.production else {
+            return Ok(Vec::new());
+        };
+        let commit = record
+            .releases
+            .get(&production.release)
+            .and_then(|release| Commit::parse(&release.commit))
+            .ok_or_else(|| internal("운영의 release 를 찾지 못했습니다"))?;
+        Ok(self
+            .assembled(instance, &commit)?
+            .manifest
+            .get()
+            .secrets
+            .external
+            .clone())
+    }
+
     /// 운영에 올라 있는 release 의 권한 표. 운영이 없으면 빈 표다.
     fn production_access(&self, instance: &InstanceId, record: &InstanceRecord) -> Outcome<Access> {
         let Some(production) = &record.production else {
@@ -931,7 +1421,7 @@ impl Layer {
         Ok(self.assembled(instance, &commit)?.access)
     }
 
-    /// commit 하나의 미리보기를 세운다. 그 commit 에서 직접 빌드하고, 씨앗 데이터만 든 DB 를 새로 만들어 역할과 권한을 세우고, 권한 검사를 돌린다.
+    /// commit 하나의 프리뷰를 세운다. 그 commit 에서 직접 빌드하고, 씨앗 데이터만 든 DB 를 새로 만들어 역할과 권한을 세우고, 권한 검사를 돌린다.
     pub fn preview(&self, instance: &InstanceId, commit: Option<Commit>) -> Outcome<PreviewReport> {
         let mut inner = self.lock();
         let record = inner
@@ -948,7 +1438,7 @@ impl Layer {
         let assembled = self.assembled(instance, &commit)?;
         let folder = self.build(instance, &assembled)?;
 
-        // 앞의 미리보기를 걷는다. 인스턴스마다 미리보기는 하나다
+        // 앞의 프리뷰를 걷는다. 인스턴스마다 프리뷰는 하나다
         if let Some(old) = inner
             .live
             .remove(&(instance.as_str().to_owned(), Stage::Preview))
@@ -959,6 +1449,8 @@ impl Layer {
         }
 
         let names = Names::new(fresh_id('p')?);
+        // 세우기 전에 적어 둔다. 도중에 관리 서버가 내려가도 다시 뜰 때 이 database 를 걷는다
+        Self::note_preview(&mut inner, instance, Some(&names))?;
         let identity_key = random(32)?;
         let prepared =
             self.prepare_preview_database(&mut inner.admin, &names, &assembled, &identity_key);
@@ -978,7 +1470,7 @@ impl Layer {
             organization: &record.organization,
             app: &record.app,
         };
-        let launched = match self.launch(instance, &assembled, &folder, &stand) {
+        let launched = match self.launch(instance, &assembled, &folder, &stand, true) {
             Ok(launched) => launched,
             Err(failure) => {
                 let _ = inner.admin.destroy(&names);
@@ -986,7 +1478,13 @@ impl Layer {
             }
         };
 
-        // 운영에 아직 돌지 않은 마이그레이션이 있으면 예행연습이 필요하다
+        // 위쪽이 정한 적합성 테스트를 이 프리뷰에 대해 돌린다
+        let conformance = self.conform(instance, &assembled, &launched.origin);
+        let conformed = conformance
+            .as_ref()
+            .map_or(Conformed::NotDeclared, |report| report.outcome);
+
+        // 운영에 아직 돌지 않은 마이그레이션이 있으면 리허설이 필요하다
         let rehearsal = match &record.production {
             None => Rehearsed::NotNeeded,
             Some(_) => {
@@ -1022,6 +1520,12 @@ impl Layer {
                 access_findings: findings.len(),
                 rehearsal,
                 missing_keys: self.missing_keys(&record.organization, &assembled.manifest),
+                missing_secrets: self.missing_secrets(
+                    &record.organization,
+                    instance,
+                    &assembled.manifest,
+                ),
+                conformance: conformed,
             })
             .iter()
             .map(blocker_text)
@@ -1034,6 +1538,16 @@ impl Layer {
                     )
                 })
                 .collect(),
+            missing_secrets: missing_secrets(
+                &assembled.manifest,
+                &self
+                    .vault
+                    .filled(&record.organization, instance, SecretStage::Preview),
+            )
+            .iter()
+            .map(|name| name.as_str().to_owned())
+            .collect(),
+            conformance,
         };
 
         let stored = inner
@@ -1048,9 +1562,37 @@ impl Layer {
                 commit: commit.to_string(),
                 access_findings: findings.len(),
                 rehearsal,
+                external: assembled
+                    .manifest
+                    .get()
+                    .secrets
+                    .external
+                    .iter()
+                    .map(|name| name.as_str().to_owned())
+                    .collect(),
+                conformance: conformed,
             },
         );
         inner.registry.save().map_err(Failure::Internal)?;
+        // 업데이트를 담은 commit 이면 그 rollout 에 적용 · 프리뷰 · 검사의 결과를 넘긴다
+        self.track(
+            &mut inner,
+            instance,
+            &commit,
+            &[
+                RolloutEvent::Applied {
+                    instance: instance.clone(),
+                },
+                RolloutEvent::Previewed {
+                    instance: instance.clone(),
+                },
+                RolloutEvent::Checked {
+                    instance: instance.clone(),
+                    access_passed: findings.is_empty(),
+                    conformance_passed: conformed.clears(),
+                },
+            ],
+        )?;
         inner.live.insert(
             (instance.as_str().to_owned(), Stage::Preview),
             Live {
@@ -1064,6 +1606,19 @@ impl Layer {
             },
         );
         Ok(report)
+    }
+
+    /// 프리뷰의 database 를 기록에 적거나 지운다.
+    fn note_preview(
+        inner: &mut Inner,
+        instance: &InstanceId,
+        names: Option<&Names>,
+    ) -> Outcome<()> {
+        if let Some(record) = inner.registry.state.instances.get_mut(instance.as_str()) {
+            record.preview = names.map(|names| names.instance().as_str().to_owned());
+            inner.registry.save().map_err(Failure::Internal)?;
+        }
+        Ok(())
     }
 
     fn prepare_preview_database(
@@ -1093,7 +1648,7 @@ impl Layer {
                 "빈 DB 에 마이그레이션을 돌리다가 실패했습니다. {error}"
             ))
         })?;
-        // 씨앗 데이터의 SQL 이 씨앗 사용자를 가리킬 수 있게 그 앞에 넣는다. 미리보기에만 들어간다
+        // 씨앗 데이터의 SQL 이 씨앗 사용자를 가리킬 수 있게 그 앞에 넣는다. 프리뷰에만 들어간다
         admin
             .seed_users(names, &assembled.seed_users, now())
             .map_err(|error| {
@@ -1119,9 +1674,9 @@ impl Layer {
         ))
     }
 
-    /// 미리보기에서 씨앗 사용자로 요청해 볼 수 있게 그 사용자의 세션을 만들고, 요청에 그대로 붙일 `Cookie` 머리말의 값을 돌려준다.
+    /// 프리뷰에서 씨앗 사용자로 요청해 볼 수 있게 그 사용자의 세션을 만들고, 요청에 그대로 붙일 `Cookie` 머리말의 값을 돌려준다.
     ///
-    /// 미리보기의 DB 에만 있는 세션이라 운영에서는 읽히지 않는다. 씨앗 사용자(`db/seed/users.toml`)만 된다.
+    /// 프리뷰의 DB 에만 있는 세션이라 운영에서는 읽히지 않는다. 씨앗 사용자(`db/seed/users.toml`)만 된다.
     pub fn preview_session(&self, instance: &InstanceId, user: &str) -> Outcome<String> {
         let (names, manifest) = {
             let inner = self.lock();
@@ -1130,7 +1685,7 @@ impl Layer {
                 .get(&(instance.as_str().to_owned(), Stage::Preview))
                 .ok_or_else(|| {
                     Failure::Conflict(
-                        "떠 있는 미리보기가 없습니다. `orbital preview` 로 먼저 세워 주세요"
+                        "떠 있는 프리뷰가 없습니다. `orbital preview` 로 먼저 세워 주세요"
                             .to_owned(),
                     )
                 })?;
@@ -1151,7 +1706,7 @@ impl Layer {
         Ok(format!("{SESSION_COOKIE}={}", session.to_text()))
     }
 
-    /// 미리보기를 걷는다.
+    /// 프리뷰를 걷는다.
     pub fn stop_preview(&self, instance: &InstanceId) -> Outcome<()> {
         let mut inner = self.lock();
         if let Some(old) = inner
@@ -1162,7 +1717,7 @@ impl Layer {
             drop(old);
             inner.admin.destroy(&names).map_err(internal)?;
         }
-        Ok(())
+        Self::note_preview(&mut inner, instance, None)
     }
 
     /// 운영 DB 의 사본에 아직 돌지 않은 마이그레이션을 미리 돌려 본다. 숫자만 돌아온다.
@@ -1177,8 +1732,7 @@ impl Layer {
             .ok_or(Failure::NotFound)?;
         let known = record.releases.get(release).ok_or_else(|| {
             Failure::Conflict(
-                "그 release 의 미리보기가 없습니다. `orbital preview` 로 먼저 세워 주세요"
-                    .to_owned(),
+                "그 release 의 프리뷰가 없습니다. `orbital preview` 로 먼저 세워 주세요".to_owned(),
             )
         })?;
         let commit = Commit::parse(&known.commit)
@@ -1258,13 +1812,13 @@ impl Layer {
             .ok_or(Failure::NotFound)?;
         let known = record.releases.get(release).ok_or_else(|| {
             Failure::Conflict(
-                "그 release 의 미리보기가 없습니다. `orbital preview` 로 먼저 세워 주세요"
-                    .to_owned(),
+                "그 release 의 프리뷰가 없습니다. `orbital preview` 로 먼저 세워 주세요".to_owned(),
             )
         })?;
         let commit = Commit::parse(&known.commit)
             .ok_or_else(|| internal("release 의 commit 을 읽지 못했습니다"))?;
-        let (access_findings, rehearsal) = (known.access_findings, known.rehearsal);
+        let (access_findings, rehearsal, conformance) =
+            (known.access_findings, known.rehearsal, known.conformance);
         let organization = record.organization.clone();
         let manifest = self.assembled(instance, &commit)?.manifest;
         let found = blockers(&Release {
@@ -1273,6 +1827,8 @@ impl Layer {
             access_findings,
             rehearsal,
             missing_keys: self.missing_keys(&organization, &manifest),
+            missing_secrets: self.missing_secrets(&organization, instance, &manifest),
+            conformance,
         });
         if !found.is_empty() {
             return Err(Failure::Denied(PromoteDenied::Blocked { blockers: found }));
@@ -1313,13 +1869,27 @@ impl Layer {
             rehearsal: known.rehearsal,
             // 팩토리의 키는 올리는 때의 것을 본다. 앞에서 넣었다가 지웠으면 막힌다
             missing_keys: self.missing_keys(organization, &assembled.manifest),
+            // 밖에서 넣는 비밀도 올리는 때의 운영 칸을 본다
+            missing_secrets: self.missing_secrets(organization, instance, &assembled.manifest),
+            // 적합성 테스트는 프리뷰에서 돈 결과를 본다
+            conformance: known.conformance,
         };
-        // 승인은 호출에 적힌 release 하나에 묶인다. 승인한 뒤 commit 이 더해졌으면 식별자가 달라 여기서 찾지 못하거나 예행연습이 다시 필요하다
+        // 승인은 호출에 적힌 release 하나에 묶인다. 승인한 뒤 commit 이 더해졌으면 식별자가 달라 여기서 찾지 못하거나 리허설이 다시 필요하다
         let approval = Approval {
             release: ReleaseId(release.to_owned()),
             by: approved_by,
         };
         judge_promotion(&facts, change, Some(&approval)).map_err(Failure::Denied)?;
+        // 업데이트를 담은 release 면 그 rollout 의 관문(멈춤 · 물결 · 통과 · change)을 지나야 한다
+        let governing = self.governing(&inner, instance, &commit);
+        if let Some(id) = &governing
+            && let Some(record) = inner.registry.state.rollouts.get(id)
+        {
+            record
+                .rollout
+                .may_promote(instance, change)
+                .map_err(|refusal| Failure::Conflict(refusal_text(&refusal)))?;
+        }
 
         let folder = self.build(instance, &assembled)?;
         let names = Names::new(instance.clone());
@@ -1395,7 +1965,18 @@ impl Layer {
                     record: &record,
                     names: &names,
                 };
-                return Err(self.back_out(&mut inner, &prior, point.as_ref(), kind, failure));
+                let failure = self.back_out(&mut inner, &prior, point.as_ref(), kind, failure);
+                // 업데이트를 담은 release 가 서지 못하고 되돌려졌다. 그 인스턴스는 실패로 적히고 rollout 이 멈춘다
+                if let Some(id) = &governing {
+                    let _ = Self::record(
+                        &mut inner,
+                        id,
+                        &[RolloutEvent::RolledBack {
+                            instance: instance.clone(),
+                        }],
+                    );
+                }
+                return Err(failure);
             }
         };
 
@@ -1430,6 +2011,16 @@ impl Layer {
         });
         stored.promotion_requested = None;
         inner.registry.save().map_err(Failure::Internal)?;
+        if let Some(id) = &governing {
+            Self::record(
+                &mut inner,
+                id,
+                &[RolloutEvent::Promoted {
+                    instance: instance.clone(),
+                    change,
+                }],
+            )?;
+        }
         inner.live.insert(
             key,
             Live {
@@ -1495,7 +2086,7 @@ impl Layer {
             app: target.app,
         };
         let launched = self
-            .launch(target.instance, assembled, target.folder, &stand)
+            .launch(target.instance, assembled, target.folder, &stand, true)
             .map_err(|failure| (failure, migrated))?;
         Ok((launched, ran))
     }
@@ -1516,10 +2107,10 @@ impl Layer {
         };
         match after_promotion(false, kind) {
             Aftermath::Keep => failure,
-            Aftermath::RollBackCode => {
-                self.relaunch(inner, prior, production);
-                failure
-            }
+            Aftermath::RollBackCode => match self.relaunch(inner, prior, production) {
+                Ok(()) => failure,
+                Err(blocked) => blocked,
+            },
             Aftermath::AskHuman => {
                 // 마이그레이션이 돈 직후이고 아직 아무도 쓰지 않았다. 되돌릴 지점으로 돌려도 잃는 데이터가 없다
                 let manifest = prior
@@ -1532,8 +2123,10 @@ impl Layer {
                 if let (Some(point), Some(manifest)) = (point, manifest)
                     && inner.admin.restore(prior.names, &manifest, point).is_ok()
                 {
-                    self.relaunch(inner, prior, production);
-                    return failure;
+                    return match self.relaunch(inner, prior, production) {
+                        Ok(()) => failure,
+                        Err(blocked) => blocked,
+                    };
                 }
                 Failure::Conflict(
                     "새 release 가 서지 못했고 운영 DB 를 앞의 모습으로 돌리지도 못했습니다. 운영이 내려가 있습니다. 사람이 확인해야 합니다".to_owned(),
@@ -1542,8 +2135,14 @@ impl Layer {
         }
     }
 
-    /// 앞의 release 의 서버를 다시 띄운다.
-    fn relaunch(&self, inner: &mut Inner, prior: &Prior<'_>, production: &ProductionRecord) {
+    /// 앞의 release 의 서버를 다시 띄운다. 승격과 같은 판정을 지나서, 그 release 가 쓰는 비밀의 운영 값이 빠졌으면
+    /// 값 없이 띄우지 않고 까닭을 돌려준다.
+    fn relaunch(
+        &self,
+        inner: &mut Inner,
+        prior: &Prior<'_>,
+        production: &ProductionRecord,
+    ) -> Result<(), Failure> {
         let previous = prior
             .record
             .releases
@@ -1551,10 +2150,25 @@ impl Layer {
             .and_then(|release| Commit::parse(&release.commit))
             .and_then(|commit| self.assembled(prior.instance, &commit).ok());
         let Some(assembled) = previous else {
-            return;
+            return Ok(());
         };
+        let missing = self.missing_secrets(
+            &prior.record.organization,
+            prior.instance,
+            &assembled.manifest,
+        );
+        if !missing.is_empty() {
+            let names: Vec<String> = missing
+                .iter()
+                .map(|name| format!("`{}`", name.as_str()))
+                .collect();
+            return Err(Failure::Conflict(format!(
+                "새 release 가 서지 못했고, 앞의 release 가 쓰는 비밀 {} 의 운영 값이 없어 앞의 release 로 되돌리지도 못했습니다. 운영이 내려가 있습니다. 사람이 입력 카드에서 운영의 값을 넣은 뒤 다시 올려 주세요",
+                names.join(", ")
+            )));
+        }
         let Ok(folder) = self.build(prior.instance, &assembled) else {
-            return;
+            return Ok(());
         };
         // 권한을 앞의 권한 표로 되돌린다. 새 release 의 권한이 남아 있으면 안 된다
         let _ = inner
@@ -1569,7 +2183,7 @@ impl Layer {
             organization: &prior.record.organization,
             app: &prior.record.app,
         };
-        if let Ok(launched) = self.launch(prior.instance, &assembled, &folder, &stand) {
+        if let Ok(launched) = self.launch(prior.instance, &assembled, &folder, &stand, true) {
             inner.live.insert(
                 (prior.instance.as_str().to_owned(), Stage::Production),
                 Live {
@@ -1583,6 +2197,7 @@ impl Layer {
                 },
             );
         }
+        Ok(())
     }
 
     /// 사람의 승인을 기다리는 승격 요청. 없으면 `None` 이다. 권한의 변화는 읽는 때의 운영과 견준다.
@@ -1615,7 +2230,10 @@ impl Layer {
                 .map_err(internal)?,
         };
         let before = self.production_access(instance, &record)?;
+        let received = self.production_external(instance, &record)?;
+        let rollout = self.governing(&inner, instance, &commit);
         Ok(Some(PendingPromotion {
+            rollout,
             release,
             commit: commit.to_string(),
             changes: changes(&before, &assembled.access)
@@ -1623,6 +2241,10 @@ impl Layer {
                 .map(|change| change.sentence)
                 .collect(),
             migrations,
+            new_secrets: newly_received(&received, &assembled.manifest.get().secrets.external)
+                .iter()
+                .map(|name| name.as_str().to_owned())
+                .collect(),
         }))
     }
 
@@ -1781,6 +2403,7 @@ impl Layer {
             .destroy(&Names::new(instance.clone()))
             .map_err(internal)?;
         self.sources.destroy(instance).map_err(internal)?;
+        self.vault.forget(instance).map_err(vault_failure)?;
         inner.registry.state.instances.remove(instance.as_str());
         inner.registry.save().map_err(Failure::Internal)
     }
@@ -1907,5 +2530,682 @@ impl Layer {
             "{origin}/_orbital/auth/google/finish?ticket={}",
             ticket.to_text()
         ))
+    }
+}
+
+// ---- 밖에서 넣는 비밀 ----
+
+/// 봉인의 열쇠가 없는 레이어에서 값을 넣으려 했을 때의 까닭.
+const NO_SEAL_KEY: &str = "레이어에 봉인의 열쇠가 없어 비밀의 값을 넣지 못합니다. 레이어의 운영자가 `ORBITAL_SEAL_KEY` 를 넣고 다시 띄워야 합니다";
+
+/// 금고의 거절을 HTTP 의 답으로 옮긴다.
+fn vault_failure(error: VaultError) -> Failure {
+    match error {
+        VaultError::NoSealKey => Failure::Conflict(NO_SEAL_KEY.to_owned()),
+        VaultError::Internal(message) => Failure::Internal(message),
+    }
+}
+
+/// 비밀의 이름을 읽는다. 틀린 이름은 되풀이하지 않는다. 이름 자리에 값을 잘못 넣었을 수 있다.
+fn secret_name(name: &str) -> Outcome<SecretName> {
+    SecretName::parse(name).map_err(|error| {
+        Failure::Problems(vec![format!(
+            "비밀의 이름이 틀렸습니다({error}). `orbital.toml` 의 `[secrets] external` 에 적은 이름(대문자 · 숫자 · 밑줄)을 써 주세요"
+        )])
+    })
+}
+
+fn undeclared(name: &SecretName) -> String {
+    format!(
+        "비밀 `{}` 은 이 인스턴스의 어느 release 도 밖에서 넣는다고 선언하지 않았습니다. `orbital.toml` 의 `[secrets] external` 에 적고 프리뷰를 세운 뒤 요청해 주세요",
+        name.as_str()
+    )
+}
+
+/// 값을 받지 않는 까닭. 값은 되풀이하지 않는다.
+fn value_failure(problems: &[ValueProblem]) -> Failure {
+    Failure::Problems(
+        problems
+            .iter()
+            .map(|problem| match problem {
+                ValueProblem::Empty => "값이 비었습니다. 값을 붙여 넣어 주세요".to_owned(),
+                ValueProblem::TooLarge { max } => {
+                    format!("값이 {max}바이트보다 큽니다. 비밀의 값만 넣어 주세요")
+                }
+                ValueProblem::Nul => {
+                    "값에 NUL 글자가 들었습니다. 환경 변수에 실을 수 없으니 값을 다시 복사해 넣어 주세요"
+                        .to_owned()
+                }
+            })
+            .collect(),
+    )
+}
+
+impl Layer {
+    /// 선언이 밖에서 넣는다고 적었는데 운영의 칸에 풀리는 값이 없는 비밀. 판정은 core 가 한다.
+    fn missing_secrets(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        manifest: &ValidManifest,
+    ) -> Vec<SecretName> {
+        missing_secrets(
+            manifest,
+            &self
+                .vault
+                .filled(organization, instance, SecretStage::Production),
+        )
+    }
+
+    /// 인스턴스가 속한 팩토리. 토큰의 길이 범위를 판정받은 뒤에 쓴다.
+    pub fn instance_organization(&self, instance: &InstanceId) -> Outcome<String> {
+        self.lock()
+            .registry
+            .state
+            .instances
+            .get(instance.as_str())
+            .map(|record| record.organization.clone())
+            .ok_or(Failure::NotFound)
+    }
+
+    /// 그 인스턴스의 release(프리뷰로 세운 것과 운영의 것)가 밖에서 넣는다고 선언한 이름. 다른 팩토리의 것은 없는 것으로 답한다.
+    fn declared_secrets(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+    ) -> Outcome<BTreeSet<SecretName>> {
+        let mut inner = self.lock();
+        let record = Self::owned(&mut inner, organization, instance)?;
+        Ok(record
+            .releases
+            .values()
+            .flat_map(|release| release.external.iter())
+            .filter_map(|name| SecretName::parse(name).ok())
+            .collect())
+    }
+
+    /// 이름마다 선언됐는지 · 요청됐는지 · 단계마다 채워졌는지. 값은 어떤 열쇠로도 돌려주지 않는다.
+    pub fn list_secrets(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+    ) -> Outcome<Vec<SecretReport>> {
+        let declared = self.declared_secrets(organization, instance)?;
+        let status = self.vault.status(organization, instance);
+        let requests = self.vault.requests(instance);
+        let mut names: BTreeSet<String> = declared
+            .iter()
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        names.extend(status.keys().map(|name| name.as_str().to_owned()));
+        names.extend(requests.keys().cloned());
+        let slot = |at: Option<u64>| SlotReport {
+            set: at.is_some(),
+            set_at: at,
+        };
+        Ok(names
+            .into_iter()
+            .map(|name| {
+                let parsed = SecretName::parse(&name).ok();
+                let filled = parsed
+                    .as_ref()
+                    .and_then(|parsed| status.get(parsed).cloned())
+                    .unwrap_or_default();
+                SecretReport {
+                    declared: parsed.is_some_and(|parsed| declared.contains(&parsed)),
+                    requested: requests.get(&name).map(|requested| RequestedReport {
+                        reason: requested.reason.clone(),
+                        at: requested.at,
+                    }),
+                    preview: slot(filled.preview),
+                    production: slot(filled.production),
+                    name,
+                }
+            })
+            .collect())
+    }
+
+    /// 사람에게 비밀의 입력을 요청한다. 에이전트의 토큰(`secrets:request`)이나 service key 로 부른다.
+    pub fn request_secret(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        name: &str,
+        reason: &str,
+    ) -> Outcome<()> {
+        let name = secret_name(name)?;
+        let declared = self.declared_secrets(organization, instance)?;
+        let problems = judge_request(&declared, &name, reason);
+        if !problems.is_empty() {
+            return Err(Failure::Problems(
+                problems
+                    .iter()
+                    .map(|problem| match problem {
+                        RequestProblem::Undeclared => undeclared(&name),
+                        RequestProblem::ReasonEmpty => {
+                            "까닭(reason)을 적어 주세요. 사람이 카드에서 무엇에 쓰는 값인지 읽습니다"
+                                .to_owned()
+                        }
+                        RequestProblem::ReasonTooLong { max } => {
+                            format!("까닭(reason)은 {max}자 안으로 줄여 주세요")
+                        }
+                    })
+                    .collect(),
+            ));
+        }
+        self.vault
+            .request(instance, &name, reason.trim(), (self.clock)())
+            .map_err(vault_failure)
+    }
+
+    /// 값을 넣는다(service key 만). 그 단계에 떠 있는 서비스는 재워, 다음 요청이 새 값으로 깨게 한다.
+    pub fn put_secret(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        name: &str,
+        stage: SecretStage,
+        value: &SecretValue,
+    ) -> Outcome<()> {
+        let name = secret_name(name)?;
+        if !self
+            .declared_secrets(organization, instance)?
+            .contains(&name)
+        {
+            return Err(Failure::Problems(vec![undeclared(&name)]));
+        }
+        let problems = judge_value(value.expose());
+        if !problems.is_empty() {
+            return Err(value_failure(&problems));
+        }
+        let place = Place {
+            instance: instance.clone(),
+            name,
+            stage,
+        };
+        self.vault
+            .put(organization, &place, value, (self.clock)())
+            .map_err(vault_failure)?;
+        self.refresh(&place);
+        Ok(())
+    }
+
+    /// 값을 지운다(service key 만). 지금 운영의 release 가 쓰는 비밀의 운영 값은 지우지 못한다.
+    pub fn remove_secret(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        name: &str,
+        stage: SecretStage,
+    ) -> Outcome<bool> {
+        let name = secret_name(name)?;
+        let record = {
+            let mut inner = self.lock();
+            Self::owned(&mut inner, organization, instance)?.clone()
+        };
+        if stage == SecretStage::Production
+            && self.production_external(instance, &record)?.contains(&name)
+        {
+            return Err(Failure::Conflict(format!(
+                "지금 운영의 release 가 쓰는 비밀 `{}` 의 운영 값은 지우지 못합니다. 값을 바꾸려면 새 값을 넣어 주세요. 지우려면 먼저 `[secrets] external` 에서 뺀 release 를 운영에 올려 주세요",
+                name.as_str()
+            )));
+        }
+        let place = Place {
+            instance: instance.clone(),
+            name,
+            stage,
+        };
+        let removed = self.vault.remove(&place).map_err(vault_failure)?;
+        if removed {
+            self.refresh(&place);
+        }
+        Ok(removed)
+    }
+
+    /// 사람이 값을 넣을 입력 표를 낸다(service key 만). 표는 인스턴스 · 이름 · 단계 하나에 묶이고 10분 안에 한 번 쓴다.
+    /// 레이어는 표의 sha256 만 적는다. 사람의 브라우저가 돌려받은 주소로 레이어에 바로 값을 보낸다.
+    pub fn open_entry(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        name: &str,
+        stage: SecretStage,
+    ) -> Outcome<EntryTicket> {
+        let name = secret_name(name)?;
+        if !self
+            .declared_secrets(organization, instance)?
+            .contains(&name)
+        {
+            return Err(Failure::Problems(vec![undeclared(&name)]));
+        }
+        // 넣지 못할 값을 받을 표는 내지 않는다
+        if !self.vault.can_seal() {
+            return Err(Failure::Conflict(NO_SEAL_KEY.to_owned()));
+        }
+        let ticket = token::hex(&random(32)?);
+        let now = (self.clock)();
+        let expires_at = entry_expires_at(now);
+        self.vault
+            .issue(
+                organization,
+                &sha256_hex(&ticket),
+                Entry {
+                    place: Place {
+                        instance: instance.clone(),
+                        name,
+                        stage,
+                    },
+                    expires_at,
+                    used: false,
+                },
+                now,
+            )
+            .map_err(vault_failure)?;
+        Ok(EntryTicket {
+            url: format!("{}/v1/secret-entries/{ticket}", self.public_url),
+            expires_at,
+        })
+    }
+
+    /// 입력 표로 값을 넣는다. 쿠키도 키도 보지 않고 표만 본다. 본문이 적은 이름과 단계는 표의 것과 같아야 한다.
+    pub fn redeem_entry(
+        &self,
+        ticket: &str,
+        name: Option<&str>,
+        stage: Option<SecretStage>,
+        value: &SecretValue,
+    ) -> Outcome<Place> {
+        if ticket.len() != 64 || !ticket.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Failure::NotFound);
+        }
+        let name = name.map(secret_name).transpose()?;
+        let place = self
+            .vault
+            .redeem(&sha256_hex(ticket), (name, stage), value, (self.clock)())
+            .map_err(|error| match error {
+                RedeemError::Unknown => Failure::NotFound,
+                RedeemError::Refused(EntryRefusal::Used) => Failure::Gone(
+                    "이미 쓴 입력 표입니다. 카드에서 표를 새로 받아 주세요".to_owned(),
+                ),
+                RedeemError::Refused(EntryRefusal::Expired) => Failure::Gone(
+                    "입력 표가 만료되었습니다(10분). 카드에서 표를 새로 받아 주세요".to_owned(),
+                ),
+                RedeemError::Refused(EntryRefusal::OtherPlace) => Failure::Invalid(
+                    "입력 표는 묶인 이름과 단계에만 값을 넣습니다. 본문에는 `value` 만 적어 주세요"
+                        .to_owned(),
+                ),
+                RedeemError::Value(problems) => value_failure(&problems),
+                RedeemError::Vault(error) => vault_failure(error),
+            })?;
+        self.refresh(&place);
+        Ok(place)
+    }
+
+    /// 그 단계에 떠 있는 앱이 이 비밀을 선언했으면 서버 서비스를 재운다. 다음 요청이 새 값으로 깬다.
+    fn refresh(&self, place: &Place) {
+        let inner = self.lock();
+        let Some(live) = inner
+            .live
+            .get(&(place.instance.as_str().to_owned(), Stage::of(place.stage)))
+        else {
+            return;
+        };
+        if !live.manifest.get().secrets.external.contains(&place.name) {
+            return;
+        }
+        for service in &live.services {
+            if let Some(server) = &service.server {
+                server.refresh();
+            }
+        }
+    }
+}
+
+// ---- 백업과 복구 훈련 ----
+
+/// 인스턴스 하나를 되살린 결과. 이름과 숫자만 싣는다.
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreReport {
+    pub instance: String,
+    /// 되살린 시점(유닉스 초).
+    pub at: u64,
+    /// 되살리는 데 걸린 시간.
+    pub millis: u64,
+    /// 되살린 database 의 표의 수.
+    pub tables: usize,
+    /// 되살리기 직전의 운영 DB 를 떠 둔 되돌릴 지점(database 의 이름).
+    pub restore_point: String,
+}
+
+/// 팩토리가 보는 훈련의 모습. 통과했는지와 숫자만.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupStatus {
+    /// 마지막으로 통과한 훈련이 여드레 안인가. 아니면 새 고객의 데이터를 받지 않는 것이 규칙이다.
+    pub fresh: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_passed_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_drill: Option<DrillSummary>,
+}
+
+/// 마지막 훈련의 숫자.
+#[derive(Debug, Clone, Serialize)]
+pub struct DrillSummary {
+    pub passed: bool,
+    pub at: u64,
+    pub recovery_millis: u64,
+    pub drill_millis: u64,
+    pub exposure_seconds: Option<u64>,
+    pub instances: usize,
+    pub checks: usize,
+    pub failed_checks: usize,
+}
+
+fn backup_off() -> Failure {
+    Failure::Conflict(
+        "이 레이어는 백업을 켜지 않았습니다. 레이어의 운영자가 관리 서버에 `ORBITAL_BACKUP_DIR` 을 적어야 합니다".to_owned(),
+    )
+}
+
+/// 그 시점으로 되살리지 못하는 까닭. 무엇을 고치면 되는지를 함께 적는다.
+pub fn restore_refusal_text(refusal: &orbital_core::backup::RestoreRefusal) -> String {
+    use orbital_core::backup::RestoreRefusal;
+    match refusal {
+        RestoreRefusal::NoBackup => "기반 백업이 아직 없습니다. 레이어가 첫 기반 백업을 뜬 뒤의 시점으로만 되살릴 수 있습니다".to_owned(),
+        RestoreRefusal::BeforeOldestBackup { oldest } => format!(
+            "가장 오랜 기반 백업(유닉스 초 {})보다 앞선 시점으로는 되살리지 못합니다. 그 뒤의 시점을 적어 주세요",
+            oldest.div_ceil(1000)
+        ),
+        RestoreRefusal::BeyondArchive { .. } => {
+            "보관한 WAL 이 그 시점에 닿지 않습니다. 지금보다 앞선 시점을 적어 주세요".to_owned()
+        }
+        RestoreRefusal::MissingWal { segment } => format!(
+            "기반 백업에서 그 시점까지 이어지는 WAL 조각 `{segment}` 이 보관 폴더에 없어 되살리지 못합니다. 레이어의 운영자가 백업을 확인해야 합니다"
+        ),
+    }
+}
+
+/// 훈련이 낡아 새 인스턴스를 받지 않는 까닭. 에이전트가 고칠 수 없는 일임을 밝힌다.
+fn stale_text(freshness: orbital_core::backup::Freshness) -> String {
+    use orbital_core::backup::Freshness;
+    let why = match freshness {
+        Freshness::Overdue { .. } => "마지막으로 통과한 복구 훈련이 여드레를 넘겼습니다",
+        Freshness::NeverPassed | Freshness::Fresh => "복구 훈련이 한 번도 통과하지 않았습니다",
+    };
+    format!(
+        "{why}. 훈련이 통과한 뒤에만 새 고객의 데이터를 받으므로 새 인스턴스를 세우지 않습니다. 에이전트가 고칠 수 없는 일입니다. 레이어의 운영자가 `orbitald drill` 로 훈련을 통과시켜야 합니다. 이미 선 인스턴스의 프리뷰와 승격은 그대로 됩니다"
+    )
+}
+
+impl Layer {
+    fn backup_on(&self) -> Outcome<&Backup> {
+        self.backup.as_ref().ok_or_else(backup_off)
+    }
+
+    /// 마지막으로 통과한 훈련으로 본 지금의 모습.
+    fn freshness(&self) -> orbital_core::backup::Freshness {
+        let history = crate::backup::history(&self.home);
+        orbital_core::backup::freshness(orbital_core::backup::last_passed(&history), (self.clock)())
+    }
+
+    /// 훈련을 켠 레이어에서 훈련이 낡았으면 새 인스턴스를 받지 않는다.
+    fn require_fresh_drill(&self) -> Outcome<()> {
+        if self
+            .backup
+            .as_ref()
+            .is_some_and(|backup| backup.require_drill)
+        {
+            let freshness = self.freshness();
+            if !freshness.is_fresh() {
+                return Err(Failure::Conflict(stale_text(freshness)));
+            }
+        }
+        Ok(())
+    }
+
+    /// 기반 백업을 하나 뜨고 보관 기간이 지난 것을 지운다. 백업을 켜지 않은 레이어에서는 409 다.
+    /// 뜨는 동안 다른 일을 멈춰 레이어의 기록과 DB 가 같은 때의 것이 되게 한다.
+    pub fn base_backup(&self) -> Outcome<orbital_core::backup::BaseBackup> {
+        let backup = self.backup_on()?;
+        let _guard = self.lock();
+        crate::backup::take_base_backup(
+            backup.store.as_ref(),
+            &self.home,
+            &self.pg_url,
+            backup.keep_for,
+        )
+        .map_err(internal)
+    }
+
+    /// 복구 훈련을 한 번 돌리고 기록에 쌓는다. 훈련은 운영 클러스터를 덮어쓰지 않고, 도는 동안 다른 일을 막지 않는다.
+    pub fn drill(&self) -> Outcome<orbital_core::backup::DrillRecord> {
+        let backup = self.backup_on()?;
+        let record = crate::backup::drill(
+            backup.store.as_ref(),
+            &self.home,
+            &self.pg_url,
+            (self.clock)(),
+        );
+        crate::backup::append(&self.home, &record).map_err(Failure::Internal)?;
+        Ok(record)
+    }
+
+    /// 팩토리가 보는 훈련의 모습. 훈련은 레이어 하나의 일이라 어느 팩토리에게나 같다.
+    pub fn backup_status(&self, _organization: &str) -> Outcome<BackupStatus> {
+        let history = crate::backup::history(&self.home);
+        let last_passed_at = orbital_core::backup::last_passed(&history);
+        let fresh = orbital_core::backup::freshness(last_passed_at, (self.clock)()).is_fresh();
+        let last_drill = history
+            .iter()
+            .max_by_key(|record| record.at)
+            .map(|record| DrillSummary {
+                passed: record.passed,
+                at: record.at,
+                recovery_millis: record.recovery_millis,
+                drill_millis: record.drill_millis,
+                exposure_seconds: record.exposure_seconds,
+                instances: record.instances,
+                checks: record.checks.len(),
+                failed_checks: record
+                    .checks
+                    .iter()
+                    .filter(|checked| !checked.passed)
+                    .count(),
+            });
+        Ok(BackupStatus {
+            fresh,
+            last_passed_at,
+            last_drill,
+        })
+    }
+
+    /// 정한 주기가 됐으면 기반 백업을 뜨고 복구 훈련을 돌린다. 관리 서버가 1분마다 부른다.
+    /// 훈련이 실패했으면 주기를 기다리지 않고 한 시간 뒤에 다시 돌린다.
+    pub fn tend(&self, backup_every: Duration, drill_every: Duration) {
+        let Some(backup) = &self.backup else {
+            return;
+        };
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            });
+        let latest = backup
+            .store
+            .backups()
+            .ok()
+            .and_then(|backups| backups.iter().map(|backup| backup.finished_at).max());
+        let every = u64::try_from(backup_every.as_millis()).unwrap_or(u64::MAX);
+        if latest.is_none_or(|at| now_millis >= at.saturating_add(every))
+            && self.base_backup().is_err()
+        {
+            eprintln!("orbitald: 기반 백업을 뜨지 못했습니다");
+        }
+        let history = crate::backup::history(&self.home);
+        let now = (self.clock)();
+        let due = match history.iter().max_by_key(|record| record.at) {
+            None => true,
+            Some(last) if last.passed => now >= last.at.saturating_add(drill_every.as_secs()),
+            Some(last) => now >= last.at.saturating_add(60 * 60),
+        };
+        if due {
+            match self.drill() {
+                Ok(record) if record.passed => eprintln!(
+                    "orbitald: 복구 훈련이 통과했습니다(복구 {}ms)",
+                    record.recovery_millis
+                ),
+                Ok(_) => eprintln!(
+                    "orbitald: 복구 훈련이 실패했습니다. drills.jsonl 의 마지막 줄을 봐 주세요"
+                ),
+                Err(_) => eprintln!("orbitald: 복구 훈련을 돌리지 못했습니다"),
+            }
+        }
+    }
+
+    /// 운영 중인 인스턴스 하나의 DB 를 지난 시점(유닉스 초)으로 되살린다. 팩토리의 서버(service key)만 부른다.
+    ///
+    /// 옆에 그 시점의 클러스터를 되살린 뒤 이 인스턴스의 database 만 운영 클러스터로 옮겨 바꿔 넣는다. 순서는 이렇다.
+    /// 옆 이름에 레이어의 계획으로 다시 세우고 권한 검사를 지난다(앱의 정의는 관리 권한으로 돌지 않는다) → 서버를 재운다 →
+    /// 지금의 운영 DB 를 되돌릴 지점으로 남긴다 → 이름을 바꿔 넣는다 → 다음 요청이 되살린 DB 에 닿는다.
+    /// 다른 인스턴스의 database 와 역할은 건드리지 않는다. 코드(release)와 금고는 그대로다.
+    pub fn restore_instance(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        at: u64,
+    ) -> Outcome<RestoreReport> {
+        use orbital_backup::DatabaseName;
+
+        let started = Instant::now();
+        let mut inner = self.lock();
+        let record = Self::owned(&mut inner, organization, instance)?.clone();
+        let backup = self.backup_on()?;
+        let production = record.production.clone().ok_or_else(|| {
+            Failure::Conflict("운영에 오른 것이 없어 되살릴 DB 가 없습니다".to_owned())
+        })?;
+        let at_millis = at
+            .checked_mul(1000)
+            .ok_or_else(|| Failure::Problems(vec!["`at` 은 유닉스 초로 적어 주세요".to_owned()]))?;
+        let commit = record
+            .releases
+            .get(&production.release)
+            .and_then(|release| Commit::parse(&release.commit))
+            .ok_or_else(|| internal("운영의 release 를 찾지 못했습니다"))?;
+        let assembled = self.assembled(instance, &commit)?;
+
+        // 그 시점의 클러스터를 옆에 세운다. 운영 클러스터는 덮어쓰지 않는다
+        let store = backup.store.as_ref();
+        store.seal(&self.pg_url).map_err(internal)?;
+        let backups = store.backups().map_err(internal)?;
+        let archive = store.archive().map_err(internal)?;
+        let chosen = orbital_core::backup::judge_restore(&backups, &archive, at_millis)
+            .map_err(|refusal| Failure::Conflict(restore_refusal_text(&refusal)))?
+            .clone();
+        let side = store
+            .recover(&chosen, at_millis)
+            .map_err(|error| Failure::Conflict(error.to_string()))?;
+        let names = Names::new(instance.clone());
+        let present = side
+            .connect("postgres")
+            .and_then(|mut client| orbital_backup::databases(&mut client))
+            .map_err(internal)?;
+        if !present.contains(&names.database()) {
+            return Err(Failure::Conflict(
+                "그 시점에는 이 인스턴스의 DB 가 아직 없었습니다. 운영에 처음 오른 뒤의 시점을 적어 주세요".to_owned(),
+            ));
+        }
+        let source = DatabaseName::parse(&names.database()).map_err(internal)?;
+        let suffix: String = random(5)?
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let staged = names
+            .staged(&format!("rs_{suffix}"))
+            .ok_or_else(|| internal("옆 이름을 짓지 못했습니다"))?;
+        let identity_key = token::unhex(&production.identity_key)
+            .ok_or_else(|| internal("서명의 열쇠를 읽지 못했습니다"))?;
+        let manifest = &assembled.manifest;
+
+        // 그 시점의 database 를 운영 클러스터의 옆 이름에 다시 세운다. 레이어의 것은 레이어의 계획으로 세우고, 앱의 정의는
+        // 마이그레이션 역할로, 로그인의 행은 인증 역할로 넣는다. 권한을 권한 표대로 세워 권한 검사를 지나야 바꿔 넣는다.
+        // 이동안 운영은 그대로 돈다
+        let plan = crate::backup::Rebuild {
+            names: &staged,
+            manifest,
+            access: &assembled.access,
+            identity_key: &identity_key,
+            pg_url: &self.pg_url,
+        };
+        let rebuilt = crate::backup::rebuild(&mut inner.admin, &side, &source, &plan);
+        drop(side);
+        rebuilt.map_err(Failure::Conflict)?;
+
+        // 서버를 재우고, 지금의 운영 DB 를 되돌릴 지점으로 남긴 뒤 바꿔 넣는다
+        let key = (instance.as_str().to_owned(), Stage::Production);
+        let sleep = |inner: &Inner| {
+            if let Some(live) = inner.live.get(&key) {
+                for service in &live.services {
+                    if let Some(server) = &service.server {
+                        server.refresh();
+                    }
+                }
+            }
+        };
+        let forget_staged = |inner: &mut Inner| {
+            let _ = inner.admin.forget(RestorePoint::named(staged.database()));
+        };
+        sleep(&inner);
+        if let Err(error) = inner.admin.quiesce(&names) {
+            forget_staged(&mut inner);
+            return Err(internal(error));
+        }
+        let marked = inner.admin.mark(&names);
+        let resumed = inner.admin.resume(&names);
+        let point = match (marked, resumed) {
+            (Ok(point), Ok(())) => point,
+            (marked, resumed) => {
+                forget_staged(&mut inner);
+                return Err(internal(
+                    marked
+                        .err()
+                        .or(resumed.err())
+                        .map_or_else(String::new, |error| error.to_string()),
+                ));
+            }
+        };
+        if let Err(error) =
+            inner
+                .admin
+                .restore(&names, manifest, &RestorePoint::named(staged.database()))
+        {
+            forget_staged(&mut inner);
+            let _ = inner.admin.forget(point);
+            return Err(internal(error));
+        }
+        let tables = inner
+            .admin
+            .tables(&names, manifest)
+            .map_err(internal)?
+            .len();
+
+        // 되돌릴 지점은 하나만 둔다. 앞의 승격이 남긴 것은 지운다
+        if let Some(old) = production.restore_point.clone() {
+            let _ = inner.admin.forget(RestorePoint::named(old));
+        }
+        let stored = Self::owned(&mut inner, organization, instance)?;
+        if let Some(production) = stored.production.as_mut() {
+            production.restore_point = Some(point.database().to_owned());
+        }
+        inner.registry.save().map_err(Failure::Internal)?;
+        // 앞의 DB 에 붙어 있던 프로세스를 다시 재운다. 다음 요청이 되살린 DB 로 깬다
+        sleep(&inner);
+        Ok(RestoreReport {
+            instance: instance.as_str().to_owned(),
+            at,
+            millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            tables,
+            restore_point: point.database().to_owned(),
+        })
     }
 }

@@ -113,7 +113,7 @@ fn word_after<'a>(text: &'a str, marker: &str) -> &'a str {
 }
 
 #[test]
-fn 에이전트가_코드를_받아_고쳐_올리고_미리보기의_주소를_받는다() {
+fn 에이전트가_코드를_받아_고쳐_올리고_프리뷰의_주소를_받는다() {
     let Ok(pg_url) = std::env::var("ORBITAL_PG") else {
         eprintln!("ORBITAL_PG 가 없어 건너뜁니다. scripts/pg-local.sh 로 띄워 주세요");
         return;
@@ -203,9 +203,9 @@ fn 에이전트가_코드를_받아_고쳐_올리고_미리보기의_주소를_�
         git(&work, &["rev-parse", "HEAD"])
     );
 
-    // ---- 미리보기: 명령 한 번으로 주소가 돌아온다 ----
+    // ---- 프리뷰: 명령 한 번으로 주소가 돌아온다 ----
     let preview = agent.ok(&work, &["preview"]);
-    assert!(preview.contains("미리보기가 섰습니다"), "{preview}");
+    assert!(preview.contains("프리뷰가 섰습니다"), "{preview}");
     assert!(
         preview.contains("자기 행을 읽을 수 있게 됩니다"),
         "{preview}"
@@ -239,7 +239,7 @@ fn 에이전트가_코드를_받아_고쳐_올리고_미리보기의_주소를_�
     assert!(
         agent
             .ok(&work, &["rehearse", release])
-            .contains("예행연습이 필요 없습니다")
+            .contains("리허설이 필요 없습니다")
     );
 
     // ---- 다른 작업 폴더가 먼저 올렸을 때: 받아 합친 뒤에 올린다 ----

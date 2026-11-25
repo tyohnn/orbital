@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 046e55a4d69996e2604130e34983cddf3277c8b968642fbe32b19dd5bafa3335 # shrinks to declared = [false, false, true], filled = [false, false, false]
+cc ad888fda56226bb8b87fafa6c5e31ce45ec493570f20f8079f3d783c87086ebd # shrinks to token = Token { organization: OrganizationId("org_a"), instance: InstanceId("k3f9x2ab"), can: {}, expires_at: 0 }, request = Request { organization: OrganizationId("org_a"), instance: InstanceId("k3f9x2ab"), action: SourceRead, at: 0 }, words = []

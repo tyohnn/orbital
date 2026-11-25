@@ -179,7 +179,7 @@ pub fn static_file(path: &str, service_path: &str) -> Option<Vec<String>> {
     Some(parts)
 }
 
-/// 미리보기의 씨앗 사용자(`db/seed/users.toml`). 미리보기에만 들어가고 운영에는 들어가지 않는다.
+/// 프리뷰의 씨앗 사용자(`db/seed/users.toml`). 프리뷰에만 들어가고 운영에는 들어가지 않는다.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeedUsers {
@@ -190,7 +190,7 @@ pub struct SeedUsers {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeedUser {
-    /// 미리보기 전용이라 `u_` 모양이 아니어도 된다. 씨앗 데이터의 SQL 이 이 식별자로 행의 주인을 적는다.
+    /// 프리뷰 전용이라 `u_` 모양이 아니어도 된다. 씨앗 데이터의 SQL 이 이 식별자로 행의 주인을 적는다.
     pub id: Ident,
     pub email: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

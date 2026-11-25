@@ -1,4 +1,4 @@
-//! 로그인 한 바퀴를 실제로 돈다. 레이어가 미리보기와 운영 앞에 router 를 세우고, 사람은 router 의 주소로만 닿는다.
+//! 로그인 한 바퀴를 실제로 돈다. 레이어가 프리뷰와 운영 앞에 router 를 세우고, 사람은 router 의 주소로만 닿는다.
 //!
 //! 실제 PostgreSQL, 실제 git, 실제 앱 프로세스(Node 서버), 실제 HTTP 로 잰다. router 에는 손으로 짠 HTTP/1.1 요청을 보낸다.
 //! 브라우저나 HTTP 라이브러리가 경로의 `..` 를 미리 풀어 버리지 않게, 그리고 답의 머리말을 빠짐없이 견주려는 것이다.
@@ -381,7 +381,7 @@ impl Bench {
         body["token"].as_str().unwrap().to_owned()
     }
 
-    /// 미리보기를 세운다. 그 router 의 주소와 release 를 돌려준다.
+    /// 프리뷰를 세운다. 그 router 의 주소와 release 를 돌려준다.
     fn preview_release(&self, instance: &str, token: &str) -> (String, String) {
         let (status, preview) = self.call(
             "POST",
@@ -401,7 +401,7 @@ impl Bench {
         self.preview_release(instance, token).0
     }
 
-    /// 미리보기 → 승격 요청 → 고객의 승인 → 운영. 운영의 router 의 주소를 돌려준다.
+    /// 프리뷰 → 승격 요청 → 고객의 승인 → 운영. 운영의 router 의 주소를 돌려준다.
     fn ship(&mut self, app: &str) -> (String, String) {
         let instance = self.instance(app);
         let token = self.token(&instance);
@@ -438,6 +438,18 @@ impl Bench {
         Outbox::read(&self.home.join(OUTBOX))
     }
 
+    /// 그 이메일로 `count` 통이 쌓일 때까지 기다렸다가 돌려준다. 메일은 링크 요청의 답을 보낸 뒤에 뒤에서 나간다.
+    fn wait_mails_to(&self, email: &str, count: usize) -> Vec<Mail> {
+        let started = std::time::Instant::now();
+        loop {
+            let mails = self.mails_to(email);
+            if mails.len() >= count || started.elapsed() > Duration::from_secs(10) {
+                return mails;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn mails_to(&self, email: &str) -> Vec<Mail> {
         self.mails()
             .into_iter()
@@ -447,6 +459,7 @@ impl Bench {
 
     /// 사람이 하듯이 들어온다. 링크를 요청하고, 메일함에서 링크를 꺼내 같은 브라우저로 연다. 세션 쿠키(`이름=값`)를 돌려준다.
     fn sign_in(&self, origin: &str, email: &str) -> String {
+        let before = self.mails_to(email).len();
         let asked = http(
             "POST",
             origin,
@@ -457,7 +470,7 @@ impl Bench {
         assert_eq!(asked.status, 202, "{}", asked.body);
         let browser = asked.cookie("__Host-orbital-browser");
         let link = self
-            .mails_to(email)
+            .wait_mails_to(email, before + 1)
             .pop()
             .expect("메일함에 링크가 없습니다")
             .link;
@@ -643,8 +656,8 @@ fn 초대받지_않은_이메일과_초대받은_이메일에_같은_답이_가�
         (stranger.status, strip(&stranger), &stranger.body)
     );
 
-    assert_eq!(bench.mails_to("kim@example.com").len(), 1);
-    assert_eq!(bench.mails_to("lee@example.com").len(), 1);
+    assert_eq!(bench.wait_mails_to("kim@example.com", 1).len(), 1);
+    assert_eq!(bench.wait_mails_to("lee@example.com", 1).len(), 1);
     assert!(bench.mails_to("stranger@example.com").is_empty());
     assert!(bench.mails_to("nobody@example.com").is_empty());
 }
@@ -819,7 +832,7 @@ fn 로그인이_필요한_서비스에_세션_없이_화면을_열면_로그인_
 }
 
 #[test]
-fn 씨앗_사용자로_들어가는_길은_미리보기에만_있고_운영에서는_404_다() {
+fn 씨앗_사용자로_들어가는_길은_프리뷰에만_있고_운영에서는_404_다() {
     let mut bench = bench!();
     let instance = bench.instance("cards");
     let token = bench.token(&instance);
@@ -915,7 +928,11 @@ fn 세션_토큰은_답과_로그와_오류_어디에도_없고_링크의_토큰
     );
     let browser = asked.cookie("__Host-orbital-browser");
     replies.push(asked);
-    let link = bench.mails_to("kim@example.com").pop().unwrap().link;
+    let link = bench
+        .wait_mails_to("kim@example.com", 1)
+        .pop()
+        .unwrap()
+        .link;
     let link_token = link.split("token=").nth(1).unwrap().to_owned();
     let path = link.strip_prefix(&live).unwrap().to_owned();
     let opened = http("GET", &live, &path, &[("Cookie", &browser)], "");
@@ -1152,7 +1169,7 @@ fn 직원의_요청이_앱의_버그로_급여_관리자의_연결을_타도_행
 }
 
 #[test]
-fn 행_단위_규칙을_끈_표는_역할_제한이_걸리지_않는_표로_미리보기에_알리고_실패로_보지_않는다() {
+fn 행_단위_규칙을_끈_표는_역할_제한이_걸리지_않는_표로_프리뷰에_알리고_실패로_보지_않는다() {
     let mut bench = bench!();
     let instance = bench.instance("payroll");
     let token = bench.token(&instance);

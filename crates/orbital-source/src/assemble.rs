@@ -16,7 +16,7 @@ use crate::{Commit, Error, SourceStore};
 
 pub const MANIFEST: &str = "orbital.toml";
 pub const ACCESS: &str = "db/access.toml";
-/// 미리보기의 씨앗 사용자. 선언의 `seed` 폴더와 상관없이 이 자리에서 읽는다.
+/// 프리뷰의 씨앗 사용자. 선언의 `seed` 폴더와 상관없이 이 자리에서 읽는다.
 pub const SEED_USERS: &str = "db/seed/users.toml";
 
 /// 순서대로 돌릴 SQL 파일 하나.
@@ -34,9 +34,9 @@ pub struct Assembled {
     pub manifest: ValidManifest,
     pub access: Access,
     pub migrations: Vec<Script>,
-    /// 미리보기 DB 에 넣을 가짜 데이터.
+    /// 프리뷰 DB 에 넣을 가짜 데이터.
     pub seed: Vec<Script>,
-    /// 미리보기에 넣을 씨앗 사용자(`db/seed/users.toml`). 운영에는 들어가지 않는다.
+    /// 프리뷰에 넣을 씨앗 사용자(`db/seed/users.toml`). 운영에는 들어가지 않는다.
     pub seed_users: Vec<SeedUser>,
 }
 

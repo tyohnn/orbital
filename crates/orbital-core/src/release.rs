@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{Auth, ValidManifest};
+use crate::name::SecretName;
 
 /// release 의 식별자. 레이어가 commit · 선언 · 권한 표 · 마이그레이션의 내용에서 짓는다. 넷 중 하나라도 바뀌면 달라진다.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -20,11 +21,11 @@ pub struct ReleaseId(pub String);
 pub enum BuiltBy {
     /// 레이어가 그 commit 에서 직접 빌드했다.
     Layer,
-    /// 밖에서 빌드한 결과를 올려 받았다. 미리보기에는 쓰지만 운영에는 올리지 않는다.
+    /// 밖에서 빌드한 결과를 올려 받았다. 프리뷰에는 쓰지만 운영에는 올리지 않는다.
     Uploaded,
 }
 
-/// 마이그레이션의 예행연습이 어떻게 끝났는가.
+/// 마이그레이션의 리허설이 어떻게 끝났는가.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Rehearsed {
@@ -45,6 +46,35 @@ pub struct Release {
     /// 선언의 로그인 방법이 쓰는데 팩토리가 넣지 않은 키. [`missing_keys`] 가 셈한다.
     #[serde(default)]
     pub missing_keys: Vec<FactoryKey>,
+    /// 선언이 밖에서 넣는다고 적었는데 운영의 값이 없는 비밀. [`crate::secrets::missing_secrets`] 가 셈한다.
+    #[serde(default)]
+    pub missing_secrets: Vec<SecretName>,
+    /// 위쪽이 정한 적합성 테스트가 프리뷰에서 어떻게 끝났는가.
+    #[serde(default)]
+    pub conformance: Conformed,
+}
+
+/// 적합성 테스트가 어떻게 끝났는가. 위쪽이 선언하지 않았으면 돌릴 것이 없다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Conformed {
+    /// 위쪽(release 가 담은 가장 새 앱의 commit)이 적합성 테스트를 선언하지 않았다.
+    #[default]
+    NotDeclared,
+    Passed,
+    /// 명령이 실패로 끝났다.
+    Failed,
+    /// 명령을 돌리지 못했다(시작하지 못했거나 테스트의 폴더를 꺼내지 못했다).
+    NotRun,
+    /// 제한 시간 안에 끝나지 않아 멈췄다.
+    TimedOut,
+}
+
+impl Conformed {
+    /// 승격을 막지 않는가.
+    pub fn clears(self) -> bool {
+        matches!(self, Self::NotDeclared | Self::Passed)
+    }
 }
 
 /// 운영의 로그인이 쓰는 팩토리의 키. 레이어는 공용 발송 도메인도 공용 Google 클라이언트도 갖지 않는다.
@@ -66,7 +96,7 @@ pub struct Keys {
     pub dev_mailbox: bool,
 }
 
-/// 선언의 로그인 방법이 쓰는데 팩토리가 넣지 않은 키. 비어 있어야 운영에 오른다. 미리보기는 키 없이 선다.
+/// 선언의 로그인 방법이 쓰는데 팩토리가 넣지 않은 키. 비어 있어야 운영에 오른다. 프리뷰는 키 없이 선다.
 pub fn missing_keys(manifest: &ValidManifest, keys: &Keys) -> Vec<FactoryKey> {
     let Some(auth) = &manifest.get().auth else {
         return Vec::new();
@@ -82,7 +112,7 @@ pub fn missing_keys(manifest: &ValidManifest, keys: &Keys) -> Vec<FactoryKey> {
 }
 
 /// 승격을 막는 것.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "blocker", rename_all = "snake_case")]
 pub enum Blocker {
     NotBuiltByLayer,
@@ -94,6 +124,14 @@ pub enum Blocker {
     /// 팩토리가 키를 넣지 않았다. 에이전트가 고칠 수 없고 팩토리의 관리자가 설정에 넣어야 한다.
     KeyMissing {
         key: FactoryKey,
+    },
+    /// 밖에서 넣는 비밀의 운영 값이 없다. 에이전트가 고칠 수 없고 사람이 입력 카드에서 넣어야 한다.
+    SecretMissing {
+        secret: SecretName,
+    },
+    /// 위쪽이 정한 적합성 테스트를 통과하지 못했다(실패 · 돌지 않음 · 제한 시간 초과). 포크의 코드를 고쳐 프리뷰를 다시 세워야 한다.
+    ConformanceFailed {
+        outcome: Conformed,
     },
 }
 
@@ -119,6 +157,19 @@ pub fn blockers(release: &Release) -> Vec<Blocker> {
             .iter()
             .map(|&key| Blocker::KeyMissing { key }),
     );
+    found.extend(
+        release
+            .missing_secrets
+            .iter()
+            .map(|secret| Blocker::SecretMissing {
+                secret: secret.clone(),
+            }),
+    );
+    if !release.conformance.clears() {
+        found.push(Blocker::ConformanceFailed {
+            outcome: release.conformance,
+        });
+    }
     found
 }
 
@@ -243,6 +294,8 @@ mod tests {
             access_findings: 0,
             rehearsal: Rehearsed::Passed,
             missing_keys: Vec::new(),
+            missing_secrets: Vec::new(),
+            conformance: Conformed::NotDeclared,
         }
     }
 
@@ -403,7 +456,7 @@ path = "/"
     }
 
     #[test]
-    fn 예행연습이_실패했거나_돌지_않은_마이그레이션은_승격하지_못한다() {
+    fn 리허설이_실패했거나_돌지_않은_마이그레이션은_승격하지_못한다() {
         let mut release = release("r1");
         release.rehearsal = Rehearsed::Failed;
         assert_eq!(blockers(&release), vec![Blocker::RehearsalFailed]);
@@ -412,7 +465,7 @@ path = "/"
     }
 
     #[test]
-    fn 마이그레이션이_없는_release_는_예행연습_없이_올린다() {
+    fn 마이그레이션이_없는_release_는_리허설_없이_올린다() {
         let mut release = release("r1");
         release.rehearsal = Rehearsed::NotNeeded;
         assert_eq!(blockers(&release), vec![]);
@@ -433,8 +486,45 @@ path = "/"
             access_findings: 1,
             rehearsal: Rehearsed::Failed,
             missing_keys: vec![FactoryKey::Mail, FactoryKey::Google],
+            missing_secrets: vec![SecretName::parse("BANK_API_KEY").unwrap()],
+            conformance: Conformed::Failed,
         };
-        assert_eq!(blockers(&release).len(), 5);
+        assert_eq!(blockers(&release).len(), 7);
+    }
+
+    #[test]
+    fn 적합성_테스트를_통과하지_못한_release_는_승격하지_못한다() {
+        for outcome in [Conformed::Failed, Conformed::NotRun, Conformed::TimedOut] {
+            let mut release = release("r1");
+            release.conformance = outcome;
+            assert_eq!(
+                blockers(&release),
+                vec![Blocker::ConformanceFailed { outcome }]
+            );
+            assert_eq!(
+                promote(
+                    &release,
+                    Change::SecurityUpdate,
+                    Some(&approval("r1", Approver::Factory))
+                ),
+                Err(PromoteDenied::Blocked {
+                    blockers: vec![Blocker::ConformanceFailed { outcome }]
+                })
+            );
+        }
+        // 통과했거나 위쪽이 선언하지 않았으면 막지 않는다
+        for outcome in [Conformed::Passed, Conformed::NotDeclared] {
+            let mut release = release("r1");
+            release.conformance = outcome;
+            assert_eq!(blockers(&release), vec![]);
+        }
+        assert_eq!(
+            serde_json::to_string(&Blocker::ConformanceFailed {
+                outcome: Conformed::TimedOut
+            })
+            .unwrap(),
+            r#"{"blocker":"conformance_failed","outcome":"timed_out"}"#
+        );
     }
 
     #[test]
