@@ -552,6 +552,15 @@ impl Layer {
             let mut env = vec![
                 ("PORT".to_owned(), port.to_string()),
                 ("HOST".to_owned(), "127.0.0.1".to_owned()),
+                // 미리보기에서 메일을 보내지 않는 것처럼, 앱이 어디에 섰는지에 따라 달리 굴 일이 있다
+                (
+                    "ORBITAL_STAGE".to_owned(),
+                    match stage {
+                        Stage::Preview => "preview",
+                        Stage::Production => "production",
+                    }
+                    .to_owned(),
+                ),
             ];
             let mut proxy = None;
             if !service.roles.is_empty() {
