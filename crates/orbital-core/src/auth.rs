@@ -64,7 +64,7 @@ pub fn wants_page(method: &str, accept: Option<&str>) -> bool {
 }
 
 /// 질의의 값 하나로 싣도록 글자를 감싼다. 읽기 쉽게 `/` 는 그대로 둔다.
-fn encode_component(text: &str) -> String {
+pub(crate) fn encode_component(text: &str) -> String {
     let mut encoded = String::new();
     for byte in text.bytes() {
         if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
@@ -119,15 +119,19 @@ pub fn admit(
     }
     if page {
         Admission::ToLogin {
-            location: format!(
-                "{}?next={}",
-                auth.login_path,
-                encode_component(&safe_next(path_and_query))
-            ),
+            location: login_location(&auth.login_path, path_and_query),
         }
     } else {
         Admission::Unauthorized
     }
+}
+
+/// 로그인 화면으로 보낼 곳. 돌아올 곳(`next`)은 이 주소 안의 경로만 싣는다.
+pub fn login_location(login_path: &str, path_and_query: &str) -> String {
+    format!(
+        "{login_path}?next={}",
+        encode_component(&safe_next(path_and_query))
+    )
 }
 
 /// 상태를 바꾸는 레이어의 요청이 이 주소의 화면에서 왔는가. `Origin` 이 없거나 다르면 아니다.

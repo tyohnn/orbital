@@ -118,15 +118,18 @@ impl Bench {
             .unwrap();
         let access = access(&manifest, ACCESS);
         admin.provision(&names, &manifest).unwrap();
-        admin.install_identity(&names, KEY).unwrap();
-        admin.migrate(&names, &[MIGRATION]).unwrap();
-        admin.grant(&names, &manifest, &access).unwrap();
-        Some(Self {
+        // 세우다가 깨져도 걷히도록, 여기부터는 다 지은 값 위에서 세운다(값이 떨어질 때 `Drop` 이 걷는다)
+        let mut bench = Self {
             admin,
             names,
             manifest,
             access,
-        })
+        };
+        let (admin, names, manifest) = (&mut bench.admin, &bench.names, &bench.manifest);
+        admin.install_identity(names, KEY).unwrap();
+        admin.migrate(names, &[MIGRATION]).unwrap();
+        admin.grant(names, manifest, &bench.access).unwrap();
+        Some(bench)
     }
 
     /// 서비스가 업무 역할로 들어간 연결.
@@ -159,6 +162,7 @@ impl Bench {
                 subject: Some(subject.to_owned()),
                 roles: ROLES.iter().map(|role| (*role).to_owned()).collect(),
                 session: None,
+                client: None,
                 expires_at: FAR_FUTURE,
             },
         )
@@ -537,6 +541,7 @@ fn 서명이_없거나_틀린_신원으로는_어떤_행도_읽지_못한다() {
             subject: Some("emp_1".to_owned()),
             roles: ROLES.iter().map(|role| (*role).to_owned()).collect(),
             session: None,
+            client: None,
             expires_at: FAR_FUTURE,
         },
     );
@@ -572,6 +577,7 @@ fn 만료된_신원과_다른_인스턴스의_신원은_읽히지_않는다() {
             subject: Some("emp_1".to_owned()),
             roles: ROLES.iter().map(|role| (*role).to_owned()).collect(),
             session: None,
+            client: None,
             expires_at: 1,
         },
     );
@@ -588,6 +594,7 @@ fn 만료된_신원과_다른_인스턴스의_신원은_읽히지_않는다() {
             subject: Some("emp_1".to_owned()),
             roles: ROLES.iter().map(|role| (*role).to_owned()).collect(),
             session: None,
+            client: None,
             expires_at: FAR_FUTURE,
         },
     );

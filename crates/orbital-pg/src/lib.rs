@@ -19,6 +19,7 @@ use postgres::{Client, Config, NoTls};
 pub mod auth;
 pub mod identity;
 pub mod migrations;
+pub mod oauth;
 pub mod rehearsal;
 
 #[derive(Debug)]

@@ -76,6 +76,7 @@ fn manifest_with(api: &[bool; 3], worker: &[bool; 3], auth: bool) -> ValidManife
             signup: Signup::Invite,
             default_roles: Vec::new(),
             directory: Vec::new(),
+            mcp: None,
         }),
         ..Manifest::default()
     }
@@ -486,6 +487,103 @@ fn 권한의_말은_닿는_범위로_읽힌다() {
             (Reach::Own, Reach::Own)
         ]
     );
+}
+
+mod oauth {
+    use orbital_core::oauth::{
+        Authorize, AuthorizeQuery, KnownClient, Stop, judge_authorize, pkce_matches, same_redirect,
+    };
+    use proptest::prelude::*;
+    use sha2::{Digest, Sha256};
+
+    const RESOURCE: &str = "http://127.0.0.1:4100/mcp";
+
+    /// 오라클. 구현의 SHA-256 과 base64url 을 부르지 않고 `sha2` 와 따로 적은 부호화로 challenge 를 만든다.
+    fn challenge_of(verifier: &str) -> String {
+        let digest = Sha256::digest(verifier.as_bytes());
+        let table: Vec<char> = ('A'..='Z')
+            .chain('a'..='z')
+            .chain('0'..='9')
+            .chain(['-', '_'])
+            .collect();
+        let mut bits = String::new();
+        for byte in digest {
+            bits.push_str(&format!("{byte:08b}"));
+        }
+        bits.as_bytes()
+            .chunks(6)
+            .map(|chunk| {
+                let mut six = String::from_utf8(chunk.to_vec()).unwrap();
+                while six.len() < 6 {
+                    six.push('0');
+                }
+                table[usize::from_str_radix(&six, 2).unwrap()]
+            })
+            .collect()
+    }
+
+    fn verifier() -> impl Strategy<Value = String> {
+        "[A-Za-z0-9._~-]{43,128}"
+    }
+
+    fn redirect() -> impl Strategy<Value = String> {
+        "https://[a-z]{1,6}\\.example(:[0-9]{2,4})?/[a-z/]{0,10}(\\?[a-z]=[0-9])?"
+    }
+
+    /// 등록된 redirect 를 한 글자 고친다: 넣기 · 빼기 · 바꾸기. 바꾼 글자가 같으면 그대로일 수도 있다.
+    fn edit() -> impl Strategy<Value = (usize, u8, char)> {
+        (
+            0usize..64,
+            0u8..3,
+            prop::sample::select(vec!['a', 'A', '/', ':', '.', '%', '?', '#', ' ', '0']),
+        )
+    }
+
+    fn apply(text: &str, (at, op, c): (usize, u8, char)) -> String {
+        let mut chars: Vec<char> = text.chars().collect();
+        let at = at % (chars.len() + 1);
+        match op {
+            0 => chars.insert(at, c),
+            1 if at < chars.len() => {
+                chars.remove(at);
+            }
+            _ if at < chars.len() => chars[at] = c,
+            _ => chars.push(c),
+        }
+        chars.into_iter().collect()
+    }
+
+    proptest! {
+        #[test]
+        fn 어떤_verifier_든_제_challenge_에만_맞는다(mine in verifier(), other in verifier()) {
+            let challenge = challenge_of(&mine);
+            prop_assert!(pkce_matches(&challenge, &mine));
+            prop_assert_eq!(pkce_matches(&challenge, &other), other == mine);
+        }
+
+        #[test]
+        fn 어떤_redirect_든_등록된_것과_한_글자라도_다르면_받지_않는다(registered in redirect(), change in edit()) {
+            let given = apply(&registered, change);
+            let client = KnownClient { id: "c_1".to_owned(), redirect_uris: vec![registered.clone()] };
+            let query = AuthorizeQuery {
+                response_type: Some("code".to_owned()),
+                client_id: Some("c_1".to_owned()),
+                redirect_uri: Some(given.clone()),
+                code_challenge: Some(challenge_of(&"v".repeat(43))),
+                code_challenge_method: Some("S256".to_owned()),
+                resource: Some(RESOURCE.to_owned()),
+                scope: None,
+                state: None,
+            };
+            let verdict = judge_authorize(&query, Some(&client), RESOURCE, "http://127.0.0.1:4100");
+            prop_assert_eq!(same_redirect(&client.redirect_uris, &given), given == registered);
+            if given == registered {
+                prop_assert!(matches!(verdict, Authorize::Accept { .. }), "{:?}", verdict);
+            } else {
+                prop_assert_eq!(verdict, Authorize::Stop { reason: Stop::BadRedirect });
+            }
+        }
+    }
 }
 
 mod release {

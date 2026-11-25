@@ -59,7 +59,7 @@ impl Secret {
     }
 
     /// DB 에 두는 값.
-    fn hash(&self) -> Vec<u8> {
+    pub(crate) fn hash(&self) -> Vec<u8> {
         Sha256::digest(self.0).to_vec()
     }
 
@@ -109,6 +109,10 @@ pub enum AuthError {
     NoSuchUser,
     /// 운영체제에서 무작위 값을 얻지 못했다.
     Random,
+    /// 인가 코드나 refresh 토큰을 받지 않는다(RFC 6749 의 `invalid_grant`). 까닭은 밖에 알리지 않는다.
+    InvalidGrant,
+    /// 그런 인가 요청이 없거나, 남의 것이거나, 이미 정했거나, 만료됐다. 넷을 가르지 않는다.
+    NoSuchRequest,
 }
 
 impl fmt::Display for AuthError {
@@ -168,6 +172,14 @@ impl fmt::Display for AuthError {
                 f,
                 "운영체제에서 무작위 값을 얻지 못했습니다. 잠시 뒤에 다시 해 주세요"
             ),
+            Self::InvalidGrant => write!(
+                f,
+                "인가 코드나 refresh 토큰을 받지 않습니다. 처음부터 다시 인가를 받아 주세요"
+            ),
+            Self::NoSuchRequest => write!(
+                f,
+                "인가 요청을 찾지 못했습니다. 클라이언트에서 다시 연결해 주세요"
+            ),
         }
     }
 }
@@ -180,7 +192,7 @@ impl From<Error> for AuthError {
     }
 }
 
-fn db(doing: &'static str) -> impl FnOnce(postgres::Error) -> AuthError {
+pub(crate) fn db(doing: &'static str) -> impl FnOnce(postgres::Error) -> AuthError {
     move |source| AuthError::Db(pg(doing)(source))
 }
 
@@ -265,6 +277,64 @@ CREATE TABLE IF NOT EXISTS orbital_auth.session (
     revoked_at timestamptz
 );
 CREATE INDEX IF NOT EXISTS session_user_id ON orbital_auth.session (user_id);
+-- MCP 의 인가(OAuth 2.1). 코드 · 토큰 · 요청의 식별자는 sha256 해시로만 둔다
+CREATE TABLE IF NOT EXISTS orbital_auth.oauth_client (
+    id text PRIMARY KEY,
+    kind text NOT NULL CHECK (kind IN ('registered', 'dynamic', 'document')),
+    name text NOT NULL,
+    redirect_uris text[] NOT NULL,
+    application_type text,
+    created_at timestamptz NOT NULL,
+    fetched_at timestamptz
+);
+CREATE TABLE IF NOT EXISTS orbital_auth.oauth_request (
+    id_hash bytea PRIMARY KEY CHECK (length(id_hash) = 32),
+    user_id text NOT NULL REFERENCES orbital_auth.users (id) ON DELETE CASCADE,
+    client_id text NOT NULL REFERENCES orbital_auth.oauth_client (id) ON DELETE CASCADE,
+    redirect_uri text NOT NULL,
+    code_challenge text NOT NULL,
+    resource text NOT NULL,
+    scope text NOT NULL,
+    state text,
+    created_at timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL,
+    decided_at timestamptz
+);
+CREATE TABLE IF NOT EXISTS orbital_auth.oauth_grant (
+    id text PRIMARY KEY,
+    user_id text NOT NULL REFERENCES orbital_auth.users (id) ON DELETE CASCADE,
+    client_id text NOT NULL REFERENCES orbital_auth.oauth_client (id) ON DELETE CASCADE,
+    scope text NOT NULL,
+    resource text NOT NULL,
+    created_at timestamptz NOT NULL,
+    revoked_at timestamptz
+);
+CREATE TABLE IF NOT EXISTS orbital_auth.oauth_code (
+    code_hash bytea PRIMARY KEY CHECK (length(code_hash) = 32),
+    grant_id text NOT NULL REFERENCES orbital_auth.oauth_grant (id) ON DELETE CASCADE,
+    redirect_uri text NOT NULL,
+    code_challenge text NOT NULL,
+    resource text NOT NULL,
+    created_at timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL,
+    used_at timestamptz
+);
+CREATE TABLE IF NOT EXISTS orbital_auth.oauth_token (
+    token_hash bytea PRIMARY KEY CHECK (length(token_hash) = 32),
+    kind text NOT NULL CHECK (kind IN ('access', 'refresh')),
+    grant_id text NOT NULL REFERENCES orbital_auth.oauth_grant (id) ON DELETE CASCADE,
+    -- 이 토큰을 처음 낸 코드. 갈아 준 토큰도 같은 코드를 적어, 코드가 다시 쓰이면 그 줄기를 모두 거둔다
+    code_hash bytea NOT NULL,
+    resource text NOT NULL,
+    created_at timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL,
+    used_at timestamptz,
+    revoked_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS oauth_token_grant ON orbital_auth.oauth_token (grant_id);
+CREATE INDEX IF NOT EXISTS oauth_token_code ON orbital_auth.oauth_token (code_hash);
+CREATE INDEX IF NOT EXISTS oauth_grant_user ON orbital_auth.oauth_grant (user_id);
+
 REVOKE ALL ON ALL TABLES IN SCHEMA orbital_auth FROM PUBLIC;
 
 -- 두 뷰는 레이어의 관리 역할이 갖는다. 읽는 역할에게 표의 권한이 없어도 뷰가 준 줄만 보인다.
@@ -452,27 +522,33 @@ impl AuthStore {
 
 /// 인증 역할로 붙은 연결 하나. `orbital_auth` 의 표만 읽고 쓴다.
 pub struct AuthStore {
-    client: Client,
-    manifest: ValidManifest,
+    pub(crate) client: Client,
+    pub(crate) manifest: ValidManifest,
 }
 
-fn seconds(now: u64) -> i64 {
+pub(crate) fn seconds(now: u64) -> i64 {
     i64::try_from(now).unwrap_or(i64::MAX)
 }
 
-fn unix(value: Option<i64>) -> Option<u64> {
+pub(crate) fn unix(value: Option<i64>) -> Option<u64> {
     value.map(|value| u64::try_from(value).unwrap_or(0))
 }
 
 /// `u_` 와 소문자 · 숫자 20자. 고르게 나오도록 36의 배수를 넘는 바이트는 버린다.
 fn user_id() -> Result<String, AuthError> {
+    random_id("u_")
+}
+
+/// 머리말과 소문자 · 숫자 20자.
+pub(crate) fn random_id(lead: &str) -> Result<String, AuthError> {
     const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut id = String::from("u_");
-    while id.len() < 22 {
+    let mut id = String::from(lead);
+    let length = lead.len() + 20;
+    while id.len() < length {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes).map_err(|_| AuthError::Random)?;
         for byte in bytes {
-            if byte < 252 && id.len() < 22 {
+            if byte < 252 && id.len() < length {
                 id.push(char::from(ALPHABET[usize::from(byte % 36)]));
             }
         }
@@ -838,6 +914,22 @@ impl AuthStore {
                 &[&user_id, &seconds(now)],
             )
             .map_err(db("사용자의 세션을 거두"))?;
+        // 클라이언트에 준 승인과 그 토큰도 거둔다
+        transaction
+            .execute(
+                "UPDATE orbital_auth.oauth_token t SET revoked_at = to_timestamp($2::bigint) \
+                 FROM orbital_auth.oauth_grant g \
+                 WHERE t.grant_id = g.id AND g.user_id = $1 AND t.revoked_at IS NULL",
+                &[&user_id, &seconds(now)],
+            )
+            .map_err(db("사용자의 토큰을 거두"))?;
+        transaction
+            .execute(
+                "UPDATE orbital_auth.oauth_grant SET revoked_at = to_timestamp($2::bigint) \
+                 WHERE user_id = $1 AND revoked_at IS NULL",
+                &[&user_id, &seconds(now)],
+            )
+            .map_err(db("사용자의 승인을 거두"))?;
         transaction.commit().map_err(db("사용자 빼기를 마무리"))
     }
 }

@@ -27,6 +27,8 @@ pub struct Claims {
     pub roles: Vec<String>,
     /// 세션을 가리키는 것. 세션의 토큰이 아니다. 사람 없는 실행에는 없다.
     pub session: Option<String>,
+    /// MCP 로 들어왔으면 그 클라이언트(`cid`). 브라우저의 세션이면 없다.
+    pub client: Option<String>,
     /// 이 시각(유닉스 초)부터 읽히지 않는다.
     pub expires_at: u64,
 }
@@ -39,6 +41,7 @@ impl Claims {
             subject: None,
             roles: vec![role.as_str().to_owned()],
             session: None,
+            client: None,
             expires_at,
         }
     }
@@ -60,6 +63,9 @@ pub fn sign(key: &[u8], names: &Names, claims: &Claims) -> String {
     }
     if let Some(session) = &claims.session {
         body["sid"] = serde_json::Value::from(session.as_str());
+    }
+    if let Some(client) = &claims.client {
+        body["cid"] = serde_json::Value::from(client.as_str());
     }
     let body = body.to_string();
     let signed = format!("v2.{}", hex(body.as_bytes()));
@@ -150,6 +156,12 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = orbital, pg_catalog AS $$
     SELECT CASE WHEN orbital.granted() THEN orbital.claims() ->> 'sub' END
 $$;
 
+-- MCP 로 들어온 요청이면 그 클라이언트. 브라우저의 세션이면 NULL 이다. 앱의 정책이 MCP 의 요청에 더 좁은 권한을 줄 때 읽는다.
+CREATE OR REPLACE FUNCTION orbital.client() RETURNS text
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = orbital, pg_catalog AS $$
+    SELECT CASE WHEN orbital.granted() THEN orbital.claims() ->> 'cid' END
+$$;
+
 -- 이미 돈 마이그레이션의 이름. 소유자는 적기만 하고 고치거나 지우지 못한다.
 CREATE TABLE IF NOT EXISTS orbital.migration (
     name text PRIMARY KEY,
@@ -200,6 +212,7 @@ mod tests {
             subject: Some("emp_1".to_owned()),
             roles: vec!["employee".to_owned()],
             session: Some("s_1".to_owned()),
+            client: None,
             expires_at: 2_000_000_000,
         };
         let token = sign(b"key", &names(), &claims);
@@ -214,6 +227,7 @@ mod tests {
             subject: Some("emp_1".to_owned()),
             roles: vec!["employee".to_owned()],
             session: Some("s_1".to_owned()),
+            client: None,
             expires_at: 2_000_000_000,
         };
         let token = sign(b"key", &names(), &claims);
@@ -239,6 +253,7 @@ mod tests {
             subject: Some("a\"b\\c".to_owned()),
             roles: Vec::new(),
             session: None,
+            client: None,
             expires_at: 1,
         };
         let token = sign(b"key", &names(), &claims);
@@ -269,6 +284,7 @@ mod tests {
                 subject: Some("u_1".to_owned()),
                 roles: vec!["employee".to_owned(), "manager".to_owned()],
                 session: Some("s_1".to_owned()),
+                client: None,
                 expires_at: 7,
             },
         );

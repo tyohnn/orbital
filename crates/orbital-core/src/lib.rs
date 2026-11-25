@@ -9,6 +9,7 @@ pub mod check;
 pub mod describe;
 pub mod manifest;
 pub mod name;
+pub mod oauth;
 pub mod plan;
 pub mod release;
 pub mod scope;

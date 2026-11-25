@@ -88,6 +88,28 @@ pub struct Auth {
     /// 다른 사용자의 이름과 이메일(`orbital.users`)을 읽는 업무 역할.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub directory: Vec<Ident>,
+    /// MCP 의 주소와 그 인가(OAuth 2.1). 없으면 인가 서버의 주소가 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<Mcp>,
+}
+
+/// MCP 의 주소. router 가 자원 서버의 자리를, Orbital Auth 가 인가 서버의 자리를 맡는다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mcp {
+    /// MCP 주소가 있는 서버 서비스.
+    pub service: Ident,
+    /// MCP 요청의 경로. 그 서비스의 `path` 아래여야 한다.
+    pub path: String,
+    /// 앱의 동의 화면. 어느 서비스의 `path` 아래여야 한다.
+    pub consent_path: String,
+    /// 동적 등록(RFC 7591)을 받는가. 기본은 받는다.
+    #[serde(default = "yes")]
+    pub dynamic_registration: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Auth {
@@ -108,6 +130,8 @@ pub enum Signup {
 
 /// 레이어가 쓰는 경로의 머리. 서비스와 로그인 화면은 이 아래에 둘 수 없다.
 pub const LAYER_PATH: &str = "/_orbital";
+/// 인가 서버와 자원 서버의 메타데이터가 서는 경로의 머리. 서비스와 화면의 경로로 적지 못한다.
+pub const WELL_KNOWN_PATH: &str = "/.well-known";
 
 impl Service {
     /// 서비스 이름의 길이. 서비스마다의 로그인 이름이 Postgres 의 63바이트 한도 안에 들어야 한다.
@@ -178,6 +202,10 @@ pub enum ManifestProblem {
     DefaultRoleUndeclared { role: Ident },
     OpenSignupWithoutDefaultRoles,
     DefaultRolesWithoutOpenSignup,
+    McpUnknownService { service: Ident },
+    McpNotServer { service: Ident },
+    McpPathOutsideService { path: String },
+    ConsentPathOutsideServices { path: String },
 }
 
 impl fmt::Display for ManifestProblem {
@@ -273,7 +301,23 @@ impl fmt::Display for ManifestProblem {
             ),
             Self::LayerPath { path } => write!(
                 f,
-                "경로 `{path}` 는 `{LAYER_PATH}` 로 시작합니다. 레이어가 쓰는 경로이니 다른 경로로 바꿔 주세요"
+                "경로 `{path}` 는 `{LAYER_PATH}` 나 `{WELL_KNOWN_PATH}` 로 시작합니다. 레이어가 쓰는 경로이니 다른 경로로 바꿔 주세요"
+            ),
+            Self::McpUnknownService { service } => write!(
+                f,
+                "`[auth.mcp].service` 의 서비스 `{service}` 가 없습니다. MCP 주소가 있는 서버 서비스의 이름을 적어 주세요"
+            ),
+            Self::McpNotServer { service } => write!(
+                f,
+                "`[auth.mcp].service` 의 `{service}` 는 정적 서비스입니다. MCP 주소는 서버 서비스에 둬야 합니다"
+            ),
+            Self::McpPathOutsideService { path } => write!(
+                f,
+                "`[auth.mcp].path` 의 `{path}` 가 그 서비스의 `path` 아래가 아닙니다. 서비스의 경로 아래로 적어 주세요"
+            ),
+            Self::ConsentPathOutsideServices { path } => write!(
+                f,
+                "`[auth.mcp].consent_path` 의 `{path}` 가 어느 서비스의 경로 아래도 아닙니다. 동의 화면을 그리는 서비스의 `path` 아래로 적어 주세요"
             ),
             Self::DirectoryUndeclaredRole { role } => write!(
                 f,
@@ -487,6 +531,46 @@ impl Manifest {
                 }
                 _ => {}
             }
+            if let Some(mcp) = &auth.mcp {
+                match self
+                    .services
+                    .iter()
+                    .find(|service| service.name == mcp.service)
+                {
+                    None => problems.push(ManifestProblem::McpUnknownService {
+                        service: mcp.service.clone(),
+                    }),
+                    Some(service) if service.kind != ServiceKind::Server => {
+                        problems.push(ManifestProblem::McpNotServer {
+                            service: mcp.service.clone(),
+                        });
+                    }
+                    Some(service) => {
+                        if is_layer_path(&mcp.path) {
+                            problems.push(ManifestProblem::LayerPath {
+                                path: mcp.path.clone(),
+                            });
+                        } else if !under(&mcp.path, &service.path) {
+                            problems.push(ManifestProblem::McpPathOutsideService {
+                                path: mcp.path.clone(),
+                            });
+                        }
+                    }
+                }
+                if is_layer_path(&mcp.consent_path) {
+                    problems.push(ManifestProblem::LayerPath {
+                        path: mcp.consent_path.clone(),
+                    });
+                } else if !self
+                    .services
+                    .iter()
+                    .any(|service| under(&mcp.consent_path, &service.path))
+                {
+                    problems.push(ManifestProblem::ConsentPathOutsideServices {
+                        path: mcp.consent_path.clone(),
+                    });
+                }
+            }
         }
 
         if problems.is_empty() {
@@ -499,7 +583,7 @@ impl Manifest {
 
 /// 레이어가 쓰는 경로인가. 조각의 경계를 따지지 않고 글자로 본다(`/_orbitalx` 도 받지 않는다). 넓게 막는 편이 안전하다.
 fn is_layer_path(path: &str) -> bool {
-    path.starts_with(LAYER_PATH)
+    path.starts_with(LAYER_PATH) || path.starts_with(WELL_KNOWN_PATH)
 }
 
 pub(crate) fn trim_path(path: &str) -> &str {
@@ -938,6 +1022,93 @@ directory = ["manager"]
         // 비슷하지만 다른 경로는 받는다
         let near = WITH_AUTH.replace("login_path = \"/login\"", "login_path = \"/orbital/login\"");
         assert!(parse(&near).check().is_ok());
+    }
+
+    #[test]
+    fn mcp_의_선언은_auth_가_있어야_하고_경로는_그_서비스의_path_아래여야_한다() {
+        let with_mcp = format!(
+            "{WITH_AUTH}\n[auth.mcp]\nservice = \"api\"\npath = \"/api/mcp\"\nconsent_path = \"/oauth/consent\"\n"
+        );
+        let manifest = parse(&with_mcp).check().expect("받아야 합니다");
+        let mcp = manifest.get().auth.as_ref().unwrap().mcp.as_ref().unwrap();
+        assert!(mcp.dynamic_registration, "동적 등록은 기본으로 켜져 있다");
+        // [auth] 없이 [auth.mcp] 만 적으면 로그인의 선언이 모자라 읽지 않는다
+        let alone = format!(
+            "{}\n[auth.mcp]\nservice = \"api\"\npath = \"/api/mcp\"\nconsent_path = \"/oauth/consent\"\n",
+            WITH_AUTH
+                .split("[auth]")
+                .next()
+                .unwrap()
+                .replace("auth = \"required\"\n", "")
+        );
+        assert!(toml::from_str::<Manifest>(&alone).is_err());
+        // 경로는 그 서비스의 path 아래여야 한다. 조각의 경계로 본다
+        for (path, problem) in [
+            (
+                "/mcp",
+                ManifestProblem::McpPathOutsideService {
+                    path: "/mcp".to_owned(),
+                },
+            ),
+            (
+                "/apix/mcp",
+                ManifestProblem::McpPathOutsideService {
+                    path: "/apix/mcp".to_owned(),
+                },
+            ),
+            (
+                "/_orbital/mcp",
+                ManifestProblem::LayerPath {
+                    path: "/_orbital/mcp".to_owned(),
+                },
+            ),
+            (
+                "/.well-known/mcp",
+                ManifestProblem::LayerPath {
+                    path: "/.well-known/mcp".to_owned(),
+                },
+            ),
+        ] {
+            let text = with_mcp.replace("path = \"/api/mcp\"", &format!("path = \"{path}\""));
+            assert_eq!(problems(&text), vec![problem], "{path}");
+        }
+        // 정적 서비스나 없는 서비스에는 두지 못한다
+        let static_service = with_mcp.replace(
+            "service = \"api\"\npath = \"/api/mcp\"",
+            "service = \"web\"\npath = \"/mcp\"",
+        );
+        assert_eq!(
+            problems(&static_service),
+            vec![ManifestProblem::McpNotServer {
+                service: ident("web")
+            }]
+        );
+        let missing = with_mcp.replace("service = \"api\"\npath", "service = \"worker\"\npath");
+        assert_eq!(
+            problems(&missing),
+            vec![ManifestProblem::McpUnknownService {
+                service: ident("worker")
+            }]
+        );
+        // 동의 화면은 어느 서비스의 path 아래여야 하고 레이어의 경로로 적지 못한다
+        let consent = with_mcp.replace(
+            "consent_path = \"/oauth/consent\"",
+            "consent_path = \"/.well-known/consent\"",
+        );
+        assert_eq!(
+            problems(&consent),
+            vec![ManifestProblem::LayerPath {
+                path: "/.well-known/consent".to_owned()
+            }]
+        );
+        // 서비스의 경로도 /.well-known 으로 시작하지 못한다
+        let service = WITH_AUTH.replace("path = \"/api\"", "path = \"/.well-known/api\"");
+        assert_eq!(
+            problems(&service),
+            vec![ManifestProblem::LayerPath {
+                path: "/.well-known/api".to_owned()
+            }]
+        );
     }
 
     #[test]

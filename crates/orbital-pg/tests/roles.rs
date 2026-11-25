@@ -172,6 +172,7 @@ impl Bench {
                 subject: subject.map(str::to_owned),
                 roles: roles.iter().map(|role| (*role).to_owned()).collect(),
                 session: subject.map(|_| "s_test".to_owned()),
+                client: None,
                 expires_at: FAR_FUTURE,
             },
         )
@@ -427,6 +428,111 @@ fn 신원의_업무_역할은_orbital_me_의_역할과_같고_me_는_그_역할�
     )
     .unwrap();
     assert!(elsewhere.is_empty());
+}
+
+#[test]
+fn orbital_client_는_mcp_로_들어온_요청의_클라이언트를_돌려주고_브라우저의_세션이면_null_이다() {
+    let bench = bench!(true);
+    let client = |client: Option<&str>, roles: &[&str], login: &str| -> Vec<String> {
+        let identity = sign(
+            KEY,
+            &bench.names,
+            &Claims {
+                subject: Some("emp1".to_owned()),
+                roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+                session: None,
+                client: client.map(str::to_owned),
+                expires_at: FAR_FUTURE,
+            },
+        );
+        rows(
+            &mut bench.login(login),
+            Some(&identity),
+            "SELECT coalesce(orbital.client(), 'none')",
+        )
+        .unwrap()
+    };
+    assert_eq!(client(Some("c_1"), &["employee"], "employee"), vec!["c_1"]);
+    assert_eq!(client(None, &["employee"], "employee"), vec!["none"]);
+    // 연결의 업무 역할이 신원에 없으면 클라이언트도 없다
+    assert_eq!(
+        client(Some("c_1"), &["employee"], "payroll_admin"),
+        vec!["none"]
+    );
+}
+
+/// 실행 계획(JSON)의 마디를 모두 모은다.
+fn plan_nodes(node: &serde_json::Value, found: &mut Vec<serde_json::Value>) {
+    found.push(node.clone());
+    if let Some(children) = node["Plans"].as_array() {
+        for child in children {
+            plan_nodes(child, found);
+        }
+    }
+}
+
+#[test]
+fn 역할_제한_정책의_검증은_행마다가_아니라_문장마다_한_번_돈다() {
+    let bench = bench!(true);
+    bench
+        .superuser()
+        .batch_execute(
+            "INSERT INTO payroll.payslip (employee, amount) SELECT 'emp1', n FROM generate_series(1, 500) n",
+        )
+        .unwrap();
+    let identity = bench.identity(Some("emp1"), &["employee"]);
+    let mut employee = bench.login("employee");
+    let mut transaction = employee.transaction().unwrap();
+    transaction
+        .execute(
+            "SELECT set_config('orbital.identity', $1, true)",
+            &[&identity],
+        )
+        .unwrap();
+    let text = transaction
+        .simple_query(
+            "EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) SELECT employee FROM payroll.payslip",
+        )
+        .unwrap()
+        .into_iter()
+        .find_map(|message| match message {
+            postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .unwrap();
+    let explained: serde_json::Value = serde_json::from_str(&text).unwrap();
+    transaction.commit().unwrap();
+    let mut nodes = Vec::new();
+    plan_nodes(&explained[0]["Plan"], &mut nodes);
+
+    // 검증 함수는 따로 된 마디(InitPlan)에서 문장마다 한 번만 돈다
+    for function in ["orbital.granted()", "orbital.subject()"] {
+        let once = nodes.iter().find(|node| {
+            node["Parent Relationship"] == "InitPlan"
+                && node["Output"].as_array().is_some_and(|output| {
+                    output
+                        .iter()
+                        .any(|item| item.as_str().is_some_and(|text| text.contains(function)))
+                })
+        });
+        let once =
+            once.unwrap_or_else(|| panic!("{function} 이 InitPlan 에 없습니다: {explained}"));
+        assert_eq!(once["Actual Loops"], 1, "{function}: {once}");
+    }
+    // 표를 읽는 마디는 행마다 함수를 부르지 않고 InitPlan 의 값만 견준다
+    let scan = nodes
+        .iter()
+        .find(|node| node["Relation Name"] == "payslip")
+        .unwrap_or_else(|| panic!("{explained}"));
+    let filter = scan["Filter"].as_str().unwrap_or_default();
+    assert!(!filter.contains("orbital.granted("), "{filter}");
+    assert!(!filter.contains("orbital.subject("), "{filter}");
+    // PostgreSQL 18 부터 행 수를 소수로 적는다
+    let examined = scan["Actual Rows"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("{scan}"))
+        + scan["Rows Removed by Filter"].as_f64().unwrap_or(0.0);
+    assert!(examined > 500.0, "{scan}");
 }
 
 // ---- 권한 검사 ----

@@ -199,6 +199,7 @@ impl Bench {
                 subject: Some(subject.to_owned()),
                 roles: vec!["member".to_owned(), "manager".to_owned()],
                 session: None,
+                client: None,
                 expires_at: FAR_FUTURE,
             },
         )
