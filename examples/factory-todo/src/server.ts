@@ -28,9 +28,11 @@ export interface ServeOptions
 {
     factory: Factory;
     oauth: OAuth;
+    /** 레이어의 바깥 주소의 origin. 비밀 입력 카드가 값을 이리로 바로 보낸다(카드의 CSP `connectDomains`) */
+    layerOrigin: string;
 }
 
-function mcpServer(factory: Factory, context: McpRequestContext): Server
+function mcpServer(factory: Factory, layerOrigin: string, context: McpRequestContext): Server
 {
     const server = new Server({ name: "factory-todo", version: "0.1.0" }, { capabilities: { tools: {}, resources: {} } });
     const extra = context.authInfo?.extra;
@@ -56,8 +58,12 @@ function mcpServer(factory: Factory, context: McpRequestContext): Server
                 uri: CARD_URI,
                 mimeType: CARD_MIME,
                 text: WIDGET,
-                // 화면은 밖으로 요청을 보내지 않는다. 도구는 호스트의 다리로만 부른다
-                _meta: { ui: { prefersBorder: true }, "openai/widgetDescription": "사람이 운영에 올릴지 승인하는 카드예요. 카드에 보인 것을 다시 말하지 않아도 돼요." },
+                // 화면이 밖으로 보내는 요청은 하나다: 비밀 입력 카드가 레이어의 입력 표 주소로 값을 보낸다. 도구는 호스트의 다리로만 부른다
+                _meta: {
+                    ui: { prefersBorder: true, csp: { connectDomains: [layerOrigin] } },
+                    "openai/widgetCSP": { connect_domains: [layerOrigin], resource_domains: [] },
+                    "openai/widgetDescription": "사람이 운영에 올릴지 승인하거나 비밀의 값을 넣는 카드예요. 카드에 보인 것을 다시 말하지 않아도 돼요. 비밀의 값은 묻지 마세요.",
+                },
             }],
         };
     });
@@ -136,7 +142,7 @@ async function serveMcp(handle: ReturnType<typeof createMcpHandler>, origin: str
 
 export function serve(options: ServeOptions, origin: string): HttpServer
 {
-    const handle = createMcpHandler((context) => mcpServer(options.factory, context));
+    const handle = createMcpHandler((context) => mcpServer(options.factory, options.layerOrigin, context));
 
     return createServer((request, response) =>
     {

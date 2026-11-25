@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>승인 카드</title>
+<title>팩토리 카드</title>
 <style>
     :root
     {
@@ -30,6 +30,8 @@
     button { font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--fg); cursor: pointer; }
     button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
     button:disabled { opacity: .6; cursor: default; }
+    form.secret { display: flex; flex-direction: column; gap: 4px; padding-top: 6px; border-top: 1px solid var(--line); }
+    input { font: inherit; font-size: 13px; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--fg); flex: 1; min-width: 0; }
 </style>
 </head>
 <body>
@@ -39,10 +41,13 @@
 </main>
 <script>
 // 화면은 서버가 지은 카드(`_meta["factory-todo/card"]`)를 꽂기만 한다. 무엇을 보일지와 승인 단추가 설지는 서버가 정한다.
+// 비밀 입력 카드의 값만은 화면이 직접 보낸다. 화면 전용 도구(`secret_entry_open`)로 입력 표의 주소를 받고, 그 주소(레이어)로 값을 바로 POST 한다.
+// 값은 도구의 인자에도, 모델에게 알리는 글에도 싣지 않는다.
 // MCP Apps 호스트(하모니 · 클로드)에서는 postMessage 위의 JSON-RPC 다리로, ChatGPT 에서는 window.openai 로 도구를 부른다.
 (function ()
 {
     var CARD = "factory-todo/card";
+    var ENTRY = "factory-todo/entry";
     var openai = window.openai;
     var api = openai ? "openai" : "mcp";
     var seq = 0;
@@ -76,6 +81,75 @@
             $("card").innerHTML = html;
         }
     }
+
+    $("card").addEventListener("submit", function (event)
+    {
+        var form = event.target.closest("form.secret");
+
+        if (!form)
+        {
+            return;
+        }
+
+        event.preventDefault();
+        var input = form.querySelector("input[name=value]");
+        var button = form.querySelector("button[type=submit]");
+        var name = form.dataset.secret;
+        var stage = form.dataset.stage;
+        var value = input.value;
+
+        if (value === "")
+        {
+            say("값을 붙여 넣어 주세요.");
+            return;
+        }
+
+        button.disabled = true;
+        say("레이어로 보내는 중이에요.");
+        callTool("secret_entry_open", { name: name, stage: stage }).then(function (result)
+        {
+            var entry = result && result._meta && result._meta[ENTRY];
+
+            if (!entry || typeof entry.url !== "string")
+            {
+                throw new Error("입력 표를 받지 못했어요.");
+            }
+
+            return fetch(entry.url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ value: value }) });
+        }).then(function (response)
+        {
+            return response.json().catch(function () { return {}; }).then(function (body)
+            {
+                if (!response.ok)
+                {
+                    throw new Error(body && body.message ? body.message : "레이어가 값을 받지 않았어요.");
+                }
+            });
+        }).then(function ()
+        {
+            input.value = "";
+            say(stage === "production" ? "운영의 값을 넣었어요." : "프리뷰의 값을 넣었어요.");
+            var state = form.querySelector("[data-filled]");
+
+            if (state)
+            {
+                state.textContent = "넣었어요";
+                state.dataset.filled = "true";
+            }
+
+            if (api === "mcp")
+            {
+                request("ui/update-model-context", { content: [{ type: "text", text: "사람이 비밀 " + name + " 의 " + (stage === "production" ? "운영" : "프리뷰") + " 값을 카드에서 넣었어요. 값은 레이어에만 있어요." }] }).catch(function () { return undefined; });
+            }
+        }).catch(function (error)
+        {
+            say(error && error.message ? error.message : "보내지 못했어요. 다시 해 주세요.");
+        }).then(function ()
+        {
+            button.disabled = false;
+            value = "";
+        });
+    });
 
     $("card").addEventListener("click", function (event)
     {
