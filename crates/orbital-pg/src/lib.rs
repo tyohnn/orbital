@@ -17,6 +17,7 @@ use postgres::error::SqlState;
 use postgres::{Client, Config, NoTls};
 
 pub mod identity;
+pub mod migrations;
 pub mod rehearsal;
 
 #[derive(Debug)]

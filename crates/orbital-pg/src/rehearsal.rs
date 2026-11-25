@@ -40,6 +40,13 @@ pub struct RestorePoint {
 }
 
 impl RestorePoint {
+    /// 적어 둔 이름에서 되돌릴 지점을 다시 가리킨다. 그 이름의 database 가 없으면 `restore` 가 없다고 답한다.
+    pub fn named(database: impl Into<String>) -> Self {
+        Self {
+            database: database.into(),
+        }
+    }
+
     pub fn database(&self) -> &str {
         &self.database
     }
@@ -121,6 +128,27 @@ impl Admin {
             .map_err(pg("database 를 지우"))
     }
 
+    /// 운영 DB 의 문을 닫고 붙어 있는 연결을 끊는다. 복제는 원본에 다른 연결이 없어야 한다.
+    ///
+    /// 닫혀 있는 동안 앱의 요청은 DB 에 붙지 못한다. 복제가 끝나면 곧바로 [`Admin::resume`] 으로 연다.
+    /// proxy 가 요청을 붙잡아 주기 전까지의 모양이다.
+    pub fn quiesce(&mut self, names: &Names) -> Result<(), Error> {
+        let database = names.database();
+        self.open(&database, false)?;
+        self.cluster
+            .execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1",
+                &[&database],
+            )
+            .map_err(pg("운영 DB 의 연결을 끊"))?;
+        Ok(())
+    }
+
+    /// 닫았던 운영 DB 의 문을 다시 연다.
+    pub fn resume(&mut self, names: &Names) -> Result<(), Error> {
+        self.open(&names.database(), true)
+    }
+
     /// 운영 DB 의 사본에 마이그레이션을 미리 돌려 본다. 운영은 건드리지 않고, 사본은 끝나면 지운다.
     pub fn rehearse(&mut self, names: &Names, migrations: &[&str]) -> Result<Rehearsal, Error> {
         let copy = format!("{}_reh_{}", names.prefix(), suffix());
@@ -137,10 +165,20 @@ impl Admin {
         copy: &str,
         migrations: &[&str],
     ) -> Result<Rehearsal, Error> {
-        // 문을 열어도 관리 역할만 들어간다. 접속 권한은 위에서 모두 걷었다
+        // 사본의 문을 열고 마이그레이션 역할에게만 접속을 준다. 그 역할로는 레이어만 들어간다.
+        // 관리 연결에서 역할만 바꿔 돌리지 않는다. 그러면 마이그레이션이 `RESET ROLE` 한 줄로 관리 권한을 되찾는다.
         self.open(copy, true)?;
-        let mut client = self.database(copy)?;
-        let before = counts(&mut client)?;
+        self.cluster
+            .batch_execute(&format!(
+                "GRANT CONNECT ON DATABASE {} TO {}",
+                quote(copy),
+                quote(&names.migrator())
+            ))
+            .map_err(pg("사본의 문을 여"))?;
+        let before = counts(&mut self.database(copy)?)?;
+        let mut client = self
+            .connect_as(copy, &names.migrator())
+            .map_err(pg("마이그레이션 역할로 사본에 붙"))?;
         client
             .batch_execute(&format!("SET ROLE {}", quote(&names.owner())))
             .map_err(pg("소유자가 되"))?;
@@ -159,10 +197,8 @@ impl Admin {
         }
         let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-        client
-            .batch_execute("RESET ROLE")
-            .map_err(pg("관리 역할로 돌아오"))?;
-        let after = counts(&mut client)?;
+        drop(client);
+        let after = counts(&mut self.database(copy)?)?;
         let mut tables: Vec<TableCount> = before
             .iter()
             .map(|(table, count)| TableCount {

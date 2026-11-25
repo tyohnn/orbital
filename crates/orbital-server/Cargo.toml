@@ -1,0 +1,32 @@
+[package]
+name = "orbital-server"
+description = "Orbital 의 관리 서버. 토큰을 발급하고 확인하며, 코드를 받아 빌드하고 미리보기를 세우고 승인받은 것을 운영에 올린다"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "orbitald"
+path = "src/main.rs"
+
+[dependencies]
+orbital-core = { path = "../orbital-core" }
+orbital-pg = { path = "../orbital-pg" }
+orbital-proxy = { path = "../orbital-proxy" }
+orbital-run = { path = "../orbital-run" }
+orbital-source = { path = "../orbital-source" }
+hmac.workspace = true
+postgres.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tiny_http.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+ureq.workspace = true
+
+[lints]
+workspace = true

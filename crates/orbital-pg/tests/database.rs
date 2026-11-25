@@ -862,3 +862,229 @@ fn 원본에_끝나지_않는_연결이_있으면_복제하지_않고_바쁘다�
     ));
     assert_eq!(databases(&bench), vec![bench.names.database()]);
 }
+
+// ---- 마이그레이션이 관리 권한을 얻으려 할 때 ----
+
+fn role_exists(bench: &Bench, name: &str) -> bool {
+    let mut client = bench.admin.connect_as("postgres", "postgres").unwrap();
+    client
+        .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&name])
+        .unwrap()
+        .is_some()
+}
+
+#[test]
+fn 예행연습의_마이그레이션이_역할을_되돌려도_관리_권한을_얻지_못한다() {
+    let mut bench = bench!();
+    let intruder = format!("{}_x_intruder", bench.names.prefix());
+    let attack = format!("RESET ROLE; CREATE ROLE \"{intruder}\" SUPERUSER LOGIN");
+    let result = bench.admin.rehearse(&bench.names, &[&attack]).unwrap();
+    assert!(!result.passed);
+    assert_eq!(result.sqlstate.as_deref(), Some("42501"));
+    assert!(!role_exists(&bench, &intruder));
+    // 다른 database 를 읽는 길도 없다
+    let result = bench
+        .admin
+        .rehearse(
+            &bench.names,
+            &["RESET ROLE; COPY (SELECT 1) TO PROGRAM 'true'"],
+        )
+        .unwrap();
+    assert_eq!(result.sqlstate.as_deref(), Some("42501"));
+}
+#[test]
+fn 운영의_마이그레이션이_역할을_되돌려도_관리_권한을_얻지_못한다() {
+    let mut bench = bench!();
+    let intruder = format!("{}_x_intruder", bench.names.prefix());
+    let attack = format!("RESET ROLE; CREATE ROLE \"{intruder}\" SUPERUSER LOGIN");
+    assert!(matches!(
+        bench.admin.migrate(&bench.names, &[&attack]),
+        Err(Error::Pg { .. })
+    ));
+    assert!(matches!(
+        bench
+            .admin
+            .migrate_named(&bench.names, &[("900_attack.sql", &attack)]),
+        Err(Error::Pg { .. })
+    ));
+    assert!(!role_exists(&bench, &intruder));
+    assert_eq!(
+        bench.admin.applied(&bench.names).unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+// ---- 이름이 붙은 마이그레이션 ----
+
+#[test]
+fn 이미_돈_마이그레이션은_다시_돌리지_않는다() {
+    let mut bench = bench!();
+    let scripts = [
+        (
+            "010_note.sql",
+            "ALTER TABLE payroll.payslip ADD COLUMN note text",
+        ),
+        (
+            "020_paid.sql",
+            "ALTER TABLE payroll.payslip ADD COLUMN paid boolean",
+        ),
+    ];
+    assert_eq!(
+        bench
+            .admin
+            .pending(&bench.names, &["010_note.sql", "020_paid.sql"])
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        bench
+            .admin
+            .migrate_named(&bench.names, &scripts[..1])
+            .unwrap(),
+        vec!["010_note.sql"]
+    );
+    // 다시 돌리면 「이미 있는 열」로 깨질 것이 건너뛰어진다
+    assert_eq!(
+        bench.admin.migrate_named(&bench.names, &scripts).unwrap(),
+        vec!["020_paid.sql"]
+    );
+    assert_eq!(
+        bench.admin.migrate_named(&bench.names, &scripts).unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        bench.admin.applied(&bench.names).unwrap(),
+        vec!["010_note.sql", "020_paid.sql"]
+    );
+    assert_eq!(
+        bench
+            .admin
+            .pending(&bench.names, &["010_note.sql", "030_new.sql"])
+            .unwrap(),
+        vec!["030_new.sql"]
+    );
+}
+
+#[test]
+fn 실패한_마이그레이션은_이름이_남지_않고_앞에서_돈_것은_남는다() {
+    let mut bench = bench!();
+    let scripts = [
+        (
+            "010_note.sql",
+            "ALTER TABLE payroll.payslip ADD COLUMN note text",
+        ),
+        (
+            "020_broken.sql",
+            "ALTER TABLE payroll.payslip ADD COLUMN paid boolean; SELECT 1 / 0",
+        ),
+    ];
+    assert!(bench.admin.migrate_named(&bench.names, &scripts).is_err());
+    assert_eq!(
+        bench.admin.applied(&bench.names).unwrap(),
+        vec!["010_note.sql"]
+    );
+    // 실패한 마이그레이션이 더한 열은 함께 되돌아갔다
+    assert!(
+        bench
+            .login("api", "payroll_admin")
+            .query("SELECT paid FROM payroll.payslip", &[])
+            .is_err()
+    );
+}
+
+#[test]
+fn 업무_역할은_마이그레이션의_기록을_읽거나_고치지_못한다() {
+    let mut bench = bench!();
+    bench
+        .admin
+        .migrate_named(
+            &bench.names,
+            &[(
+                "010_note.sql",
+                "ALTER TABLE payroll.payslip ADD COLUMN note text",
+            )],
+        )
+        .unwrap();
+    let mut admin = bench.login("api", "payroll_admin");
+    assert!(denied(
+        admin.execute("SELECT * FROM orbital.migration", &[])
+    ));
+    assert!(denied(admin.execute("DELETE FROM orbital.migration", &[])));
+    assert!(denied(admin.execute(
+        "INSERT INTO orbital.migration (name) VALUES ('999_fake.sql')",
+        &[]
+    )));
+}
+
+#[test]
+fn 되돌릴_지점으로_돌아가면_마이그레이션의_기록도_그때로_돌아간다() {
+    let mut bench = bench!();
+    let point = bench.admin.mark(&bench.names).unwrap();
+    bench
+        .admin
+        .migrate_named(
+            &bench.names,
+            &[(
+                "010_note.sql",
+                "ALTER TABLE payroll.payslip ADD COLUMN note text",
+            )],
+        )
+        .unwrap();
+    bench
+        .admin
+        .restore(&bench.names, &bench.manifest, &point)
+        .unwrap();
+    assert_eq!(
+        bench.admin.applied(&bench.names).unwrap(),
+        Vec::<String>::new()
+    );
+    // 같은 마이그레이션을 다시 돌릴 수 있다
+    assert_eq!(
+        bench
+            .admin
+            .migrate_named(
+                &bench.names,
+                &[(
+                    "010_note.sql",
+                    "ALTER TABLE payroll.payslip ADD COLUMN note text"
+                )]
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn 운영_db_의_문을_닫고_연결을_끊으면_복제할_수_있고_다시_열면_붙는다() {
+    let mut bench = bench!();
+    let mut held = bench.login("api", "employee");
+    bench.admin.quiesce(&bench.names).unwrap();
+    // 닫혀 있는 동안에는 새로 붙지 못하고, 붙어 있던 연결은 끊겼다
+    let login = bench.names.login(&ident("api"), &ident("employee"));
+    assert!(
+        bench
+            .admin
+            .connect_as(&bench.names.database(), &login)
+            .is_err()
+    );
+    assert!(held.query("SELECT 1", &[]).is_err());
+    let result = bench
+        .admin
+        .rehearse(
+            &bench.names,
+            &["ALTER TABLE payroll.payslip ADD COLUMN note text"],
+        )
+        .unwrap();
+    assert!(result.passed);
+    bench.admin.resume(&bench.names).unwrap();
+    assert_eq!(
+        payslip_owners(
+            &mut bench.login("api", "employee"),
+            Some(&bench.identity("emp_1"))
+        )
+        .len(),
+        2
+    );
+}

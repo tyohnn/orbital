@@ -1,7 +1,8 @@
 //! `orbital`: 에이전트가 sandbox 에서 쓰는 CLI.
 //!
-//! 지금은 서버에 닿지 않는 명령만 있다. 선언(`orbital.toml`)과 권한 표(`db/access.toml`)를 올리기 전에 검사하고,
-//! 세워질 역할과 권한을 미리 보고, 권한의 변화를 승인 카드에 설 문장으로 본다. 판정은 모두 `orbital-core` 가 한다.
+//! 명령은 두 갈래다. 서버에 닿지 않는 명령(`check` · `plan` · `diff`)은 선언(`orbital.toml`)과 권한 표(`db/access.toml`)를
+//! 올리기 전에 검사하고, 세워질 역할과 권한을 미리 보고, 권한의 변화를 승인 카드에 설 문장으로 본다. 판정은 모두 `orbital-core` 가 한다.
+//! 레이어에 닿는 명령(`clone` · `push` · `preview` …)은 `remote` 모듈에 있고 토큰으로 부른다.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -14,20 +15,31 @@ use orbital_core::manifest::{Manifest, ValidManifest};
 use orbital_core::name::{InstanceId, TableRef};
 use orbital_core::plan::{Names, grants, logins, provision};
 
+mod remote;
+
 const USAGE: &str = "\
 orbital check [폴더]                         선언과 권한 표를 검사한다
 orbital plan [폴더] --instance <식별자>      세워질 역할과 권한을 SQL 로 본다
 orbital diff <앞의 access.toml> [폴더]       권한의 변화를 문장으로 본다
 orbital --version
+
+레이어에 닿는 명령(ORBITAL_URL · ORBITAL_INSTANCE · ORBITAL_TOKEN 이 있어야 한다):
+orbital clone <폴더>                         코드를 이력째 받는다
+orbital pull                                 레이어의 최신 commit 을 받아 합친다
+orbital push                                 commit 을 올린다
+orbital preview                              올린 commit 을 빌드해 미리보기를 세운다
+orbital identity <사람>                      미리보기에서 씨앗 데이터의 사람으로 요청할 신원을 받는다
+orbital rehearse <release>                   운영 사본에 마이그레이션을 예행연습한다
+orbital request-promotion <release>          승격을 요청한다. 승인은 사람이 한다
 ";
 
 /// 명령 하나의 결과. 글과 종료 코드다.
-struct Outcome {
-    text: String,
-    ok: bool,
+pub(crate) struct Outcome {
+    pub(crate) text: String,
+    pub(crate) ok: bool,
 }
 
-fn fail(text: impl Into<String>) -> Outcome {
+pub(crate) fn fail(text: impl Into<String>) -> Outcome {
     Outcome {
         text: text.into(),
         ok: false,
@@ -200,6 +212,13 @@ fn run(args: &[String]) -> Outcome {
             None => {
                 fail("앞의 권한 표 파일을 적어 주세요: orbital diff <앞의 access.toml> [폴더]\n")
             }
+        },
+        Some(
+            command @ ("clone" | "pull" | "push" | "preview" | "identity" | "rehearse"
+            | "request-promotion"),
+        ) => match remote::Remote::from_env() {
+            Ok(remote) => remote.run(command, args.get(1).map(String::as_str)),
+            Err(text) => fail(text),
         },
         _ => fail(USAGE),
     }

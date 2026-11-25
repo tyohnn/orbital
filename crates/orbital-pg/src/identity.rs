@@ -111,6 +111,13 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = orbital, pg_catalog AS $$
     LIMIT 1
 $$;
 
+-- 이미 돈 마이그레이션의 이름. 소유자는 적기만 하고 고치거나 지우지 못한다.
+CREATE TABLE IF NOT EXISTS orbital.migration (
+    name text PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
+REVOKE ALL ON orbital.migration FROM PUBLIC;
+
 GRANT USAGE ON SCHEMA orbital TO PUBLIC;
 "#;
 
@@ -128,6 +135,12 @@ impl Admin {
                 &[&names.instance().as_str(), &names.prefix(), &key],
             )
             .map_err(pg("서명의 열쇠를 두"))?;
+        client
+            .batch_execute(&format!(
+                "GRANT SELECT, INSERT ON orbital.migration TO {}",
+                crate::quote(&names.owner())
+            ))
+            .map_err(pg("마이그레이션의 기록을 두"))?;
         Ok(())
     }
 }
