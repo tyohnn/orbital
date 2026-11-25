@@ -1,0 +1,21 @@
+[package]
+name = "orbital-pg"
+description = "Orbital 의 Postgres 어댑터. core 의 계획을 실제 DB 에 세우고, 실제 DB 의 모습을 읽어 core 의 검사에 넘긴다"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+orbital-core = { path = "../orbital-core" }
+postgres.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
+
+[lints]
+workspace = true
