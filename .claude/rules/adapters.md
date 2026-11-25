@@ -5,6 +5,7 @@ paths:
   - "crates/orbital-router/**"
   - "crates/orbital-source/**"
   - "crates/orbital-run/**"
+  - "crates/orbital-backup/**"
 ---
 
 # 어댑터 crate
