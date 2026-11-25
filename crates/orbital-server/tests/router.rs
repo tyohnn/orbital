@@ -287,6 +287,10 @@ impl Runner for CountingRunner {
         self.inner.build(job)
     }
 
+    fn check(&self, job: &Job<'_>, limit: Duration) -> Result<(), RunError> {
+        self.inner.check(job, limit)
+    }
+
     fn start(&self, job: &Job<'_>) -> Result<Box<dyn Running>, RunError> {
         self.probe.starts.fetch_add(1, Ordering::SeqCst);
         if let Some(port) = job
