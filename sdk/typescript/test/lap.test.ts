@@ -117,6 +117,11 @@ before(async () =>
             ORBITAL_HOME: join(scratch, "home"),
             ORBITAL_PG: pg,
             ORBITAL_SERVICE_KEYS: `factory=${FACTORY},other=${OTHER_FACTORY}`,
+            // 팩토리의 메일 키 없이 운영에 올린다. 개발용 메일함을 명시해 켠다
+            ORBITAL_DEV_MAIL: "outbox",
+            // 팩토리의 키를 봉인하는 열쇠. 테스트에만 쓰는 값이다
+            ORBITAL_SEAL_KEY: "07".repeat(32),
+            ORBITAL_PUBLIC_URL: "https://layer.example",
             ORBITAL_LISTEN: listen,
         },
     });
@@ -308,4 +313,38 @@ test("모르는 service key 와 없는 스캐폴드 버전은 까닭과 함께 �
     assert.deepEqual([missing.status, missing.code], [422, "problems"]);
     // 무엇을 고칠지는 details 에 문장으로 온다
     assert.match(missing.details.join("\n"), /v999/);
+});
+
+test("팩토리가 SDK 로 넣은 메일과 Google 의 키는 설정을 읽어도 돌아오지 않는다", { skip }, async () =>
+{
+    const other = createOrbital({ url, serviceKey: OTHER_FACTORY });
+    const empty = await other.settings.auth.get();
+    assert.deepEqual(empty, {
+        mail: { configured: false, provider: null, from: null, fromName: null },
+        google: { configured: false, clientId: null, redirectUri: "https://layer.example/v1/auth/google/callback" },
+    });
+    const set = await other.settings.auth.set({
+        mail: { provider: "resend", apiKey: "re_sdk_secret_value", from: "login@other.example", fromName: "다른 팩토리" },
+        google: { clientId: "other.apps.googleusercontent.com", clientSecret: "GOCSPX-sdk-secret" },
+    });
+    assert.deepEqual(set, {
+        mail: { configured: true, provider: "resend", from: "login@other.example", fromName: "다른 팩토리" },
+        google: { configured: true, clientId: "other.apps.googleusercontent.com", redirectUri: "https://layer.example/v1/auth/google/callback" },
+    });
+    const read = await other.settings.auth.get();
+    assert.deepEqual(read, set);
+    assert.ok(!JSON.stringify(read).includes("secret"));
+    // SDK 가 걸러서가 아니라 관리 서버의 답에 없다
+    const raw = await (await fetch(`${url}/v1/settings/auth`, { headers: { authorization: `Bearer ${OTHER_FACTORY}` } })).text();
+    assert.ok(!raw.includes("re_sdk_secret_value") && !raw.includes("GOCSPX-sdk-secret"), raw);
+    // 다른 팩토리의 설정에는 보이지 않는다
+    assert.equal((await orbital.settings.auth.get()).mail.configured, false);
+    // 보내지 않은 칸은 그대로 두고 null 은 지운다
+    const cleared = await other.settings.auth.set({ google: null });
+    assert.equal(cleared.google.configured, false);
+    assert.equal(cleared.mail.configured, true);
+    const refused = await rejection(other.settings.auth.set({ mail: { provider: "resend", apiKey: "re_sdk_secret_value", from: "not-an-address" } }));
+    assert.equal(refused.status, 422);
+    assert.ok(!JSON.stringify(refused).includes("re_sdk_secret_value"));
+    assert.ok(!refused.message.includes("re_sdk_secret_value"));
 });
