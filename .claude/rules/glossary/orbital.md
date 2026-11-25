@@ -30,6 +30,10 @@ paths:
 | 초대 | 그 이메일이 들어올 수 있게 하고 처음 가질 업무 역할을 정한 것. 14일 동안 받아들여진다 | `AuthStore::invite`, `judge_invitation` |
 | 로그인 링크 | 메일로 가는 한 번 쓰는 주소. 15분, 요청한 브라우저에서만 열린다. 같은 이메일로는 1분에 하나 | `AuthStore::request_link` · `enter`, `judge_link` |
 | 세션 | 로그인한 브라우저의 쿠키(`__Host-orbital-session`)가 가리키는 것. 거두거나 사용자를 빼면 다음 요청부터 없는 것이다 | `AuthStore::session`, `judge_session` |
+| 인가 서버 · 자원 서버 | MCP 의 인가에서 Orbital Auth 가 토큰을 내는 쪽(발급자는 router 의 주소), router 가 MCP 주소에서 토큰을 확인하는 쪽 | `orbital_core::oauth`, `orbital_router::oauth` |
+| 승인(grant) | 사용자가 클라이언트 하나에 준 허락. 코드와 토큰은 승인에 딸리고, 승인을 거두면 함께 끊긴다 | `oauth_grant`, `AuthStore::decide` · `revoke_grant` |
+| 인가 코드 · access 토큰 · refresh 토큰 | 5분 한 번 · 1시간 · 30일(쓸 때마다 간다). 해시로만 둔다 | `oauth_code`, `oauth_token`, `judge_code` · `judge_token` |
+| metadata 문서 | `https` 주소를 `client_id` 로 쓰는 클라이언트가 자신을 밝힌 문서. 받아 와서 24시간 기억한다 | `DocumentFetcher`, `judge_document` |
 | 인증 역할 | `orbital_auth` 의 표만 읽고 쓰는 Postgres 역할. 앱의 스키마에는 닿지 못한다 | `Names::auth` |
 | 스캐폴드 | 팩토리가 올린 앱의 원본. 버전(태그)이 있고 인스턴스가 그 하나에서 갈라진다 | `receive_scaffold`, `SourceStore::create` |
 | 묶음 | 코드를 주고받는 git bundle. 에이전트가 받아 가서 고친 뒤 올린다 | `SourceStore::bundle` · `receive` |
