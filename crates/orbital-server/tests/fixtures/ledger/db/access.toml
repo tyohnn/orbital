@@ -1,0 +1,13 @@
+[ledger.note]
+member = "read own"
+admin = "read write"
+
+[ledger.tag]
+rls = "off: 되살리기의 시험용 표"
+member = "none"
+admin = "read"
+
+[ledger.trace]
+rls = "off: 되살리기의 시험용 표"
+member = "none"
+admin = "read"

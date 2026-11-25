@@ -52,6 +52,7 @@ use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
+use crate::backup::BackupOptions;
 use crate::login::{Endpoints, FactoryGoogleDoor, FactoryMailer, exchange, sha256_hex};
 use crate::registry::{InstanceRecord, ProductionRecord, Registry, ReleaseRecord};
 use crate::seal::SealKey;
@@ -470,6 +471,8 @@ pub struct Options {
     pub clock: Clock,
     /// 적합성 테스트의 제한 시간(기본 120초). 넘으면 멈추고 실패로 적는다.
     pub conformance_timeout: Duration,
+    /// 백업과 복구 훈련(`ORBITAL_BACKUP_DIR`). 없으면 백업하지 않고, 인스턴스를 되살리는 길은 409 로 답한다.
+    pub backup: Option<BackupOptions>,
 }
 
 /// 하위 도메인으로 인스턴스를 가르는 레이어의 설정.
@@ -504,6 +507,7 @@ impl Options {
             hosting: None,
             clock: Arc::new(now),
             conformance_timeout: Duration::from_secs(120),
+            backup: None,
         }
     }
 }
@@ -534,7 +538,16 @@ pub struct Layer {
     runtime: Runtime,
     token_key: Vec<u8>,
     service_keys: Vec<([u8; 32], String)>,
+    /// 백업을 켠 레이어에만 있다.
+    backup: Option<Backup>,
     inner: Mutex<Inner>,
+}
+
+/// 백업을 두는 곳과 그 설정.
+struct Backup {
+    store: Box<dyn orbital_backup::Store>,
+    keep_for: Duration,
+    require_drill: bool,
 }
 
 /// 사용자 목록의 한 줄. 팩토리의 관리 화면이 세운다.
@@ -692,7 +705,32 @@ impl Layer {
                 })
             }
         };
+        let backup = match options.backup {
+            None => None,
+            Some(backup) => {
+                let tools = orbital_backup::Tools::find().map_err(|error| error.to_string())?;
+                let store = orbital_backup::LocalStore::open(tools, backup.root)
+                    .map_err(|error| format!("백업의 폴더를 열지 못했습니다. {error}"))?;
+                // 운영 클러스터가 WAL 을 보관하지 않으면 시점 복구가 되지 않는다. 적을 명령을 알린다
+                let archiving = postgres::Client::connect(&options.pg_url, postgres::NoTls)
+                    .and_then(|mut client| client.query_one("SHOW archive_mode", &[]))
+                    .map(|row| row.get::<_, String>(0) != "off")
+                    .unwrap_or(false);
+                if !archiving {
+                    return Err(format!(
+                        "운영 클러스터가 WAL 을 보관하지 않습니다. postgresql.conf 에 `archive_mode = on` 과 `archive_command = '{}'` 를 적고 클러스터를 다시 띄워 주세요",
+                        store.archive_command().replace('\'', "''")
+                    ));
+                }
+                Some(Backup {
+                    store: Box::new(store),
+                    keep_for: backup.keep_for,
+                    require_drill: backup.require_drill,
+                })
+            }
+        };
         let layer = Self {
+            backup,
             sources: SourceStore::new(options.home.join("sources")),
             settings: Arc::new(settings),
             vault: Arc::new(vault),
@@ -946,6 +984,8 @@ impl Layer {
         if !scaffold.join("HEAD").is_file() {
             return Err(Failure::NotFound);
         }
+        // 복구 훈련이 통과한 뒤에만 새 고객의 데이터를 받는다
+        self.require_fresh_drill()?;
         let mut inner = self.lock();
         let instance = fresh_id('i')?;
         self.sources
@@ -2819,5 +2859,353 @@ impl Layer {
                 server.refresh();
             }
         }
+    }
+}
+
+// ---- 백업과 복구 훈련 ----
+
+/// 인스턴스 하나를 되살린 결과. 이름과 숫자만 싣는다.
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreReport {
+    pub instance: String,
+    /// 되살린 시점(유닉스 초).
+    pub at: u64,
+    /// 되살리는 데 걸린 시간.
+    pub millis: u64,
+    /// 되살린 database 의 표의 수.
+    pub tables: usize,
+    /// 되살리기 직전의 운영 DB 를 떠 둔 되돌릴 지점(database 의 이름).
+    pub restore_point: String,
+}
+
+/// 팩토리가 보는 훈련의 모습. 통과했는지와 숫자만.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupStatus {
+    /// 마지막으로 통과한 훈련이 여드레 안인가. 아니면 새 고객의 데이터를 받지 않는 것이 규칙이다.
+    pub fresh: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_passed_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_drill: Option<DrillSummary>,
+}
+
+/// 마지막 훈련의 숫자.
+#[derive(Debug, Clone, Serialize)]
+pub struct DrillSummary {
+    pub passed: bool,
+    pub at: u64,
+    pub recovery_millis: u64,
+    pub drill_millis: u64,
+    pub exposure_seconds: Option<u64>,
+    pub instances: usize,
+    pub checks: usize,
+    pub failed_checks: usize,
+}
+
+fn backup_off() -> Failure {
+    Failure::Conflict(
+        "이 레이어는 백업을 켜지 않았습니다. 레이어의 운영자가 관리 서버에 `ORBITAL_BACKUP_DIR` 을 적어야 합니다".to_owned(),
+    )
+}
+
+/// 그 시점으로 되살리지 못하는 까닭. 무엇을 고치면 되는지를 함께 적는다.
+pub fn restore_refusal_text(refusal: &orbital_core::backup::RestoreRefusal) -> String {
+    use orbital_core::backup::RestoreRefusal;
+    match refusal {
+        RestoreRefusal::NoBackup => "기반 백업이 아직 없습니다. 레이어가 첫 기반 백업을 뜬 뒤의 시점으로만 되살릴 수 있습니다".to_owned(),
+        RestoreRefusal::BeforeOldestBackup { oldest } => format!(
+            "가장 오랜 기반 백업(유닉스 초 {})보다 앞선 시점으로는 되살리지 못합니다. 그 뒤의 시점을 적어 주세요",
+            oldest.div_ceil(1000)
+        ),
+        RestoreRefusal::BeyondArchive { .. } => {
+            "보관한 WAL 이 그 시점에 닿지 않습니다. 지금보다 앞선 시점을 적어 주세요".to_owned()
+        }
+        RestoreRefusal::MissingWal { segment } => format!(
+            "기반 백업에서 그 시점까지 이어지는 WAL 조각 `{segment}` 이 보관 폴더에 없어 되살리지 못합니다. 레이어의 운영자가 백업을 확인해야 합니다"
+        ),
+    }
+}
+
+/// 훈련이 낡아 새 인스턴스를 받지 않는 까닭. 에이전트가 고칠 수 없는 일임을 밝힌다.
+fn stale_text(freshness: orbital_core::backup::Freshness) -> String {
+    use orbital_core::backup::Freshness;
+    let why = match freshness {
+        Freshness::Overdue { .. } => "마지막으로 통과한 복구 훈련이 여드레를 넘겼습니다",
+        Freshness::NeverPassed | Freshness::Fresh => "복구 훈련이 한 번도 통과하지 않았습니다",
+    };
+    format!(
+        "{why}. 훈련이 통과한 뒤에만 새 고객의 데이터를 받으므로 새 인스턴스를 세우지 않습니다. 에이전트가 고칠 수 없는 일입니다. 레이어의 운영자가 `orbitald drill` 로 훈련을 통과시켜야 합니다. 이미 선 인스턴스의 프리뷰와 승격은 그대로 됩니다"
+    )
+}
+
+impl Layer {
+    fn backup_on(&self) -> Outcome<&Backup> {
+        self.backup.as_ref().ok_or_else(backup_off)
+    }
+
+    /// 마지막으로 통과한 훈련으로 본 지금의 모습.
+    fn freshness(&self) -> orbital_core::backup::Freshness {
+        let history = crate::backup::history(&self.home);
+        orbital_core::backup::freshness(orbital_core::backup::last_passed(&history), (self.clock)())
+    }
+
+    /// 훈련을 켠 레이어에서 훈련이 낡았으면 새 인스턴스를 받지 않는다.
+    fn require_fresh_drill(&self) -> Outcome<()> {
+        if self
+            .backup
+            .as_ref()
+            .is_some_and(|backup| backup.require_drill)
+        {
+            let freshness = self.freshness();
+            if !freshness.is_fresh() {
+                return Err(Failure::Conflict(stale_text(freshness)));
+            }
+        }
+        Ok(())
+    }
+
+    /// 기반 백업을 하나 뜨고 보관 기간이 지난 것을 지운다. 백업을 켜지 않은 레이어에서는 409 다.
+    /// 뜨는 동안 다른 일을 멈춰 레이어의 기록과 DB 가 같은 때의 것이 되게 한다.
+    pub fn base_backup(&self) -> Outcome<orbital_core::backup::BaseBackup> {
+        let backup = self.backup_on()?;
+        let _guard = self.lock();
+        crate::backup::take_base_backup(
+            backup.store.as_ref(),
+            &self.home,
+            &self.pg_url,
+            backup.keep_for,
+        )
+        .map_err(internal)
+    }
+
+    /// 복구 훈련을 한 번 돌리고 기록에 쌓는다. 훈련은 운영 클러스터를 덮어쓰지 않고, 도는 동안 다른 일을 막지 않는다.
+    pub fn drill(&self) -> Outcome<orbital_core::backup::DrillRecord> {
+        let backup = self.backup_on()?;
+        let record = crate::backup::drill(
+            backup.store.as_ref(),
+            &self.home,
+            &self.pg_url,
+            (self.clock)(),
+        );
+        crate::backup::append(&self.home, &record).map_err(Failure::Internal)?;
+        Ok(record)
+    }
+
+    /// 팩토리가 보는 훈련의 모습. 훈련은 레이어 하나의 일이라 어느 팩토리에게나 같다.
+    pub fn backup_status(&self, _organization: &str) -> Outcome<BackupStatus> {
+        let history = crate::backup::history(&self.home);
+        let last_passed_at = orbital_core::backup::last_passed(&history);
+        let fresh = orbital_core::backup::freshness(last_passed_at, (self.clock)()).is_fresh();
+        let last_drill = history
+            .iter()
+            .max_by_key(|record| record.at)
+            .map(|record| DrillSummary {
+                passed: record.passed,
+                at: record.at,
+                recovery_millis: record.recovery_millis,
+                drill_millis: record.drill_millis,
+                exposure_seconds: record.exposure_seconds,
+                instances: record.instances,
+                checks: record.checks.len(),
+                failed_checks: record
+                    .checks
+                    .iter()
+                    .filter(|checked| !checked.passed)
+                    .count(),
+            });
+        Ok(BackupStatus {
+            fresh,
+            last_passed_at,
+            last_drill,
+        })
+    }
+
+    /// 정한 주기가 됐으면 기반 백업을 뜨고 복구 훈련을 돌린다. 관리 서버가 1분마다 부른다.
+    /// 훈련이 실패했으면 주기를 기다리지 않고 한 시간 뒤에 다시 돌린다.
+    pub fn tend(&self, backup_every: Duration, drill_every: Duration) {
+        let Some(backup) = &self.backup else {
+            return;
+        };
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            });
+        let latest = backup
+            .store
+            .backups()
+            .ok()
+            .and_then(|backups| backups.iter().map(|backup| backup.finished_at).max());
+        let every = u64::try_from(backup_every.as_millis()).unwrap_or(u64::MAX);
+        if latest.is_none_or(|at| now_millis >= at.saturating_add(every))
+            && self.base_backup().is_err()
+        {
+            eprintln!("orbitald: 기반 백업을 뜨지 못했습니다");
+        }
+        let history = crate::backup::history(&self.home);
+        let now = (self.clock)();
+        let due = match history.iter().max_by_key(|record| record.at) {
+            None => true,
+            Some(last) if last.passed => now >= last.at.saturating_add(drill_every.as_secs()),
+            Some(last) => now >= last.at.saturating_add(60 * 60),
+        };
+        if due {
+            match self.drill() {
+                Ok(record) if record.passed => eprintln!(
+                    "orbitald: 복구 훈련이 통과했습니다(복구 {}ms)",
+                    record.recovery_millis
+                ),
+                Ok(_) => eprintln!(
+                    "orbitald: 복구 훈련이 실패했습니다. drills.jsonl 의 마지막 줄을 봐 주세요"
+                ),
+                Err(_) => eprintln!("orbitald: 복구 훈련을 돌리지 못했습니다"),
+            }
+        }
+    }
+
+    /// 운영 중인 인스턴스 하나의 DB 를 지난 시점(유닉스 초)으로 되살린다. 팩토리의 서버(service key)만 부른다.
+    ///
+    /// 옆에 그 시점의 클러스터를 되살린 뒤 이 인스턴스의 database 만 운영 클러스터로 옮겨 바꿔 넣는다. 순서는 이렇다.
+    /// 옆 이름에 레이어의 계획으로 다시 세우고 권한 검사를 지난다(앱의 정의는 관리 권한으로 돌지 않는다) → 서버를 재운다 →
+    /// 지금의 운영 DB 를 되돌릴 지점으로 남긴다 → 이름을 바꿔 넣는다 → 다음 요청이 되살린 DB 에 닿는다.
+    /// 다른 인스턴스의 database 와 역할은 건드리지 않는다. 코드(release)와 금고는 그대로다.
+    pub fn restore_instance(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        at: u64,
+    ) -> Outcome<RestoreReport> {
+        use orbital_backup::DatabaseName;
+
+        let started = Instant::now();
+        let mut inner = self.lock();
+        let record = Self::owned(&mut inner, organization, instance)?.clone();
+        let backup = self.backup_on()?;
+        let production = record.production.clone().ok_or_else(|| {
+            Failure::Conflict("운영에 오른 것이 없어 되살릴 DB 가 없습니다".to_owned())
+        })?;
+        let at_millis = at
+            .checked_mul(1000)
+            .ok_or_else(|| Failure::Problems(vec!["`at` 은 유닉스 초로 적어 주세요".to_owned()]))?;
+        let commit = record
+            .releases
+            .get(&production.release)
+            .and_then(|release| Commit::parse(&release.commit))
+            .ok_or_else(|| internal("운영의 release 를 찾지 못했습니다"))?;
+        let assembled = self.assembled(instance, &commit)?;
+
+        // 그 시점의 클러스터를 옆에 세운다. 운영 클러스터는 덮어쓰지 않는다
+        let store = backup.store.as_ref();
+        store.seal(&self.pg_url).map_err(internal)?;
+        let backups = store.backups().map_err(internal)?;
+        let archive = store.archive().map_err(internal)?;
+        let chosen = orbital_core::backup::judge_restore(&backups, &archive, at_millis)
+            .map_err(|refusal| Failure::Conflict(restore_refusal_text(&refusal)))?
+            .clone();
+        let side = store
+            .recover(&chosen, at_millis)
+            .map_err(|error| Failure::Conflict(error.to_string()))?;
+        let names = Names::new(instance.clone());
+        let present = side
+            .connect("postgres")
+            .and_then(|mut client| orbital_backup::databases(&mut client))
+            .map_err(internal)?;
+        if !present.contains(&names.database()) {
+            return Err(Failure::Conflict(
+                "그 시점에는 이 인스턴스의 DB 가 아직 없었습니다. 운영에 처음 오른 뒤의 시점을 적어 주세요".to_owned(),
+            ));
+        }
+        let source = DatabaseName::parse(&names.database()).map_err(internal)?;
+        let suffix: String = random(5)?
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let staged = names
+            .staged(&format!("rs_{suffix}"))
+            .ok_or_else(|| internal("옆 이름을 짓지 못했습니다"))?;
+        let identity_key = token::unhex(&production.identity_key)
+            .ok_or_else(|| internal("서명의 열쇠를 읽지 못했습니다"))?;
+        let manifest = &assembled.manifest;
+
+        // 그 시점의 database 를 운영 클러스터의 옆 이름에 다시 세운다. 레이어의 것은 레이어의 계획으로 세우고, 앱의 정의는
+        // 마이그레이션 역할로, 로그인의 행은 인증 역할로 넣는다. 권한을 권한 표대로 세워 권한 검사를 지나야 바꿔 넣는다.
+        // 이동안 운영은 그대로 돈다
+        let plan = crate::backup::Rebuild {
+            names: &staged,
+            manifest,
+            access: &assembled.access,
+            identity_key: &identity_key,
+            pg_url: &self.pg_url,
+        };
+        let rebuilt = crate::backup::rebuild(&mut inner.admin, &side, &source, &plan);
+        drop(side);
+        rebuilt.map_err(Failure::Conflict)?;
+
+        // 서버를 재우고, 지금의 운영 DB 를 되돌릴 지점으로 남긴 뒤 바꿔 넣는다
+        let key = (instance.as_str().to_owned(), Stage::Production);
+        let sleep = |inner: &Inner| {
+            if let Some(live) = inner.live.get(&key) {
+                for service in &live.services {
+                    if let Some(server) = &service.server {
+                        server.refresh();
+                    }
+                }
+            }
+        };
+        let forget_staged = |inner: &mut Inner| {
+            let _ = inner.admin.forget(RestorePoint::named(staged.database()));
+        };
+        sleep(&inner);
+        if let Err(error) = inner.admin.quiesce(&names) {
+            forget_staged(&mut inner);
+            return Err(internal(error));
+        }
+        let marked = inner.admin.mark(&names);
+        let resumed = inner.admin.resume(&names);
+        let point = match (marked, resumed) {
+            (Ok(point), Ok(())) => point,
+            (marked, resumed) => {
+                forget_staged(&mut inner);
+                return Err(internal(
+                    marked
+                        .err()
+                        .or(resumed.err())
+                        .map_or_else(String::new, |error| error.to_string()),
+                ));
+            }
+        };
+        if let Err(error) =
+            inner
+                .admin
+                .restore(&names, manifest, &RestorePoint::named(staged.database()))
+        {
+            forget_staged(&mut inner);
+            let _ = inner.admin.forget(point);
+            return Err(internal(error));
+        }
+        let tables = inner
+            .admin
+            .tables(&names, manifest)
+            .map_err(internal)?
+            .len();
+
+        // 되돌릴 지점은 하나만 둔다. 앞의 승격이 남긴 것은 지운다
+        if let Some(old) = production.restore_point.clone() {
+            let _ = inner.admin.forget(RestorePoint::named(old));
+        }
+        let stored = Self::owned(&mut inner, organization, instance)?;
+        if let Some(production) = stored.production.as_mut() {
+            production.restore_point = Some(point.database().to_owned());
+        }
+        inner.registry.save().map_err(Failure::Internal)?;
+        // 앞의 DB 에 붙어 있던 프로세스를 다시 재운다. 다음 요청이 되살린 DB 로 깬다
+        sleep(&inner);
+        Ok(RestoreReport {
+            instance: instance.as_str().to_owned(),
+            at,
+            millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            tables,
+            restore_point: point.database().to_owned(),
+        })
     }
 }

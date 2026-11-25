@@ -16,6 +16,7 @@ orbital-core = { path = "../orbital-core" }
 base64.workspace = true
 chacha20poly1305.workspace = true
 getrandom.workspace = true
+orbital-backup = { path = "../orbital-backup" }
 orbital-pg = { path = "../orbital-pg" }
 orbital-proxy = { path = "../orbital-proxy" }
 orbital-router = { path = "../orbital-router" }

@@ -262,6 +262,13 @@ struct NewUser {
     roles: Vec<String>,
 }
 
+/// 인스턴스를 되살릴 시점(유닉스 초).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreRequest {
+    at: u64,
+}
+
 #[derive(Deserialize)]
 struct NewPromotion {
     release: String,
@@ -356,6 +363,8 @@ fn with_token(
         ("PUT" | "DELETE", ["secrets", _]) | ("POST", ["secrets", _, "entries"]) => {
             allow(Action::SecretsWrite).map(|()| ok(json!({})))
         }
+        // 되살리는 길을 토큰으로 두드리면 core 가 「service key 로만」이라고 답한다. 본문은 읽지 않는다
+        ("POST", ["restore"]) => allow(Action::RestoreInstance).map(|()| ok(json!({}))),
         // 자기 인스턴스가 든 열린 rollout 의 진행. 다른 인스턴스는 싣지 않는다
         ("GET", ["rollout"]) => {
             allow(Action::RolloutView)?;
@@ -383,6 +392,8 @@ fn with_service_key(
             layer.put_auth_settings(&organization, body)?;
             Ok(ok(layer.auth_settings(&organization)))
         }
+        // 복구 훈련이 통과했는지와 숫자만
+        ("GET", ["backup"]) => Ok(ok(json!(layer.backup_status(&organization)?))),
         ("PUT", ["apps", app]) => {
             layer.put_app(&organization, app, body)?;
             Ok(ok(json!({ "app": app })))
@@ -512,6 +523,14 @@ fn with_service_key(
                         &instance,
                         name,
                         request.stage
+                    )?)))
+                }
+                ("POST", ["restore"]) => {
+                    let request: RestoreRequest = parse(body)?;
+                    Ok(ok(json!(layer.restore_instance(
+                        &organization,
+                        &instance,
+                        request.at
                     )?)))
                 }
                 ("DELETE", []) => {

@@ -1,0 +1,36 @@
+name: drill
+
+# 복구 훈련의 절차를 매주 한 번 처음부터 끝까지 돌려 본다. 운영의 레이어는 `orbitald` 가 정한 주기(ORBITAL_DRILL_EVERY)로
+# 자기 훈련을 돌린다. 이 워크플로는 그 절차(기반 백업 → WAL 보관 → 옆에 시점 복구 → 확인 → 걷기)가 깨지지 않았는지를 잰다.
+on:
+  schedule:
+    # 매주 월요일 04:17(UTC)
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+jobs:
+  drill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      # 끝 기준의 테스트가 띄우는 시험용 앱이 Node 로 돈다
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -sS -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-19
+      # 일반 사용자로 돌린다. 클러스터는 스크립트가 임시 폴더에 따로 세우고 끝나면 걷는다
+      - run: scripts/drill-local.sh
+      # 실제 인스턴스 · 앱 프로세스 위에서 훈련이 끝까지 도는지도 잰다(끝 기준의 테스트)
+      - run: cargo test -p orbital-server --test backup 훈련이_사람_손_없이_끝까지_돌고_통과한다
