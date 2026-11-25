@@ -247,6 +247,22 @@ test("팩토리의 서버가 인스턴스를 세워 토큰을 내고 에이전�
         (await (await fetch(`${live}/cards`, { headers: { cookie } })).json()) as unknown[];
     assert.equal((await cards(u9)).length, 1);
     assert.equal((await cards(u8)).length, 0);
+    // 팩토리의 관리 화면: 사용자 목록, 업무 역할 바꾸기, 빼기
+    const listed = await orbital.users.list(instance.id);
+    assert.deepEqual(
+        listed.map((user) => [user.email, user.roles, user.disabled]).sort(),
+        [["u8@example.test", ["member"], false], ["u9@example.test", ["member"], false]],
+    );
+    assert.ok(listed.every((user) => typeof user.lastSignedInAt === "number" && user.id.startsWith("u_")));
+    const u8id = listed.find((user) => user.email === "u8@example.test")?.id ?? "";
+    await orbital.users.setRoles({ instance: instance.id, user: u8id, roles: [] });
+    assert.deepEqual((await orbital.users.list(instance.id)).find((user) => user.id === u8id)?.roles, []);
+    const undeclared = await rejection(orbital.users.setRoles({ instance: instance.id, user: u8id, roles: ["auditor"] }));
+    assert.deepEqual([undeclared.status, undeclared.code], [422, "problems"]);
+    await orbital.users.remove({ instance: instance.id, user: u8id });
+    assert.equal((await fetch(`${live}/_orbital/auth/me`, { headers: { cookie: u8 } })).status, 401);
+    assert.equal((await orbital.users.list(instance.id)).find((user) => user.id === u8id)?.disabled, true);
+
     // 밖에서 신원 머리말을 실어 보내도 앱에는 닿지 않는다
     assert.equal((await (await fetch(`${live}/cards`, { headers: { "x-orbital-identity": "v1.00.00" } })).json() as unknown[]).length, 0);
 });
@@ -263,6 +279,9 @@ test("다른 팩토리의 service key 로는 인스턴스가 없는 것으로 �
         () => stranger.sessions.open({ instance: instance.id, can: ["source"] }),
         () => stranger.instances.destroy(instance.id),
         () => stranger.users.invite({ instance: instance.id, email: "kim@example.test", roles: ["member"] }),
+        () => stranger.users.list(instance.id),
+        () => stranger.users.setRoles({ instance: instance.id, user: "u_aaaaaaaaaaaaaaaaaaaa", roles: [] }),
+        () => stranger.users.remove({ instance: instance.id, user: "u_aaaaaaaaaaaaaaaaaaaa" }),
     ];
     for (const attempt of attempts)
     {

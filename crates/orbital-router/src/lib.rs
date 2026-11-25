@@ -201,6 +201,12 @@ pub struct Config {
 
 // ---- 인증 역할의 연결 풀 ----
 
+/// 세션을 확인한 요청. 사용자와, 신원의 `sid` 에 실을 세션의 이름이다.
+struct Signed {
+    user: SessionUser,
+    session: String,
+}
+
 /// 인증 역할의 연결을 열지 못했다. 503 으로 답한다.
 #[derive(Debug)]
 struct Unavailable;
@@ -554,7 +560,7 @@ impl State {
     }
 
     /// 세션 쿠키의 사용자. 쿠키가 없거나 세션이 없는 것이면 `None` 이다. DB 에 닿지 못하면 `Err` 이다.
-    async fn signed_in(&self, headers: &HeaderMap) -> Result<Option<SessionUser>, Unavailable> {
+    async fn signed_in(&self, headers: &HeaderMap) -> Result<Option<Signed>, Unavailable> {
         let Some(pool) = &self.pool else {
             return Ok(None);
         };
@@ -562,8 +568,9 @@ impl State {
         else {
             return Ok(None);
         };
+        let session = token.session_id();
         match pool.run(move |store| store.session(&token, now())).await {
-            Ok(user) => Ok(user),
+            Ok(user) => Ok(user.map(|user| Signed { user, session })),
             Err(StoreError::Refused(_)) => Ok(None),
             Err(StoreError::Unavailable) => Err(Unavailable),
         }
@@ -618,16 +625,19 @@ impl State {
         &self,
         request: Request<Incoming>,
         port: u16,
-        user: Option<&SessionUser>,
+        signed: Option<&Signed>,
     ) -> Response<Body> {
         let (mut parts, body) = request.into_parts();
         clean_request_headers(&mut parts.headers);
-        if let Some(user) = user {
+        if let Some(Signed { user, session }) = signed {
+            // 업무 역할은 이번 요청에서 표로 읽은 것이다. 역할을 거두면 다음 요청의 신원에서 빠진다
             let identity = sign(
                 &self.config.identity_key,
                 &self.config.names,
                 &Claims {
-                    subject: user.id.clone(),
+                    subject: Some(user.id.clone()),
+                    roles: user.roles.clone(),
+                    session: Some(session.clone()),
                     expires_at: now() + IDENTITY_TTL,
                 },
             );
@@ -799,7 +809,7 @@ impl State {
 
     async fn me(&self, headers: &HeaderMap) -> Response<Body> {
         match self.signed_in(headers).await {
-            Ok(Some(user)) => json_reply(
+            Ok(Some(Signed { user, .. })) => json_reply(
                 StatusCode::OK,
                 &json!({ "id": user.id, "email": user.email, "name": user.name, "roles": user.roles }),
             ),

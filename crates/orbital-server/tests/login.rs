@@ -19,6 +19,7 @@ use orbital_server::layer::{Layer, OUTBOX, Options};
 use serde_json::{Value, json};
 
 const FACTORY: &str = "sk_test_factory";
+const OTHER_FACTORY: &str = "sk_test_other";
 const ORGANIZATION: &str = "factory";
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -207,7 +208,10 @@ impl Bench {
         let layer = Layer::open(Options {
             home: home.clone(),
             pg_url: pg_url.clone(),
-            service_keys: vec![(FACTORY.to_owned(), ORGANIZATION.to_owned())],
+            service_keys: vec![
+                (FACTORY.to_owned(), ORGANIZATION.to_owned()),
+                (OTHER_FACTORY.to_owned(), "other".to_owned()),
+            ],
             runner: Box::new(LocalRunner::default()),
         })
         .expect("레이어를 열지 못했습니다");
@@ -220,6 +224,9 @@ impl Bench {
         };
         bench.upload("cards", &Self::cards_scaffold);
         bench.upload("plain", &Self::plain_scaffold);
+        bench.upload("payroll", &|folder: &Path| {
+            copy_tree(&fixture("payroll"), folder)
+        });
         Some(bench)
     }
 
@@ -603,7 +610,7 @@ fn 밖에서_신원_머리말을_실어_보내도_앱에는_닿지_않는다() {
     // router 가 세션을 보고 붙인 신원만 닿는다
     let identity = headers["x-orbital-identity"].as_str().unwrap();
     assert_ne!(identity, forged);
-    assert!(identity.starts_with("v1."));
+    assert!(identity.starts_with("v2."));
     assert_eq!(headers["x-orbital-stage"], Value::Null);
     // 밖에서 실은 신원으로는 남의 카드를 읽지 못한다(세션이 없으면 앱에 닿지도 않는다)
     let without = http(
@@ -975,20 +982,379 @@ fn auth_를_선언하지_않은_인스턴스의_앱은_router_를_지나도_전�
     assert_eq!(status, 422);
 }
 
+// ---- 신원에 실린 업무 역할 ----
+
+/// 앱에 닿은 신원(`v2.<hex>.<서명>`)의 내용을 읽는다.
+fn claims_of(identity: &str) -> Value {
+    let mut parts = identity.split('.');
+    assert_eq!(parts.next(), Some("v2"), "{identity}");
+    let hex = parts.next().unwrap();
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+        .collect();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn identity_at_app(origin: &str, cookie: &str) -> Value {
+    let echo = http("GET", origin, "/echo", &[("Cookie", cookie), JSON], "");
+    assert_eq!(echo.status, 200, "{}", echo.everything());
+    claims_of(
+        echo.json()["headers"]["x-orbital-identity"]
+            .as_str()
+            .unwrap(),
+    )
+}
+
 #[test]
-fn 에이전트의_토큰으로는_사용자를_초대하지_못한다() {
+fn 업무_역할을_거두면_다음_요청의_신원에_그_역할이_없다() {
     let mut bench = bench!();
-    let (instance, _) = bench.ship("cards");
-    let token = bench.token(&instance);
-    let path = format!("/v1/instances/{instance}/users");
-    let body = json!({ "email": "kim@example.com", "roles": ["member"] });
-    assert_eq!(bench.post(&path, &token, &body).0, 404);
-    // 팩토리의 service key 로는 된다. 선언에 없는 업무 역할은 고칠 것으로 돌려준다
-    assert_eq!(bench.post(&path, FACTORY, &body).0, 200);
-    let (status, problems) = bench.post(
-        &path,
+    let (instance, live) = bench.ship("payroll");
+    let (status, body) = bench.post(
+        &format!("/v1/instances/{instance}/users"),
         FACTORY,
-        &json!({ "email": "lee@example.com", "roles": ["admin"] }),
+        &json!({ "email": "kim@example.com", "roles": ["employee", "payroll_admin"] }),
     );
-    assert_eq!(status, 422, "{problems}");
+    assert_eq!(status, 200, "{body}");
+    let cookie = bench.sign_in(&live, "kim@example.com");
+    let kim = Bench::me(&live, &cookie).json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let claims = identity_at_app(&live, &cookie);
+    assert_eq!(claims["sub"], kim.as_str());
+    assert_eq!(claims["roles"], json!(["employee", "payroll_admin"]));
+    // 세션을 가리키는 것이 실리지만 세션의 토큰은 아니다
+    let sid = claims["sid"].as_str().unwrap();
+    let token = cookie.split('=').nth(1).unwrap();
+    assert!(!sid.is_empty() && !token.contains(sid) && !sid.contains(token));
+    // 신원은 요청 하나를 처리할 동안만 쓴다
+    let lifetime = claims["exp"].as_u64().unwrap()
+        - std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+    assert!(lifetime <= 60, "{lifetime}");
+
+    let (status, _) = bench.call(
+        "PUT",
+        &format!("/v1/instances/{instance}/users/{kim}/roles"),
+        FACTORY,
+        json!({ "roles": ["employee"] }).to_string().as_bytes(),
+    );
+    assert_eq!(status, 200);
+    let claims = identity_at_app(&live, &cookie);
+    assert_eq!(claims["roles"], json!(["employee"]));
+    assert_eq!(claims["sid"].as_str(), Some(sid));
+}
+
+#[test]
+fn 직원의_요청이_앱의_버그로_급여_관리자의_연결을_타도_행이_나오지_않는다() {
+    let mut bench = bench!();
+    let instance = bench.instance("payroll");
+    let token = bench.token(&instance);
+    let preview = bench.preview(&instance, &token);
+    let enter = |user: &str| {
+        let entered = http(
+            "POST",
+            &preview,
+            "/_orbital/preview/sign-in",
+            &[
+                ("Origin", preview.as_str()),
+                ("Content-Type", "application/json"),
+            ],
+            &json!({ "user": user }).to_string(),
+        );
+        assert_eq!(entered.status, 302, "{}", entered.everything());
+        entered.cookie("__Host-orbital-session")
+    };
+    let payslips = |cookie: &str, role: &str| -> Value {
+        let reply = http(
+            "GET",
+            &preview,
+            &format!("/payslips?as={role}"),
+            &[("Cookie", cookie), JSON],
+            "",
+        );
+        assert_eq!(reply.status, 200, "{}", reply.everything());
+        reply.json()
+    };
+    let employee = enter("e1");
+    assert_eq!(payslips(&employee, "employee"), json!(["e1", "e1"]));
+    // 앱이 연결을 잘못 골라 급여 관리자로 붙어도 직원의 신원으로는 어떤 행도 나오지 않는다
+    assert_eq!(payslips(&employee, "payroll_admin"), json!([]));
+    let admin = enter("a1");
+    assert_eq!(payslips(&admin, "payroll_admin"), json!(["e1", "e1", "e2"]));
+    assert_eq!(payslips(&admin, "employee"), json!([]));
+}
+
+#[test]
+fn 행_단위_규칙을_끈_표는_역할_제한이_걸리지_않는_표로_미리보기에_알리고_실패로_보지_않는다() {
+    let mut bench = bench!();
+    let instance = bench.instance("payroll");
+    let token = bench.token(&instance);
+    let (status, preview) = bench.call(
+        "POST",
+        &format!("/v1/instances/{instance}/previews"),
+        &token,
+        &[],
+    );
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(preview["findings"], json!([]));
+    assert_eq!(preview["blockers"], json!([]));
+    let notices = preview["notices"].as_array().unwrap();
+    assert_eq!(notices.len(), 1, "{preview}");
+    assert!(notices[0].as_str().unwrap().contains("payroll.calendar"));
+    // 그 표는 신원 없이도 권한 표대로 읽힌다
+    let url = preview["services"][0]["url"].as_str().unwrap();
+    let entered = http(
+        "POST",
+        url,
+        "/_orbital/preview/sign-in",
+        &[("Origin", url), ("Content-Type", "application/json")],
+        &json!({ "user": "e1" }).to_string(),
+    );
+    let cookie = entered.cookie("__Host-orbital-session");
+    let days = http("GET", url, "/calendar", &[("Cookie", &cookie), JSON], "");
+    assert_eq!(days.json(), json!(["25일"]));
+}
+
+// ---- 사용자 관리(service key) ----
+
+/// 사용자 관리의 길 넷을 이 열쇠로 두드린다. (상태, 본문)을 차례로 돌려준다.
+fn manage(bench: &Bench, instance: &str, bearer: &str, user: &str) -> Vec<(u16, Value)> {
+    let base = format!("/v1/instances/{instance}/users");
+    vec![
+        bench.call("GET", &base, bearer, &[]),
+        bench.post(
+            &base,
+            bearer,
+            &json!({ "email": "new@example.com", "roles": ["member"] }),
+        ),
+        bench.call(
+            "PUT",
+            &format!("{base}/{user}/roles"),
+            bearer,
+            json!({ "roles": ["member"] }).to_string().as_bytes(),
+        ),
+        bench.call("DELETE", &format!("{base}/{user}"), bearer, &[]),
+    ]
+}
+
+fn users(bench: &Bench, instance: &str) -> Vec<Value> {
+    let (status, body) = bench.call(
+        "GET",
+        &format!("/v1/instances/{instance}/users"),
+        FACTORY,
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    body["users"].as_array().unwrap().clone()
+}
+
+#[test]
+fn 에이전트의_토큰으로는_사용자를_초대하거나_읽지_못한다() {
+    let mut bench = bench!();
+    let (instance, live) = bench.ship("cards");
+    bench.invite(&instance, "kim@example.com");
+    let kim_cookie = bench.sign_in(&live, "kim@example.com");
+    let kim = Bench::me(&live, &kim_cookie).json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let token = bench.token(&instance);
+    for (status, body) in manage(&bench, &instance, &token, &kim) {
+        assert_eq!(status, 404, "{body}");
+    }
+    // 아무것도 바뀌지 않았다
+    let listed = users(&bench, &instance);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["disabled"], false);
+    assert_eq!(Bench::me(&live, &kim_cookie).status, 200);
+    assert!(bench.mails_to("new@example.com").is_empty());
+}
+
+#[test]
+fn 다른_팩토리의_service_key_로는_사용자가_없는_것으로_보인다() {
+    let mut bench = bench!();
+    let (instance, live) = bench.ship("cards");
+    bench.invite(&instance, "kim@example.com");
+    let kim_cookie = bench.sign_in(&live, "kim@example.com");
+    let kim = Bench::me(&live, &kim_cookie).json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let theirs = manage(&bench, &instance, OTHER_FACTORY, &kim);
+    let missing = manage(&bench, "i0000000000", OTHER_FACTORY, &kim);
+    for (status, _) in &theirs {
+        assert_eq!(*status, 404);
+    }
+    // 없는 인스턴스와 같은 답이다
+    assert_eq!(theirs, missing);
+    assert_eq!(Bench::me(&live, &kim_cookie).status, 200);
+    assert_eq!(users(&bench, &instance).len(), 1);
+}
+
+#[test]
+fn 선언에_없는_업무_역할로는_초대하지_못한다() {
+    let mut bench = bench!();
+    let (instance, live) = bench.ship("cards");
+    let path = format!("/v1/instances/{instance}/users");
+    for roles in [
+        json!(["admin"]),
+        json!(["member", "admin"]),
+        json!(["Member"]),
+    ] {
+        let (status, body) = bench.post(
+            &path,
+            FACTORY,
+            &json!({ "email": "kim@example.com", "roles": roles }),
+        );
+        assert_eq!(status, 422, "{roles}: {body}");
+        assert_eq!(body["error"], "problems");
+    }
+    // 초대가 남지 않았으니 링크도 만들어지지 않는다
+    let asked = http(
+        "POST",
+        &live,
+        "/_orbital/auth/email-link",
+        &[("Origin", &live), ("Content-Type", "application/json")],
+        &json!({ "email": "kim@example.com" }).to_string(),
+    );
+    assert_eq!(asked.status, 202);
+    assert!(bench.mails_to("kim@example.com").is_empty());
+    assert!(users(&bench, &instance).is_empty());
+}
+
+#[test]
+fn 사용자_목록에는_토큰도_세션도_실리지_않는다() {
+    let mut bench = bench!();
+    let (instance, live) = bench.ship("cards");
+    bench.invite(&instance, "kim@example.com");
+    bench.invite(&instance, "lee@example.com");
+    let session = bench.sign_in(&live, "kim@example.com");
+    let link = bench.mails_to("kim@example.com").pop().unwrap().link;
+    let link_token = link.split("token=").nth(1).unwrap().to_owned();
+    let session_token = session.split('=').nth(1).unwrap().to_owned();
+
+    let (status, body) = bench.call(
+        "GET",
+        &format!("/v1/instances/{instance}/users"),
+        FACTORY,
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    let listed = body["users"].as_array().unwrap();
+    // 초대만 받고 들어오지 않은 사람은 아직 사용자가 아니다
+    assert_eq!(listed.len(), 1);
+    let kim = listed[0].as_object().unwrap();
+    let mut keys: Vec<&str> = kim.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "disabled",
+            "email",
+            "id",
+            "last_signed_in_at",
+            "name",
+            "roles"
+        ]
+    );
+    assert_eq!(kim["email"], "kim@example.com");
+    assert_eq!(kim["roles"], json!(["member"]));
+    assert!(kim["last_signed_in_at"].as_u64().is_some());
+    let text = body.to_string();
+    assert!(!text.contains(&session_token));
+    assert!(!text.contains(&link_token));
+    // 해시처럼 보이는 긴 hex 도 없다
+    let longest_hex = text
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    assert!(longest_hex < 32, "{text}");
+}
+
+#[test]
+fn 업무_역할을_바꾸면_다음_요청의_me_에_반영된다() {
+    let mut bench = bench!();
+    let (instance, live) = bench.ship("payroll");
+    let (status, body) = bench.post(
+        &format!("/v1/instances/{instance}/users"),
+        FACTORY,
+        &json!({ "email": "kim@example.com", "roles": ["employee"] }),
+    );
+    assert_eq!(status, 200, "{body}");
+    let cookie = bench.sign_in(&live, "kim@example.com");
+    let me = Bench::me(&live, &cookie).json();
+    assert_eq!(me["roles"], json!(["employee"]));
+    let kim = me["id"].as_str().unwrap().to_owned();
+    let roles = |roles: Value| {
+        bench.call(
+            "PUT",
+            &format!("/v1/instances/{instance}/users/{kim}/roles"),
+            FACTORY,
+            json!({ "roles": roles }).to_string().as_bytes(),
+        )
+    };
+    assert_eq!(roles(json!(["employee", "payroll_admin"])).0, 200);
+    assert_eq!(
+        Bench::me(&live, &cookie).json()["roles"],
+        json!(["employee", "payroll_admin"])
+    );
+    // 선언에 없는 역할은 고칠 것으로 돌려주고, 역할은 그대로다
+    assert_eq!(roles(json!(["auditor"])).0, 422);
+    assert_eq!(
+        Bench::me(&live, &cookie).json()["roles"],
+        json!(["employee", "payroll_admin"])
+    );
+    assert_eq!(roles(json!([])).0, 200);
+    assert_eq!(Bench::me(&live, &cookie).json()["roles"], json!([]));
+    // 없는 사용자
+    let (status, _) = bench.call(
+        "PUT",
+        &format!("/v1/instances/{instance}/users/u_aaaaaaaaaaaaaaaaaaaa/roles"),
+        FACTORY,
+        json!({ "roles": [] }).to_string().as_bytes(),
+    );
+    assert_eq!(status, 404);
+}
+
+#[test]
+fn 사용자를_빼면_막히고_세션이_끊기며_목록에_막힌_것으로_보인다() {
+    let mut bench = bench!();
+    let (instance, live) = bench.ship("cards");
+    bench.invite(&instance, "kim@example.com");
+    let cookie = bench.sign_in(&live, "kim@example.com");
+    let kim = Bench::me(&live, &cookie).json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, body) = bench.call(
+        "DELETE",
+        &format!("/v1/instances/{instance}/users/{kim}"),
+        FACTORY,
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(Bench::me(&live, &cookie).status, 401);
+    assert_eq!(users(&bench, &instance)[0]["disabled"], true);
+    let (status, _) = bench.call(
+        "DELETE",
+        &format!("/v1/instances/{instance}/users/u_aaaaaaaaaaaaaaaaaaaa"),
+        FACTORY,
+        &[],
+    );
+    assert_eq!(status, 404);
+}
+
+#[test]
+fn 운영이_서지_않은_인스턴스의_사용자를_부르면_409_로_까닭을_알린다() {
+    let mut bench = bench!();
+    let instance = bench.instance("cards");
+    for (status, body) in manage(&bench, &instance, FACTORY, "u_aaaaaaaaaaaaaaaaaaaa") {
+        assert_eq!(status, 409, "{body}");
+        assert!(body["message"].as_str().unwrap().contains("운영"), "{body}");
+    }
 }

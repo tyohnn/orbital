@@ -22,8 +22,22 @@ export interface Service
 {
     name: string;
     kind: "server" | "static";
-    /** 서버 서비스가 요청을 받는 주소. 정적 서비스는 `null` 이다. */
+    /** 서비스에 닿는 주소. 인스턴스의 router 의 주소 + 서비스의 `path` 다. */
     url: string | null;
+}
+
+/** 운영의 사용자 한 사람. 토큰이나 세션은 실리지 않는다. */
+export interface User
+{
+    id: string;
+    email: string;
+    name: string | null;
+    /** 업무 역할의 이름. 이름 순이다. */
+    roles: string[];
+    /** 막혔는가(뺐는가). */
+    disabled: boolean;
+    /** 마지막으로 들어온 때(Unix 초). 한 번도 들어오지 않았으면 `null` 이다. */
+    lastSignedInAt: number | null;
 }
 
 export interface Production
@@ -112,6 +126,12 @@ export interface Orbital
          * `roles` 는 선언의 업무 역할이다. 신원은 router 가 로그인을 확인해 앱에 싣고, 레이어 밖으로는 내주지 않는다.
          */
         invite(input: { instance: string; email: string; roles: readonly string[] }): Promise<void>;
+        /** 운영의 사용자 목록. 막힌 사용자도 함께 온다. 운영이 아직 서지 않았으면 409 로 거절된다. */
+        list(instance: string): Promise<User[]>;
+        /** 업무 역할을 통째로 바꾼다. 다음 요청부터 신원에 실린다. 선언에 없는 역할이면 422 다. */
+        setRoles(input: { instance: string; user: string; roles: readonly string[] }): Promise<void>;
+        /** 사용자를 뺀다. 막고 그 사용자의 세션을 모두 거둔다. */
+        remove(input: { instance: string; user: string }): Promise<void>;
     };
 }
 
@@ -144,6 +164,18 @@ function toProduction(value: unknown): Production
             url: typeof service.url === "string" ? service.url : null,
         })),
         migrations: texts(record.migrations),
+    };
+}
+
+function toUser(value: Record<string, unknown>): User
+{
+    return {
+        id: text(value.id),
+        email: text(value.email),
+        name: typeof value.name === "string" ? value.name : null,
+        roles: texts(value.roles),
+        disabled: value.disabled === true,
+        lastSignedInAt: typeof value.last_signed_in_at === "number" ? value.last_signed_in_at : null,
     };
 }
 
@@ -254,6 +286,20 @@ export function createOrbital(options: OrbitalOptions): Orbital
             async invite({ instance, email, roles })
             {
                 await call("POST", at(instance, "/users"), { email, roles: [...roles] });
+            },
+            async list(instance)
+            {
+                const reply = await call("GET", at(instance, "/users"));
+                const users = isRecord(reply) && Array.isArray(reply.users) ? reply.users.filter(isRecord) : [];
+                return users.map(toUser);
+            },
+            async setRoles({ instance, user, roles })
+            {
+                await call("PUT", at(instance, `/users/${encodeURIComponent(user)}/roles`), { roles: [...roles] });
+            },
+            async remove({ instance, user })
+            {
+                await call("DELETE", at(instance, `/users/${encodeURIComponent(user)}`));
             },
         },
     };

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orbital_core::access::Access;
-use orbital_core::check::judge as judge_access;
+use orbital_core::check::{judge as judge_access, unguarded};
 use orbital_core::describe::changes;
 use orbital_core::manifest::{ServiceKind, ValidManifest};
 use orbital_core::name::{Ident, InstanceId};
@@ -214,6 +214,8 @@ pub struct PreviewReport {
     pub changes: Vec<String>,
     /// 승격을 막는 것.
     pub blockers: Vec<String>,
+    /// 실패는 아니지만 알아 둘 것. 로그인을 레이어에 맡겼는데 행 단위 규칙을 꺼서 역할 제한이 걸리지 않는 표.
+    pub notices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -269,6 +271,39 @@ pub struct Layer {
     token_key: Vec<u8>,
     service_keys: Vec<([u8; 32], String)>,
     inner: Mutex<Inner>,
+}
+
+/// 사용자 목록의 한 줄. 팩토리의 관리 화면이 세운다.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserReport {
+    pub id: String,
+    pub email: String,
+    pub name: Option<String>,
+    pub roles: Vec<String>,
+    pub disabled: bool,
+    /// 마지막으로 들어온 때(유닉스 초). 한 번도 들어오지 않았으면 `null` 이다.
+    pub last_signed_in_at: Option<u64>,
+}
+
+/// 업무 역할의 이름을 읽는다. 이름의 모양이 틀리면 고칠 것으로 돌려준다.
+fn role_names(roles: &[String]) -> Outcome<Vec<Ident>> {
+    roles
+        .iter()
+        .map(|role| {
+            Ident::parse(role)
+                .map_err(|error| Failure::Problems(vec![format!("업무 역할 `{role}`: {error}")]))
+        })
+        .collect()
+}
+
+/// 사용자 저장소의 거절을 HTTP 의 답으로 옮긴다. 없는 사용자는 없는 것으로, 선언에 없는 역할은 고칠 것으로.
+fn auth_failure(error: orbital_pg::auth::AuthError) -> Failure {
+    use orbital_pg::auth::AuthError;
+    match error {
+        AuthError::UndeclaredRoles { .. } => Failure::Problems(vec![error.to_string()]),
+        AuthError::NoSuchUser => Failure::NotFound,
+        other => internal(other),
+    }
 }
 
 /// 개발용 메일함의 파일. `ORBITAL_HOME` 아래에 둔다.
@@ -879,6 +914,14 @@ impl Layer {
             .iter()
             .map(blocker_text)
             .collect(),
+            notices: unguarded(&assembled.manifest, &assembled.access)
+                .iter()
+                .map(|table| {
+                    format!(
+                        "표 `{table}` 은 행 단위 규칙을 꺼서 역할 제한이 걸리지 않습니다. 권한 표대로 그 역할의 연결이면 신원 없이도 읽힙니다"
+                    )
+                })
+                .collect(),
         };
 
         let stored = inner
@@ -1182,6 +1225,11 @@ impl Layer {
                 inner.admin.resume(&names).map_err(internal)?;
                 let identity_key = token::unhex(&production.identity_key)
                     .ok_or_else(|| internal("서명의 열쇠를 읽지 못했습니다"))?;
+                // 검증 함수를 레이어의 지금 모양(v2 · granted)으로 맞춘다. 열쇠는 그대로다
+                inner
+                    .admin
+                    .install_identity(&names, &identity_key)
+                    .map_err(internal)?;
                 let mut generated = production.generated.clone();
                 for (name, value) in Self::secrets(&assembled)? {
                     generated.entry(name).or_insert(value);
@@ -1493,21 +1541,51 @@ impl Layer {
         email: &str,
         roles: &[String],
     ) -> Outcome<()> {
-        let mut parsed = Vec::new();
-        for role in roles {
-            parsed.push(Ident::parse(role).map_err(|error| {
-                Failure::Problems(vec![format!("업무 역할 `{role}`: {error}")])
-            })?);
-        }
         let mut store = self.production_auth(organization, instance)?;
-        store
-            .invite(email, &parsed, now())
-            .map_err(|error| match error {
-                orbital_pg::auth::AuthError::UndeclaredRoles { .. } => {
-                    Failure::Problems(vec![error.to_string()])
-                }
-                other => internal(other),
+        let roles = role_names(roles)?;
+        store.invite(email, &roles, now()).map_err(auth_failure)
+    }
+
+    /// 운영의 사용자 목록. 막힌 사용자도 함께 돌려준다. 토큰이나 세션은 싣지 않는다.
+    pub fn users(&self, organization: &str, instance: &InstanceId) -> Outcome<Vec<UserReport>> {
+        let mut store = self.production_auth(organization, instance)?;
+        Ok(store
+            .users()
+            .map_err(auth_failure)?
+            .into_iter()
+            .map(|user| UserReport {
+                id: user.id,
+                email: user.email,
+                name: user.name,
+                roles: user.roles,
+                disabled: user.disabled,
+                last_signed_in_at: user.last_signed_in_at,
             })
+            .collect())
+    }
+
+    /// 운영의 사용자 한 사람의 업무 역할을 통째로 바꾼다. 다음 요청부터 신원에 실린다.
+    pub fn set_roles(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        user: &str,
+        roles: &[String],
+    ) -> Outcome<()> {
+        let mut store = self.production_auth(organization, instance)?;
+        let roles = role_names(roles)?;
+        store.set_roles(user, &roles).map_err(auth_failure)
+    }
+
+    /// 운영의 사용자를 뺀다. 막고 그 사용자의 세션을 모두 거둔다.
+    pub fn remove_user(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        user: &str,
+    ) -> Outcome<()> {
+        let mut store = self.production_auth(organization, instance)?;
+        store.remove(user, now()).map_err(auth_failure)
     }
 
     /// 인스턴스를 걷는다. 떠 있는 것을 내리고 DB 와 코드 저장소를 지운다. 되돌릴 수 없다.

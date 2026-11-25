@@ -200,6 +200,7 @@ impl Remote {
             ("권한 검사에서 어긋난 것", "findings"),
             ("운영과 견준 권한의 변화(승인 카드에 섭니다)", "changes"),
             ("승격을 막는 것", "blockers"),
+            ("알아 둘 것", "notices"),
         ] {
             let found = lines(key);
             if !found.is_empty() {

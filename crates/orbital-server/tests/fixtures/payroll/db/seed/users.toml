@@ -1,0 +1,16 @@
+# 미리보기에만 들어가는 씨앗 사용자다
+
+[[user]]
+id = "e1"
+email = "e1@example.test"
+roles = ["employee"]
+
+[[user]]
+id = "e2"
+email = "e2@example.test"
+roles = ["employee"]
+
+[[user]]
+id = "a1"
+email = "a1@example.test"
+roles = ["payroll_admin"]

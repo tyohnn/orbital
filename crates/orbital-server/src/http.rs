@@ -137,6 +137,11 @@ struct NewIdentity {
 }
 
 #[derive(Deserialize)]
+struct NewRoles {
+    roles: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct NewUser {
     email: String,
     #[serde(default)]
@@ -273,10 +278,22 @@ fn with_service_key(
                 ("GET", ["production"]) => {
                     Ok(ok(json!(layer.production(&organization, &instance)?)))
                 }
+                ("GET", ["users"]) => Ok(ok(
+                    json!({ "users": layer.users(&organization, &instance)? }),
+                )),
                 ("POST", ["users"]) => {
                     let request: NewUser = parse(body)?;
                     layer.invite(&organization, &instance, &request.email, &request.roles)?;
                     Ok(ok(json!({ "invited": true })))
+                }
+                ("PUT", ["users", user, "roles"]) => {
+                    let request: NewRoles = parse(body)?;
+                    layer.set_roles(&organization, &instance, user, &request.roles)?;
+                    Ok(ok(json!({ "roles": request.roles })))
+                }
+                ("DELETE", ["users", user]) => {
+                    layer.remove_user(&organization, &instance, user)?;
+                    Ok(ok(json!({ "removed": true })))
                 }
                 ("DELETE", []) => {
                     layer.destroy_instance(&organization, &instance)?;

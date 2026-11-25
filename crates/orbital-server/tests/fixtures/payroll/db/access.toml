@@ -1,0 +1,8 @@
+[payroll.calendar]
+rls = "off: 모든 직원이 보는 지급일"
+employee = "read"
+payroll_admin = "read write"
+
+[payroll.payslip]
+employee = "read own"
+payroll_admin = "read write"
