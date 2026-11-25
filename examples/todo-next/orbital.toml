@@ -1,0 +1,14 @@
+# Next.js 풀스택 스캐폴드의 예다. 서버 서비스 하나만 적는다
+
+[[service]]
+name = "web"
+kind = "server"
+build = "npm run build"
+start = "npm run start"
+path = "/"
+roles = ["member"]
+
+[database]
+schemas = ["todo"]
+migrations = "db/migrations"
+roles = ["member"]

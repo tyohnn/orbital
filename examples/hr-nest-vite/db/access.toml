@@ -1,0 +1,18 @@
+# db/access.toml: 표마다 업무 역할마다 할 수 있는 것. 승격 전에 실제 DB 의 권한과 맞춰 본다
+# 받는 말은 다섯이다: none · read · read own · read write · read write own
+
+[hr.person]
+employee = "read own"
+manager = "read"
+payroll_admin = "read write"
+
+[hr.department]
+rls = "off: 모든 직원이 보는 부서 목록"
+employee = "read"
+manager = "read"
+payroll_admin = "read write"
+
+[payroll.payslip]
+employee = "read own"
+manager = "none"
+payroll_admin = "read write"

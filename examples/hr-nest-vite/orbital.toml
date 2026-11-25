@@ -1,0 +1,32 @@
+# orbital.toml: 필요한 것의 이름을 적는다. 값은 적지 않는다
+# NestJS API 와 Vite 화면을 한 저장소에 둔 스캐폴드의 예다
+
+[[service]]
+name = "api"
+kind = "server"                   # 요청을 받는 서버. 쉬면 재운다
+build = "npm run build -w api"
+start = "npm run start -w api"
+path = "/api"                     # 이 경로로 온 요청을 받는다
+roles = ["employee", "manager", "payroll_admin"]   # 이 서비스가 쓸 수 있는 업무 역할
+
+[[service]]
+name = "web"
+kind = "static"                   # 빌드한 파일을 router 가 바로 내준다. 서버가 없다
+build = "npm run build -w web"
+output = "web/dist"
+path = "/"
+
+[[schedule]]                      # 서버가 자는 동안에도 레이어가 이 시각에 깨워 부른다
+service = "api"
+cron = "0 9 25 * *"
+path = "/api/jobs/payroll"
+
+[database]
+schemas = ["hr", "payroll"]
+migrations = "db/migrations"
+roles = ["employee", "manager", "payroll_admin"]
+seed = "db/seed"
+
+[secrets]
+generated = ["SESSION_KEY"]     # 레이어가 만든다. 아무도 보지 못한다
+external = ["BANK_API_KEY"]     # 사람이 입력 화면에서 한 번 넣는다. 에이전트는 이름만 본다
