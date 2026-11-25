@@ -1,10 +1,11 @@
-# Next.js 풀스택 스캐폴드의 예다. 서버 서비스 하나만 적는다
+# Next.js(App Router) 풀스택 스캐폴드의 예다. 서버 서비스 하나만 적는다.
+# 빌드는 레이어가 그 commit 에서 직접 돌린다. 의존성은 package-lock.json 대로 받는다(npm ci)
 
 [[service]]
 name = "web"
 kind = "server"
-build = "npm run build"
-start = "npm run start"
+build = "npm ci && npm run build"
+start = "npm run start"           # next start 가 PORT 를 읽고 127.0.0.1 에서 듣는다
 path = "/"
 roles = ["member"]
 
@@ -12,3 +13,10 @@ roles = ["member"]
 schemas = ["todo"]
 migrations = "db/migrations"
 roles = ["member"]
+seed = "db/seed"
+
+# 로그인은 레이어가 맡는다. 서비스는 로그인 없이도 열리고(auth 의 기본은 optional), 앱이 신원이 없으면 /login 으로 보낸다.
+# auth = "required" 로 두면 로그인 화면의 스크립트(/_next/static/…)까지 막혀 화면이 뜨지 않는다
+[auth]
+methods = ["email_link"]
+login_path = "/login"

@@ -4,7 +4,7 @@
 [[service]]
 name = "api"
 kind = "server"                   # 요청을 받는 서버. 쉬면 재운다
-build = "npm run build -w api"
+build = "npm ci && npm run build -w api"   # 서비스는 적은 차례로 같은 폴더에서 빌드된다. 의존성은 여기서 한 번 받는다
 start = "npm run start -w api"
 path = "/api"                     # 이 경로로 온 요청을 받는다
 roles = ["employee", "manager", "payroll_admin"]   # 이 서비스가 쓸 수 있는 업무 역할
@@ -12,11 +12,11 @@ roles = ["employee", "manager", "payroll_admin"]   # 이 서비스가 쓸 수 �
 [[service]]
 name = "web"
 kind = "static"                   # 빌드한 파일을 router 가 바로 내준다. 서버가 없다
-build = "npm run build -w web"
+build = "npm run build -w web"    # api 의 빌드가 받아 둔 node_modules 를 쓴다
 output = "web/dist"
 path = "/"
 
-[[schedule]]                      # 서버가 자는 동안에도 레이어가 이 시각에 깨워 부른다
+[[schedule]]                      # 이 시각에 깨워 부르라는 선언이다. 지금의 레이어는 검사만 하고 부르지 않는다
 service = "api"
 cron = "0 9 25 * *"
 path = "/api/jobs/payroll"
@@ -30,3 +30,9 @@ seed = "db/seed"
 [secrets]
 generated = ["SESSION_KEY"]     # 레이어가 만든다. 아무도 보지 못한다
 external = ["BANK_API_KEY"]     # 사람이 입력 화면에서 한 번 넣는다. 에이전트는 이름만 본다
+
+# 로그인은 레이어가 맡는다. 화면은 정적 서비스 하나라 첫 화면(/)이 로그인 칸을 함께 그린다.
+# 정적 서비스는 없는 경로를 index.html 로 되돌리지 않아서 /login 같은 화면 경로를 따로 두지 못한다
+[auth]
+methods = ["email_link"]
+login_path = "/"

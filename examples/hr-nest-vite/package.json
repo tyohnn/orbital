@@ -1,0 +1,10 @@
+{
+    "name": "hr-nest-vite",
+    "version": "0.0.0",
+    "private": true,
+    "description": "NestJS API 와 Vite 화면을 한 저장소에 둔 인사 앱. Orbital 의 본보기다",
+    "workspaces": [
+        "api",
+        "web"
+    ]
+}

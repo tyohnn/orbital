@@ -20,6 +20,16 @@ test("스캐폴드에 실린 orbital-app.js 는 SDK 의 app.ts 에서 타입만 
     );
 });
 
+test("실제 프레임워크의 본보기에 실린 orbital-app.js 도 SDK 의 app.ts 에서 타입만 걷은 것과 같다", () =>
+{
+    // 앱용 SDK 는 npm 에 없어 본보기마다 넣어 둔다. SDK 를 고치면 함께 고친다
+    const expected = stripTypeScriptTypes(readFileSync(join(root, "sdk/typescript/src/app.ts"), "utf8"));
+    for (const copy of ["examples/todo-next/lib/orbital-app.js", "examples/hr-nest-vite/web/src/orbital-app.js"])
+    {
+        assert.equal(readFileSync(join(root, copy), "utf8"), expected, `${copy} 를 새로 써 주세요`);
+    }
+});
+
 test("로그인 화면은 이메일 주소만 받고 링크를 보내는 일은 레이어에 맡긴다", () =>
 {
     const page = read("pages/login.html");

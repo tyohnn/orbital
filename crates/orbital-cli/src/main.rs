@@ -230,8 +230,24 @@ mod tests {
         list.iter().map(|arg| (*arg).to_owned()).collect()
     }
 
-    /// 본보기를 고쳐 쓴 임시 폴더.
-    fn altered(name: &str, edit: impl Fn(&str, &str) -> (String, String)) -> PathBuf {
+    /// 본보기를 고쳐 쓴 임시 폴더. 테스트가 끝나면(사라지면) 걷는다.
+    struct Altered(PathBuf);
+
+    impl std::ops::Deref for Altered {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Altered {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn altered(name: &str, edit: impl Fn(&str, &str) -> (String, String)) -> Altered {
         let source = PathBuf::from(example("hr-nest-vite"));
         let folder =
             std::env::temp_dir().join(format!("orbital-cli-{}-{name}", std::process::id()));
@@ -241,7 +257,18 @@ mod tests {
         let (manifest, access) = edit(&manifest, &access);
         fs::write(folder.join("orbital.toml"), manifest).unwrap();
         fs::write(folder.join("db/access.toml"), access).unwrap();
-        folder
+        Altered(folder)
+    }
+
+    #[test]
+    fn 본보기를_고쳐_쓴_임시_폴더는_테스트가_끝나면_걷는다() {
+        let folder = altered("cleanup", |manifest, access| {
+            (manifest.to_owned(), access.to_owned())
+        });
+        let path = folder.to_path_buf();
+        assert!(path.join("orbital.toml").is_file());
+        drop(folder);
+        assert!(!path.exists());
     }
 
     #[test]
@@ -281,7 +308,7 @@ mod tests {
         let folder = altered("bad-access", |manifest, access| {
             (
                 manifest.to_owned(),
-                access.replace("manager = \"none\"\n", ""),
+                access.replace("manager = \"read own\"", "# 팀장의 줄을 뺐다"),
             )
         });
         let outcome = run(&args(&["check", folder.to_str().unwrap()]));
@@ -340,7 +367,7 @@ mod tests {
         let folder = altered("diff", |manifest, access| {
             (
                 manifest.to_owned(),
-                access.replace("manager = \"none\"", "manager = \"read\""),
+                access.replace("manager = \"read own\"", "manager = \"read\""),
             )
         });
         let before = format!("{}/db/access.toml", example("hr-nest-vite"));
@@ -349,7 +376,7 @@ mod tests {
         assert!(
             outcome
                 .text
-                .contains("`manager` 역할이 `payroll.payslip` 표를 읽을 수 있게 됩니다"),
+                .contains("`manager` 역할이 `payroll.payslip` 표를 자기 행만 읽다가 모든 행을 읽을 수 있게 됩니다"),
             "{}",
             outcome.text
         );

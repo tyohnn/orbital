@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ko">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>급여 명세</title>
+</head>
+<body>
+    <main>
+        <h1>급여 명세</h1>
+        <form id="login" hidden>
+            <label for="email">이메일</label>
+            <input id="email" name="email" type="email" autocomplete="email" required>
+            <button type="submit">로그인 링크 받기</button>
+        </form>
+        <p id="sent" hidden>메일함을 확인해 주세요. 받은 링크를 이 브라우저에서 열면 들어와요.</p>
+        <section id="payslips" hidden>
+            <p id="who"></p>
+            <table>
+                <thead><tr><th>직원</th><th>달</th><th>금액</th></tr></thead>
+                <tbody></tbody>
+            </table>
+            <button id="logout" type="button">나가기</button>
+        </section>
+        <p id="failed" role="alert" hidden>불러오지 못했어요. 잠시 뒤에 다시 해 주세요.</p>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+</body>
+</html>
