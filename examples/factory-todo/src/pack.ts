@@ -3,7 +3,7 @@
 //   node examples/factory-todo/src/pack.ts <나갈 ZIP> [MCP 서버의 주소]
 //
 // 묶는 것은 `package/` 폴더 그대로다: `plugin.json`(Agent Plugins 형식, 하모니가 읽는다), `.claude-plugin/plugin.json`(클로드가 읽는다),
-// `.mcp.json`(MCP 서버 하나), `skills/orbital-dev/SKILL.md`(스킬 하나). 훅은 없다.
+// `.mcp.json`(MCP 서버 하나), `skills/orbital-dev/`(스킬 하나와 그 참고 문서). 훅은 없다.
 // 주소를 주면 `.mcp.json` 의 서버 주소를 그것으로 바꿔 싣는다(배포한 팩토리의 https 주소).
 //
 // ⚠ 압축하지 않고 담는다(stored). 글 파일 몇 개라 크기가 문제 되지 않고, 의존성 없이 짓는다. 시각은 고정해 같은 폴더면 같은 ZIP 이 된다.

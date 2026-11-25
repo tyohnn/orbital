@@ -2,8 +2,10 @@
 //
 // DB 에는 비밀번호 없이 붙는다. 사용자 자리에 업무 역할의 이름(member)을 적고, 주소는 레이어가 환경 변수로 건넨다.
 // 실제 앱은 평범한 Postgres 드라이버를 쓰면 된다. 여기서는 설치 없이 뜨게 하려고 통신 규격의 필요한 부분만 손으로 적었다.
+const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
+const path = require("node:path");
 
 function message(type, body) {
     const head = Buffer.alloc(type ? 5 : 4);
@@ -89,10 +91,16 @@ http.createServer(async (request, response) => {
     };
     try {
         if (request.url === "/health") return send(200, { ok: true, version: 1 });
-        // 로그인 화면. 화면만 그리고, 링크를 보내고 받는 일은 레이어(/_orbital/auth/…)가 한다
-        if (request.url.split("?")[0] === "/login") {
-            response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-            return response.end("<!doctype html><title>로그인</title><form id=login><input name=email type=email><button>링크 받기</button></form>");
+        // 로그인 · 동의 화면. 화면만 그리고, 링크와 인가는 레이어(/_orbital/…)가 맡는다. 화면은 vendor/orbital-app.js(SDK)로 레이어를 부른다
+        const files = {
+            "/login": ["pages/login.html", "text/html; charset=utf-8"],
+            "/oauth/consent": ["pages/consent.html", "text/html; charset=utf-8"],
+            "/vendor/orbital-app.js": ["vendor/orbital-app.js", "text/javascript; charset=utf-8"],
+        };
+        const file = files[request.url.split("?")[0]];
+        if (file) {
+            response.writeHead(200, { "content-type": file[1] });
+            return response.end(fs.readFileSync(path.join(__dirname, file[0])));
         }
         if (request.url === "/cards" && request.method === "GET") {
             const sets = await query("member", withIdentity(request, "SELECT to_jsonb(c) - 'owner' FROM todo.card c ORDER BY id"));
