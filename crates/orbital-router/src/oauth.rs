@@ -23,8 +23,8 @@ use orbital_pg::oauth::IssuedTokens;
 use serde_json::{Value, json};
 
 use super::{
-    BODY_LIMIT, Body, Pool, Signed, State, StoreError, Unavailable, error, json_reply, now,
-    redirect, same_origin,
+    AppServer, BODY_LIMIT, Body, Pool, Signed, State, StoreError, Unavailable, error, json_reply,
+    now, redirect, same_origin,
 };
 
 /// `application/x-www-form-urlencoded` 를 푼다(`+` 는 공백).
@@ -178,7 +178,7 @@ impl State {
     pub(super) async fn mcp_request(
         &self,
         mut request: Request<Incoming>,
-        port: u16,
+        server: &Arc<AppServer>,
     ) -> Response<Body> {
         let (Some(pool), Some(mcp)) = (self.pool.clone(), mcp(&self.config.manifest)) else {
             return error(StatusCode::NOT_FOUND, "not_found");
@@ -212,7 +212,7 @@ impl State {
                     session: None,
                     client: Some(bearer.client_id),
                 };
-                self.forward(request, port, Some(&signed)).await
+                self.forward(request, server, Some(&signed)).await
             }
             Ok(None) | Err(StoreError::Refused(_)) => self.bearer_challenge(true),
             Err(StoreError::Unavailable) => error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),

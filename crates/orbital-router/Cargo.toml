@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 orbital-core = { path = "../orbital-core" }
 orbital-pg = { path = "../orbital-pg" }
+orbital-run = { path = "../orbital-run" }
 bytes.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
