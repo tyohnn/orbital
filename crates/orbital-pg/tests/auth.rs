@@ -437,7 +437,7 @@ fn 같은_링크를_동시에_두_번_열어도_세션은_하나만_생긴다() 
     // 한 번은 우연히 차례로 돌 수 있으니 여러 번 겨룬다
     for round in 0..5u64 {
         let link = store
-            .request_link("kim@example.com", "/", &browser, NOW + round)
+            .request_link("kim@example.com", "/", &browser, NOW + round * 60)
             .unwrap()
             .unwrap();
         let link = Arc::new(link);
@@ -449,7 +449,7 @@ fn 같은_링크를_동시에_두_번_열어도_세션은_하나만_생긴다() 
                 let browser = secret(9);
                 std::thread::spawn(move || {
                     gate.wait();
-                    racer.enter(&link, &browser, NOW + round + 1)
+                    racer.enter(&link, &browser, NOW + round * 60 + 1)
                 })
             })
             .collect();
@@ -560,11 +560,11 @@ fn 초대받은_사용자가_처음_들어오면_초대의_업무_역할을_갖�
 
     // 두 번째로 들어올 때는 사용자를 새로 만들지 않는다
     let again = store
-        .request_link("kim@example.com", "/", &browser, NOW + 10)
+        .request_link("kim@example.com", "/", &browser, NOW + 60)
         .unwrap()
         .unwrap();
     assert_eq!(
-        store.enter(&again, &browser, NOW + 11).unwrap().user.id,
+        store.enter(&again, &browser, NOW + 61).unwrap().user.id,
         entered.user.id
     );
     assert_eq!(bench.count("users"), 1);
@@ -575,7 +575,7 @@ fn 초대받은_사용자가_처음_들어오면_초대의_업무_역할을_갖�
         .unwrap();
     assert_eq!(
         store
-            .session(&entered.session, NOW + 12)
+            .session(&entered.session, NOW + 62)
             .unwrap()
             .unwrap()
             .roles,
@@ -594,21 +594,21 @@ fn 사용자를_빼면_그_사용자의_세션이_모두_없는_것이_된다() 
     let (kim, first) = sign_in(&mut store, "kim@example.com", &["member"]);
     let browser = secret(9);
     let link = store
-        .request_link("kim@example.com", "/", &browser, NOW + 5)
+        .request_link("kim@example.com", "/", &browser, NOW + 60)
         .unwrap()
         .unwrap();
-    let second = store.enter(&link, &browser, NOW + 6).unwrap().session;
+    let second = store.enter(&link, &browser, NOW + 61).unwrap().session;
     let (_, lee) = sign_in(&mut store, "lee@example.com", &["member"]);
 
-    store.remove(&kim, NOW + 10).unwrap();
-    assert!(store.session(&first, NOW + 11).unwrap().is_none());
-    assert!(store.session(&second, NOW + 11).unwrap().is_none());
+    store.remove(&kim, NOW + 70).unwrap();
+    assert!(store.session(&first, NOW + 71).unwrap().is_none());
+    assert!(store.session(&second, NOW + 71).unwrap().is_none());
     // 다른 사용자의 세션은 그대로다
-    assert!(store.session(&lee, NOW + 11).unwrap().is_some());
+    assert!(store.session(&lee, NOW + 71).unwrap().is_some());
     // 막힌 사용자에게는 링크가 만들어지지 않는다
     assert!(
         store
-            .request_link("kim@example.com", "/", &browser, NOW + 12)
+            .request_link("kim@example.com", "/", &browser, NOW + 200)
             .unwrap()
             .is_none()
     );
@@ -618,9 +618,9 @@ fn 사용자를_빼면_그_사용자의_세션이_모두_없는_것이_된다() 
 
     // 세션 하나를 거두면 그것만 없는 것이 된다
     let (_, park) = sign_in(&mut store, "park@example.com", &["member"]);
-    store.revoke(&lee, NOW + 13).unwrap();
-    assert!(store.session(&lee, NOW + 14).unwrap().is_none());
-    assert!(store.session(&park, NOW + 14).unwrap().is_some());
+    store.revoke(&lee, NOW + 210).unwrap();
+    assert!(store.session(&lee, NOW + 211).unwrap().is_none());
+    assert!(store.session(&park, NOW + 211).unwrap().is_some());
 }
 
 #[test]
@@ -786,5 +786,99 @@ fn auth_를_선언하지_않은_인스턴스에는_orbital_auth_도_인증_역�
     assert!(matches!(
         bench.admin.auth_store(&bench.names, &bench.manifest),
         Err(AuthError::NotDeclared)
+    ));
+}
+
+// ---- 횟수 제한 · 세션을 본 시각 · 미리보기의 씨앗 사용자 ----
+
+#[test]
+fn 같은_이메일로_1분_안에_다시_요청하면_링크가_만들어지지_않는다() {
+    let bench = bench!();
+    let mut store = bench.store();
+    store
+        .invite("kim@example.com", &[ident("member")], NOW)
+        .unwrap();
+    let browser = secret(9);
+    let first = store.request_link("kim@example.com", "/", &browser, NOW);
+    assert!(first.unwrap().is_some());
+    // 대소문자가 달라도 같은 이메일이다
+    for (email, at) in [("kim@example.com", NOW + 59), ("KIM@example.com", NOW + 30)] {
+        assert!(
+            store
+                .request_link(email, "/", &browser, at)
+                .unwrap()
+                .is_none(),
+            "{email} {at}"
+        );
+    }
+    assert_eq!(bench.count("email_link"), 1);
+    assert!(
+        store
+            .request_link("kim@example.com", "/", &browser, NOW + 60)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(bench.count("email_link"), 2);
+}
+
+#[test]
+fn 세션을_본_시각은_마지막으로_적은_지_1분이_지났을_때만_적는다() {
+    let bench = bench!();
+    let mut store = bench.store();
+    let (_, session) = sign_in(&mut store, "kim@example.com", &["member"]);
+    let seen = |bench: &Bench| -> i64 {
+        bench
+            .superuser()
+            .query_one(
+                "SELECT extract(epoch FROM last_seen_at)::bigint FROM orbital_auth.session",
+                &[],
+            )
+            .unwrap()
+            .get(0)
+    };
+    let made = i64::try_from(NOW + 1).unwrap();
+    assert_eq!(seen(&bench), made);
+    store.session(&session, NOW + 30).unwrap().unwrap();
+    store.session(&session, NOW + 60).unwrap().unwrap();
+    assert_eq!(seen(&bench), made);
+    store.session(&session, NOW + 61).unwrap().unwrap();
+    assert_eq!(seen(&bench), made + 60);
+}
+
+#[test]
+fn 씨앗_사용자는_u_모양이_아닌_식별자로_들어가고_그_database_에서만_규칙이_넓어진다() {
+    let mut bench = bench!();
+    let users = toml::from_str::<orbital_core::auth::SeedUsers>(
+        "[[user]]\nid = \"u1\"\nemail = \"u1@example.test\"\nroles = [\"member\"]\n",
+    )
+    .unwrap()
+    .check(&bench.manifest)
+    .unwrap();
+    // 넓히기 전에는 u_ 모양이 아닌 식별자가 들어가지 않는다
+    let strict = bench.superuser().execute(
+        "INSERT INTO orbital_auth.users (id, email, created_at) VALUES ('u9', 'u9@example.test', now())",
+        &[],
+    );
+    assert_eq!(strict.unwrap_err().code(), Some(&SqlState::CHECK_VIOLATION));
+    bench.admin.seed_users(&bench.names, &users, NOW).unwrap();
+    let mut store = bench.store();
+    let (session, user) = store.start_session("u1", NOW).unwrap();
+    assert_eq!(user.roles, vec!["member".to_owned()]);
+    assert_eq!(store.session(&session, NOW + 1).unwrap().unwrap().id, "u1");
+    // 넓어져도 따옴표나 대문자가 든 식별자는 들어가지 않는다
+    let odd = bench.superuser().execute(
+        "INSERT INTO orbital_auth.users (id, email, created_at) VALUES ('U\"1', 'x@example.test', now())",
+        &[],
+    );
+    assert_eq!(odd.unwrap_err().code(), Some(&SqlState::CHECK_VIOLATION));
+    assert!(matches!(
+        store.start_session("nobody", NOW),
+        Err(AuthError::NoSuchUser)
+    ));
+    // 막힌 사용자는 세션을 만들지 못한다
+    store.remove("u1", NOW + 2).unwrap();
+    assert!(matches!(
+        store.start_session("u1", NOW + 3),
+        Err(AuthError::UserDisabled)
     ));
 }

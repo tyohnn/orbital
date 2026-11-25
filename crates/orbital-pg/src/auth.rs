@@ -9,9 +9,9 @@
 use std::fmt;
 
 use orbital_core::auth::{
-    InvitationRefusal, InvitationState, LinkRefusal, LinkState, SessionState,
-    invitation_expires_at, judge_invitation, judge_link, judge_session, link_expires_at, safe_next,
-    session_expires_at, undeclared_roles,
+    InvitationRefusal, InvitationState, LinkRefusal, LinkState, SeedUser, SessionState,
+    invitation_expires_at, judge_invitation, judge_link, judge_session, link_expires_at,
+    may_create_link, needs_touch, safe_next, session_expires_at, undeclared_roles,
 };
 use orbital_core::manifest::{Signup, ValidManifest};
 use orbital_core::name::Ident;
@@ -204,7 +204,7 @@ CREATE SCHEMA IF NOT EXISTS orbital_auth;
 REVOKE ALL ON SCHEMA orbital_auth FROM PUBLIC;
 
 CREATE TABLE IF NOT EXISTS orbital_auth.users (
-    id text PRIMARY KEY CHECK (id ~ '^u_[a-z0-9]{20}$'),
+    id text PRIMARY KEY CONSTRAINT users_id_shape CHECK (id ~ '^u_[a-z0-9]{20}$'),
     email orbital.citext NOT NULL UNIQUE,
     name text,
     created_at timestamptz NOT NULL,
@@ -340,6 +340,50 @@ impl Admin {
             .map_err(pg("로그인의 표를 두기를 마무리"))
     }
 
+    /// 미리보기의 DB 에 씨앗 사용자를 넣는다. **운영에는 부르지 않는다.** 마이그레이션 뒤, 씨앗 데이터의 SQL 앞에 부른다.
+    ///
+    /// 씨앗 사용자의 식별자(`u1` 같은)는 `u_` 모양이 아니다. 그래서 씨앗 사용자가 있을 때만 이 database 의 식별자 규칙을
+    /// 「`u_` 모양이거나 선언의 이름 모양(`Ident`)」으로 넓힌다. 운영 DB 의 규칙은 넓어지지 않는다.
+    pub fn seed_users(&mut self, names: &Names, users: &[SeedUser], now: u64) -> Result<(), Error> {
+        if users.is_empty() {
+            return Ok(());
+        }
+        let mut client = self.database(&names.database())?;
+        let mut transaction = client
+            .transaction()
+            .map_err(pg("씨앗 사용자를 넣기 시작"))?;
+        transaction
+            .batch_execute(
+                "ALTER TABLE orbital_auth.users DROP CONSTRAINT users_id_shape, \
+                 ADD CONSTRAINT users_id_shape CHECK (id ~ '^u_[a-z0-9]{20}$' OR id ~ '^[a-z][a-z0-9_]{0,23}$')",
+            )
+            .map_err(pg("씨앗 사용자의 식별자 규칙을 넓히"))?;
+        for user in users {
+            let roles: Vec<&str> = user.roles.iter().map(Ident::as_str).collect();
+            transaction
+                .execute(
+                    "INSERT INTO orbital_auth.users (id, email, name, created_at) VALUES ($1, $2, $3, to_timestamp($4::bigint))",
+                    &[&user.id.as_str(), &user.email, &user.name, &seconds(now)],
+                )
+                .map_err(pg("씨앗 사용자를 넣"))?;
+            transaction
+                .execute(
+                    "INSERT INTO orbital_auth.user_role (user_id, role) SELECT $1, unnest($2::text[])",
+                    &[&user.id.as_str(), &roles],
+                )
+                .map_err(pg("씨앗 사용자의 역할을 넣"))?;
+            transaction
+                .execute(
+                    "INSERT INTO orbital_auth.login (provider, subject, user_id) VALUES ('email', lower($1), $2)",
+                    &[&user.email, &user.id.as_str()],
+                )
+                .map_err(pg("씨앗 사용자의 로그인 방법을 넣"))?;
+        }
+        transaction
+            .commit()
+            .map_err(pg("씨앗 사용자를 넣기를 마무리"))
+    }
+
     /// 인증 역할로 붙은 저장소. router 와 관리 서버가 이것으로 사용자와 세션을 다룬다.
     pub fn auth_store(
         &self,
@@ -349,15 +393,38 @@ impl Admin {
         if manifest.get().auth.is_none() {
             return Err(AuthError::NotDeclared);
         }
-        let mut client = self
+        let client = self
             .connect_as(&names.database(), &names.auth())
             .map_err(db("인증 역할로 붙"))?;
+        AuthStore::ready(client, manifest)
+    }
+}
+
+impl AuthStore {
+    /// DB 의 주소(`postgres://사용자@주소:포트/…`)에서 사용자와 database 만 이 인스턴스의 인증 역할로 바꿔 붙는다.
+    /// router 의 연결 풀이 연결을 열 때 쓴다. 비밀번호는 없다. 운영에서는 proxy 만 닿는 자리에서만 연결을 받는다.
+    pub fn connect(url: &str, names: &Names, manifest: &ValidManifest) -> Result<Self, AuthError> {
+        if manifest.get().auth.is_none() {
+            return Err(AuthError::NotDeclared);
+        }
+        let mut config: postgres::Config = url
+            .parse()
+            .map_err(|_| AuthError::Db(Error::Url("주소의 모양이 틀렸습니다".to_owned())))?;
+        let client = config
+            .user(&names.auth())
+            .dbname(&names.database())
+            .connect(postgres::NoTls)
+            .map_err(db("인증 역할로 붙"))?;
+        Self::ready(client, manifest)
+    }
+
+    fn ready(mut client: Client, manifest: &ValidManifest) -> Result<Self, AuthError> {
         // citext 의 비교 연산자는 스키마 orbital 에 있다. 찾는 길에 없으면 `=` 가 글자 비교로 떨어져 대소문자를 가린다.
         // orbital 은 레이어만 쓸 수 있는 스키마이고, pg_catalog 를 앞에 두어 기본 함수를 가리지 못하게 한다.
         client
             .batch_execute("SET search_path = pg_catalog, orbital")
             .map_err(db("인증 역할의 찾는 길을 정하"))?;
-        Ok(AuthStore {
+        Ok(Self {
             client,
             manifest: manifest.clone(),
         })
@@ -462,6 +529,23 @@ impl AuthStore {
         if !allowed {
             return Ok(None);
         }
+        // 같은 이메일의 요청이 동시에 와도 하나씩 따지도록 이메일마다 잠근다. 잠금은 트랜잭션이 끝나면 풀린다
+        transaction
+            .execute(
+                "SELECT pg_advisory_xact_lock(hashtext(lower($1::text)))",
+                &[&email],
+            )
+            .map_err(db("이메일을 잠그"))?;
+        let last: Option<i64> = transaction
+            .query_one(
+                "SELECT extract(epoch FROM max(created_at))::bigint FROM orbital_auth.email_link WHERE email = $1",
+                &[&email],
+            )
+            .map_err(db("마지막 링크를 찾"))?
+            .get(0);
+        if !may_create_link(unix(last), now) {
+            return Ok(None);
+        }
         let token = Secret::generate()?;
         transaction
             .execute(
@@ -564,19 +648,7 @@ impl AuthStore {
             }
         };
 
-        let session = Secret::generate()?;
-        transaction
-            .execute(
-                "INSERT INTO orbital_auth.session (token_hash, user_id, created_at, last_seen_at, expires_at) \
-                 VALUES ($1, $2, to_timestamp($3::bigint), to_timestamp($3::bigint), to_timestamp($4::bigint))",
-                &[
-                    &session.hash(),
-                    &id,
-                    &seconds(now),
-                    &seconds(session_expires_at(now)),
-                ],
-            )
-            .map_err(db("세션을 만들"))?;
+        let session = create_session(&mut transaction, &id, now)?;
         let user = session_user(&mut transaction, &id)?.ok_or(AuthError::NoSuchUser)?;
         transaction.commit().map_err(db("들어오기를 마무리"))?;
         Ok(Entered {
@@ -586,13 +658,44 @@ impl AuthStore {
         })
     }
 
+    /// 링크 없이 사용자의 세션을 만든다. **미리보기의 router 만 부른다**(씨앗 사용자로 들어가기). 운영의 router 에는 이 길이 없다.
+    pub fn start_session(
+        &mut self,
+        user_id: &str,
+        now: u64,
+    ) -> Result<(Secret, SessionUser), AuthError> {
+        let mut transaction = self
+            .client
+            .transaction()
+            .map_err(db("세션 만들기를 시작"))?;
+        let disabled = transaction
+            .query_opt(
+                "SELECT disabled_at IS NOT NULL FROM orbital_auth.users WHERE id = $1",
+                &[&user_id],
+            )
+            .map_err(db("사용자를 찾"))?
+            .ok_or(AuthError::NoSuchUser)?
+            .get::<_, bool>(0);
+        if disabled {
+            return Err(AuthError::UserDisabled);
+        }
+        let session = create_session(&mut transaction, user_id, now)?;
+        let user = session_user(&mut transaction, user_id)?.ok_or(AuthError::NoSuchUser)?;
+        transaction.commit().map_err(db("세션 만들기를 마무리"))?;
+        Ok((session, user))
+    }
+
     /// 세션의 사용자와 업무 역할. 없거나, 만료됐거나, 거뒀거나, 사용자가 막혀 있으면 `None` 이다.
+    ///
+    /// 요청마다 부르므로 세션 · 사용자 · 업무 역할을 한 문장으로 읽는다. 본 시각은 마지막으로 적은 지 1분이 지났을 때만 한 문장 더 적는다.
     pub fn session(&mut self, token: &Secret, now: u64) -> Result<Option<SessionUser>, AuthError> {
         let Some(row) = self
             .client
             .query_opt(
                 "SELECT s.user_id, extract(epoch FROM s.expires_at)::bigint, extract(epoch FROM s.revoked_at)::bigint, \
-                 extract(epoch FROM u.disabled_at)::bigint \
+                 extract(epoch FROM u.disabled_at)::bigint, extract(epoch FROM s.last_seen_at)::bigint, \
+                 u.email::text, u.name, \
+                 ARRAY(SELECT r.role FROM orbital_auth.user_role r WHERE r.user_id = u.id ORDER BY r.role) \
                  FROM orbital_auth.session s JOIN orbital_auth.users u ON u.id = s.user_id WHERE s.token_hash = $1",
                 &[&token.hash()],
             )
@@ -608,17 +711,20 @@ impl AuthStore {
         if judge_session(&state, now).is_err() {
             return Ok(None);
         }
-        let id: String = row.get(0);
-        let mut transaction = self.client.transaction().map_err(db("세션을 읽기 시작"))?;
-        transaction
-            .execute(
-                "UPDATE orbital_auth.session SET last_seen_at = to_timestamp($2::bigint) WHERE token_hash = $1",
-                &[&token.hash(), &seconds(now)],
-            )
-            .map_err(db("세션을 본 시각을 적"))?;
-        let user = session_user(&mut transaction, &id)?;
-        transaction.commit().map_err(db("세션을 읽기를 마무리"))?;
-        Ok(user)
+        if needs_touch(unix(Some(row.get(4))).unwrap_or(0), now) {
+            self.client
+                .execute(
+                    "UPDATE orbital_auth.session SET last_seen_at = to_timestamp($2::bigint) WHERE token_hash = $1",
+                    &[&token.hash(), &seconds(now)],
+                )
+                .map_err(db("세션을 본 시각을 적"))?;
+        }
+        Ok(Some(SessionUser {
+            id: row.get(0),
+            email: row.get(5),
+            name: row.get(6),
+            roles: row.get(7),
+        }))
     }
 
     /// 세션을 거둔다(로그아웃). 없는 세션이어도 실패하지 않는다.
@@ -767,6 +873,27 @@ fn create_user(
         )
         .map_err(db("로그인 방법을 적"))?;
     Ok(id)
+}
+
+fn create_session(
+    transaction: &mut Transaction<'_>,
+    user_id: &str,
+    now: u64,
+) -> Result<Secret, AuthError> {
+    let session = Secret::generate()?;
+    transaction
+        .execute(
+            "INSERT INTO orbital_auth.session (token_hash, user_id, created_at, last_seen_at, expires_at) \
+             VALUES ($1, $2, to_timestamp($3::bigint), to_timestamp($3::bigint), to_timestamp($4::bigint))",
+            &[
+                &session.hash(),
+                &user_id,
+                &seconds(now),
+                &seconds(session_expires_at(now)),
+            ],
+        )
+        .map_err(db("세션을 만들"))?;
+    Ok(session)
 }
 
 fn session_user(
