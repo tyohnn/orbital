@@ -46,15 +46,18 @@
 - ⚠ **값은 레이어 밖으로 나가지 않습니다.** 비밀번호 · 키 · 운영 데이터의 행은 API 응답, 로그, 오류 문구에 싣지 않습니다. 이름과 숫자만 나갑니다.
 - ⚠ **에이전트가 쓴 것은 관리 권한으로 돌리지 않습니다.** 마이그레이션은 마이그레이션 역할로 따로 접속해 돌리고, 빌드와 서버는 환경을 비운 실행기에서 돌립니다.
   관리 연결에서 역할만 바꿔 돌리면 `RESET ROLE` 한 줄로 관리 권한을 되찾습니다.
+- `sdk/typescript` 의 타입은 관리 서버가 주고받는 JSON 의 모양을 옮긴 것입니다. serde 모양이나 HTTP 의 길을 바꾸면 같은 PR 에서 함께 고칩니다.
 - ⚠ **SQL 에 들어가는 이름은 검증된 타입(`Ident`)에서만 옵니다.** 글자열을 이어 붙여 SQL 을 만들 때 선언에서 읽은 날것을 넣지 않습니다.
 
 ## 명령
 
 ```
+npm install
 cargo test --workspace                 # DB 없이 도는 테스트
 scripts/pg-local.sh                    # 로컬 PostgreSQL(가장 높은 버전)을 띄우고 ORBITAL_PG 를 찍는다
 ORBITAL_PG=… cargo test --workspace    # 실제 DB 에 역할을 세우는 테스트까지
-npm run pr:check                       # fmt · clippy · test · 층 검사 · 지시문 검사
+ORBITAL_PG=… npm run test:sdk          # SDK 와 CLI 를 실제 관리 서버에 붙여 한 바퀴
+npm run pr:check                       # fmt · clippy · test · 층 검사 · 지시문 검사 · SDK 타입 검사와 테스트
 ```
 
 `ORBITAL_PG` 가 없으면 DB 테스트는 건너뛰었다고 찍고 통과합니다. PR 전에는 반드시 DB 를 띄우고 돌립니다. CI 는 늘 DB 와 함께 돕니다.
@@ -68,14 +71,14 @@ npm run pr:check                       # fmt · clippy · test · 층 검사 · 
 
 ## 코드 스타일
 
-- Rust 는 `rustfmt` 기본값을 따릅니다. ❌ `unsafe`.
+- Rust 는 `rustfmt` 기본값을 따릅니다. ❌ `unsafe`. TypeScript 는 Allman brace, 4칸 들여쓰기, 세미콜론입니다. ❌ `any`.
 - 주석 · 문서 · 커밋 메시지 · 테스트 이름은 한국어입니다. 테스트 함수 이름은 한국어 문장을 밑줄로 잇습니다(`업무_역할은_다른_업무_역할로_바꿔_타지_못한다`).
 - 오류 문구는 합니다체로 쓰고, 무엇을 고치면 되는지를 함께 적습니다. 에이전트가 그 문구만 보고 고칩니다.
 
 ## 커밋
 
 한 커밋은 한 가지 책임만 바꾸고 각 커밋이 `pr:check` 를 통과합니다. 형식은 `<타입>(<스코프>): <한 줄>` 입니다.
-타입은 feat · fix · refactor · test · chore · docs, 스코프는 crate 이름에서 `orbital-` 을 뺀 것(`core` · `pg` · `proxy` · `source` · `run` · `server` · `cli`)이나 `repo` 입니다.
+타입은 feat · fix · refactor · test · chore · docs, 스코프는 crate 이름에서 `orbital-` 을 뺀 것(`core` · `pg` · `proxy` · `source` · `run` · `server` · `cli`)이나 `sdk` · `repo` 입니다.
 
 ## 찾아볼 자리
 
