@@ -16,6 +16,7 @@ use orbital_core::access::Access;
 use orbital_core::auth::query_value;
 use orbital_core::check::{judge as judge_access, unguarded};
 use orbital_core::describe::changes;
+use orbital_core::git::Service as GitService;
 use orbital_core::google::{IdTokenRefusal, callback_url, judge_id_token, judge_state};
 use orbital_core::host::{BaseDomain, HostTarget, Scheme, origin as host_origin};
 use orbital_core::manifest::{ServiceKind, ValidManifest};
@@ -376,6 +377,19 @@ pub struct PreviewReport {
     pub conformance: Option<ConformanceReport>,
 }
 
+/// 프리뷰의 로그. 서비스마다 빌드(`build-<서비스>`)와 서버(`preview-<서비스>`)의 끝이다.
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewLogs {
+    pub release: String,
+    pub logs: Vec<LogReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogReport {
+    pub name: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RehearsalReport {
     pub release: String,
@@ -473,6 +487,10 @@ pub struct Options {
     pub conformance_timeout: Duration,
     /// 백업과 복구 훈련(`ORBITAL_BACKUP_DIR`). 없으면 백업하지 않고, 인스턴스를 되살리는 길은 409 로 답한다.
     pub backup: Option<BackupOptions>,
+    /// 토큰을 내고 판정하는 시계. 테스트가 갈아 끼워 진행 중인 요청의 만료를 잰다.
+    pub token_clock: Clock,
+    /// 요청 본문의 상한(기본 64MiB). 묶음과 git 으로 올리는 것이 모두 이 안이어야 한다. 넘으면 413 으로 답하고 읽지 않는다.
+    pub upload_limit: usize,
 }
 
 /// 하위 도메인으로 인스턴스를 가르는 레이어의 설정.
@@ -508,6 +526,8 @@ impl Options {
             clock: Arc::new(now),
             conformance_timeout: Duration::from_secs(120),
             backup: None,
+            token_clock: Arc::new(now),
+            upload_limit: 64 * 1024 * 1024,
         }
     }
 }
@@ -521,6 +541,8 @@ pub struct Layer {
     /// 밖에서 넣는 비밀의 금고. 봉인한 글로만 파일에 있다.
     vault: Arc<Vault>,
     clock: Clock,
+    token_clock: Clock,
+    upload_limit: usize,
     /// 개발용 메일함. 명시해 켰을 때만 있다.
     outbox: Option<Arc<Outbox>>,
     public_url: String,
@@ -602,7 +624,7 @@ fn blocker_text(blocker: &orbital_core::release::Blocker) -> String {
             format!("권한 검사에서 어긋남이 {findings}개 나왔습니다")
         }
         Blocker::RehearsalNotRun => {
-            "마이그레이션의 리허설을 아직 돌리지 않았습니다. `orbital rehearse` 로 돌려 주세요"
+            "마이그레이션의 리허설을 아직 돌리지 않았습니다. 이 release 로 리허설을 돌려 주세요"
                 .to_owned()
         }
         Blocker::RehearsalFailed => "마이그레이션의 리허설이 실패했습니다".to_owned(),
@@ -630,7 +652,7 @@ pub fn conformance_text(outcome: Conformed) -> String {
 /// 밖에서 넣는 비밀의 운영 값이 없어 막힌 까닭. 에이전트가 고칠 수 없는 일임을 밝힌다.
 pub fn secret_text(secret: &SecretName) -> String {
     format!(
-        "비밀 `{secret}` 의 운영 값이 없습니다. 에이전트가 고칠 수 없는 일입니다. 에이전트는 값을 묻거나 코드에 적지 말고 사람에게 입력을 요청하고(`POST /v1/instances/{{id}}/secrets/{secret}/request`), 사람이 입력 카드에서 운영의 값을 넣어야 운영에 오릅니다",
+        "비밀 `{secret}` 의 운영 값이 없습니다. 에이전트가 고칠 수 없는 일입니다. 에이전트는 값을 묻거나 코드에 적지 말고 사람에게 이 이름의 입력을 요청하고, 사람이 입력 카드에서 운영의 값을 넣어야 운영에 오릅니다",
         secret = secret.as_str()
     )
 }
@@ -735,6 +757,8 @@ impl Layer {
             settings: Arc::new(settings),
             vault: Arc::new(vault),
             clock: options.clock,
+            token_clock: options.token_clock,
+            upload_limit: options.upload_limit,
             outbox: options
                 .dev_mailbox
                 .then(|| Arc::new(Outbox::new(options.home.join(OUTBOX)))),
@@ -914,7 +938,7 @@ impl Layer {
             organization,
             instance: instance.clone(),
             action,
-            at: now(),
+            at: (self.token_clock)(),
         };
         match judge(&token, &request) {
             Verdict::Allow => Ok(()),
@@ -1020,7 +1044,7 @@ impl Layer {
         const LONGEST: u64 = 12 * 60 * 60;
         let mut inner = self.lock();
         Self::owned(&mut inner, organization, instance)?;
-        let expires_at = now() + ttl_seconds.clamp(60, LONGEST);
+        let expires_at = (self.token_clock)() + ttl_seconds.clamp(60, LONGEST);
         let token = Token {
             organization: OrganizationId(organization.to_owned()),
             instance: instance.clone(),
@@ -1039,34 +1063,121 @@ impl Layer {
         self.sources.bundle(instance).map_err(internal)
     }
 
+    /// 묶음으로 올린 것을 받는다. git 으로 올린 것(`git_exchange`)과 같은 규칙으로 판정한다.
     pub fn push(&self, instance: &InstanceId, bundle: &[u8]) -> Outcome<Commit> {
         let mut inner = self.lock();
         let commit = self
             .sources
             .receive(instance, bundle)
             .map_err(|error| match error {
-                SourceError::BadBundle | SourceError::NotFastForward => {
+                SourceError::BadBundle | SourceError::NotFastForward | SourceError::Refused(_) => {
                     Failure::Problems(vec![error.to_string()])
                 }
                 other => internal(other),
             })?;
+        self.received(&mut inner, instance, &commit)?;
+        Ok(commit)
+    }
+
+    /// 올린 commit 을 받은 뒤의 일. 묶음과 git 의 두 길이 함께 부른다.
+    fn received(&self, inner: &mut Inner, instance: &InstanceId, commit: &Commit) -> Outcome<()> {
         // 에이전트가 업데이트를 합쳐(충돌을 풀어) 올렸으면 적용된 것이다
         self.track(
-            &mut inner,
+            inner,
             instance,
-            &commit,
+            commit,
             &[RolloutEvent::Applied {
                 instance: instance.clone(),
             }],
-        )?;
-        Ok(commit)
+        )
+    }
+
+    /// 요청 본문의 상한.
+    pub fn upload_limit(&self) -> usize {
+        self.upload_limit
+    }
+
+    /// git 의 광고. 받기는 `main` 과 열린 rollout 의 `update` 만 보이고, 올리기는 `main` 하나만 알린다.
+    pub fn git_advertise(&self, instance: &InstanceId, service: GitService) -> Outcome<Vec<u8>> {
+        self.sources
+            .advertise(instance, service)
+            .map_err(|error| match error {
+                SourceError::NoSuchInstance => Failure::NotFound,
+                other => internal(other),
+            })
+    }
+
+    /// git 과 객체를 주고받는다. 올리기는 묶음과 같은 자리를 지나고, 받으면 묶음으로 올린 것과 같은 뒤의 일을 한다.
+    /// `request` 는 이미 풀린(gzip 이 아닌) 본문이다.
+    pub fn git_exchange(
+        &self,
+        instance: &InstanceId,
+        service: GitService,
+        request: &[u8],
+    ) -> Outcome<Vec<u8>> {
+        let source_failure = |error: SourceError| match error {
+            SourceError::NoSuchInstance => Failure::NotFound,
+            SourceError::BadBundle => Failure::Problems(vec![error.to_string()]),
+            other => internal(other),
+        };
+        match service {
+            // 받기는 읽기만 한다. ref 는 한 번에 옮겨 가므로 잠그지 않는다
+            GitService::UploadPack => self
+                .sources
+                .upload_pack(instance, request)
+                .map_err(source_failure),
+            GitService::ReceivePack => {
+                let mut inner = self.lock();
+                let received = self
+                    .sources
+                    .receive_pack(instance, request)
+                    .map_err(source_failure)?;
+                if let Some(commit) = &received.commit {
+                    self.received(&mut inner, instance, commit)?;
+                }
+                Ok(received.report)
+            }
+        }
+    }
+
+    /// 떠 있는 프리뷰의 빌드와 서버의 로그(끝의 200줄씩). 프리뷰의 앱은 에이전트가 쓴 코드이고 씨앗 데이터만 갖는다.
+    pub fn preview_logs(&self, instance: &InstanceId) -> Outcome<PreviewLogs> {
+        let (release, manifest) = {
+            let inner = self.lock();
+            let live = inner
+                .live
+                .get(&(instance.as_str().to_owned(), Stage::Preview))
+                .ok_or_else(|| {
+                    Failure::Conflict(
+                        "떠 있는 프리뷰가 없습니다. 프리뷰를 먼저 세워 주세요".to_owned(),
+                    )
+                })?;
+            (live.release.clone(), live.manifest.clone())
+        };
+        let id = ReleaseId(release.clone());
+        let mut logs = Vec::new();
+        for service in &manifest.get().services {
+            let mut names = vec![format!("build-{}", service.name)];
+            if service.kind == ServiceKind::Server {
+                names.push(format!("preview-{}", service.name));
+            }
+            for name in names {
+                let text = fs::read_to_string(self.log(instance, &id, &name)).unwrap_or_default();
+                let lines: Vec<&str> = text.lines().collect();
+                logs.push(LogReport {
+                    name,
+                    text: lines[lines.len().saturating_sub(200)..].join("\n"),
+                });
+            }
+        }
+        Ok(PreviewLogs { release, logs })
     }
 
     fn assembled(&self, instance: &InstanceId, commit: &Commit) -> Outcome<Assembled> {
         assemble(&self.sources, instance, commit).map_err(|error| match error {
             AssembleError::Problems(problems) => Failure::Problems(problems),
             AssembleError::Source(SourceError::NoSuchCommit) => Failure::Problems(vec![
-                "그 commit 은 레이어에 올라와 있지 않습니다. `orbital push` 로 먼저 올려 주세요"
+                "그 commit 은 레이어에 올라와 있지 않습니다. `main` 에 commit 해 먼저 올려 주세요"
                     .to_owned(),
             ]),
             AssembleError::Source(other) => internal(other),
@@ -1685,8 +1796,7 @@ impl Layer {
                 .get(&(instance.as_str().to_owned(), Stage::Preview))
                 .ok_or_else(|| {
                     Failure::Conflict(
-                        "떠 있는 프리뷰가 없습니다. `orbital preview` 로 먼저 세워 주세요"
-                            .to_owned(),
+                        "떠 있는 프리뷰가 없습니다. 프리뷰를 먼저 세워 주세요".to_owned(),
                     )
                 })?;
             if live.manifest.get().auth.is_none() {
@@ -1732,7 +1842,7 @@ impl Layer {
             .ok_or(Failure::NotFound)?;
         let known = record.releases.get(release).ok_or_else(|| {
             Failure::Conflict(
-                "그 release 의 프리뷰가 없습니다. `orbital preview` 로 먼저 세워 주세요".to_owned(),
+                "그 release 의 프리뷰가 없습니다. 프리뷰를 먼저 세워 주세요".to_owned(),
             )
         })?;
         let commit = Commit::parse(&known.commit)
@@ -1812,7 +1922,7 @@ impl Layer {
             .ok_or(Failure::NotFound)?;
         let known = record.releases.get(release).ok_or_else(|| {
             Failure::Conflict(
-                "그 release 의 프리뷰가 없습니다. `orbital preview` 로 먼저 세워 주세요".to_owned(),
+                "그 release 의 프리뷰가 없습니다. 프리뷰를 먼저 세워 주세요".to_owned(),
             )
         })?;
         let commit = Commit::parse(&known.commit)

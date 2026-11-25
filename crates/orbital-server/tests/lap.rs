@@ -1022,7 +1022,7 @@ fn 올리지_않은_commit_과_모르는_release_로는_아무것도_서지_않�
         body["details"][0]
             .as_str()
             .unwrap()
-            .contains("orbital push")
+            .contains("먼저 올려 주세요")
     );
     assert_eq!(
         bench.post(&previews, &token, json!({ "commit": "main" })).0,

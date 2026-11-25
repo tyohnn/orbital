@@ -1,6 +1,7 @@
 //! 코드 저장소를 실제 git 으로 재는 테스트.
 //!
-//! 스캐폴드와 에이전트의 작업 폴더를 임시 폴더에 만들고, 에이전트가 하듯이 묶음으로 받아 가서 고쳐 묶음으로 올린다.
+//! 스캐폴드와 에이전트의 작업 폴더를 임시 폴더에 만들고, 묶음으로 받아 가서 고쳐 묶음으로 올린다. git 으로 주고받는 길은
+//! `orbital-server` 의 `tests/git.rs` 가 실제 HTTP 로 잰다.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -148,7 +149,7 @@ fn clone(scratch: &Scratch, store: &SourceStore, id: &InstanceId, name: &str) ->
     work
 }
 
-/// 작업 폴더의 `main` 을 묶음으로 만든다. `orbital push` 가 하는 일이다.
+/// 작업 폴더의 `main` 을 묶음으로 만든다.
 fn bundle_of(scratch: &Scratch, work: &Path) -> Vec<u8> {
     let file = scratch.path(&format!(
         "push-{}.bundle",

@@ -1,7 +1,9 @@
-//! HTTP API. CLI(에이전트)와 SDK(팩토리의 서버)가 모두 이것을 부른다.
+//! HTTP API. 팩토리의 서버가 SDK 로 부른다. 에이전트는 레이어를 직접 부르지 않고 팩토리의 도구와 git 만 쓴다.
 //!
-//! 요청마다 `Authorization: Bearer …` 를 본다. `orb1.` 로 시작하면 에이전트의 토큰이고, 아니면 팩토리의 service key 다.
+//! 요청마다 `Authorization: Bearer …` 를 본다. `orb1.` 로 시작하면 작업의 토큰이고, 아니면 팩토리의 service key 다.
 //! 토큰으로 되는 일과 service key 로 되는 일은 길이 다르다. 운영을 바꾸는 길은 service key 쪽에만 있다.
+//! git 이 바로 붙는 길(`/v1/instances/{id}/git/…`, smart HTTP)은 작업의 토큰으로만 열린다. git 의 자격 도우미가 보내는
+//! `Basic` 의 비밀번호 자리에 든 토큰도 받고, 사용자 이름은 보지 않는다. 자격이 없으면 401 과 `WWW-Authenticate: Basic` 으로 답한다.
 //! 열쇠 없이 오는 길은 Google 의 콜백(`GET /v1/auth/google/callback`) 하나다. 무엇을 할지는 레이어가 서명한 `state` 가 정한다.
 //! 팩토리의 로그인 설정(`/v1/settings/auth`)은 service key 에만 있고, 넣은 비밀은 어떤 답에도 싣지 않는다.
 //! 밖에서 넣는 비밀(`/v1/instances/{id}/secrets`)의 값은 service key 와 입력 표(`/v1/secret-entries/{표}`)로만 들어오고 어떤 열쇠로도 나가지 않는다.
@@ -13,6 +15,7 @@ use std::io::Read as _;
 use std::sync::Arc;
 
 use orbital_core::auth::query_value;
+use orbital_core::git::{Route as GitRoute, route as git_route};
 use orbital_core::name::InstanceId;
 use orbital_core::release::{Approver, Change, PromoteDenied};
 use orbital_core::scope::{Action, Capability};
@@ -24,9 +27,6 @@ use serde_json::{Value, json};
 use crate::layer::{Failure, Layer, NewRollout};
 use crate::vault::SecretValue;
 
-/// 묶음(코드)의 상한.
-const MAX_BUNDLE: usize = 64 * 1024 * 1024;
-
 pub struct Reply {
     pub status: u16,
     pub content_type: &'static str,
@@ -35,6 +35,8 @@ pub struct Reply {
     pub location: Option<String>,
     /// 다른 출처의 브라우저에 연다(`Access-Control-Allow-Origin: *`, 자격 증명 없이). 입력 표의 길만 쓴다.
     pub cors: bool,
+    /// `WWW-Authenticate: Basic` 을 싣는다. git 의 길에서 자격이 없거나 맞지 않을 때만 쓴다. git 은 이것을 보고 자격 도우미를 부른다.
+    pub challenge: bool,
 }
 
 fn ok(value: Value) -> Reply {
@@ -44,6 +46,7 @@ fn ok(value: Value) -> Reply {
         body: value.to_string().into_bytes(),
         location: None,
         cors: false,
+        challenge: false,
     }
 }
 
@@ -54,6 +57,7 @@ fn found(location: String) -> Reply {
         body: b"{}".to_vec(),
         location: Some(location),
         cors: false,
+        challenge: false,
     }
 }
 
@@ -65,6 +69,7 @@ fn problem(status: u16, code: &str, message: &str, details: Vec<String>) -> Repl
         body: body.to_string().into_bytes(),
         location: None,
         cors: false,
+        challenge: false,
     }
 }
 
@@ -78,9 +83,9 @@ fn denied(denied: &PromoteDenied) -> Reply {
                 .map(|blocker| match blocker {
                     Blocker::NotBuiltByLayer => "레이어가 빌드한 것이 아닙니다".to_owned(),
                     Blocker::AccessCheckFailed { findings } => {
-                        format!("권한 검사에서 어긋남이 {findings}개 나왔습니다. `orbital preview` 의 결과를 보고 고쳐 주세요")
+                        format!("권한 검사에서 어긋남이 {findings}개 나왔습니다. 프리뷰의 결과(`findings`)를 보고 고쳐 주세요")
                     }
-                    Blocker::RehearsalNotRun => "마이그레이션의 리허설을 아직 돌리지 않았습니다. `orbital rehearse` 로 돌려 주세요".to_owned(),
+                    Blocker::RehearsalNotRun => "마이그레이션의 리허설을 아직 돌리지 않았습니다. 이 release 로 리허설을 돌려 주세요".to_owned(),
                     Blocker::RehearsalFailed => "마이그레이션의 리허설이 실패했습니다".to_owned(),
                     Blocker::KeyMissing { key } => crate::layer::key_text(*key),
                     Blocker::SecretMissing { secret } => crate::layer::secret_text(secret),
@@ -196,6 +201,7 @@ fn entry(layer: &Layer, method: &str, ticket: &str, body: &[u8]) -> Reply {
             body: Vec::new(),
             location: None,
             cors: true,
+            challenge: false,
         },
         "POST" => parse_quietly::<EnteredValue>(body, "{ \"value\": \"…\" }")
             .and_then(|entered| {
@@ -298,6 +304,7 @@ fn with_token(
                 body: layer.source_bundle(&instance)?,
                 location: None,
                 cors: false,
+                challenge: false,
             })
         }
         ("POST", ["source"]) => {
@@ -320,6 +327,10 @@ fn with_token(
                 })?),
             };
             Ok(ok(json!(layer.preview(&instance, commit)?)))
+        }
+        ("GET", ["previews", "logs"]) => {
+            allow(Action::PreviewLogs)?;
+            Ok(ok(json!(layer.preview_logs(&instance)?)))
         }
         ("DELETE", ["previews"]) => {
             allow(Action::PreviewDeploy)?;
@@ -544,8 +555,96 @@ fn with_service_key(
     }
 }
 
+/// git 의 길이 보는 요청의 나머지.
+#[derive(Clone, Copy)]
+struct Incoming<'a> {
+    method: &'a str,
+    query: &'a str,
+    credential: Option<&'a str>,
+    gzipped: bool,
+    body: &'a [u8],
+}
+
+/// git 의 길(`/v1/instances/{id}/git/…`). 작업의 토큰으로만 열린다.
+///
+/// 판정은 다른 토큰의 길과 같다(`Layer::authorize`): 받기는 `SourceRead`, 올리기는 `SourceWrite` 이고, 토큰의 인스턴스 밖은 없는 것과 같다.
+fn git(layer: &Layer, id: &str, tail: &[&str], incoming: &Incoming<'_>) -> Reply {
+    let Incoming {
+        method,
+        query,
+        credential,
+        gzipped,
+        body,
+    } = *incoming;
+    let challenged = |reply: Reply| Reply {
+        challenge: true,
+        ..reply
+    };
+    let Some(credential) = credential else {
+        return challenged(failure(Failure::Unauthorized));
+    };
+    if !credential.starts_with("orb1.") {
+        // service key 로는 열지 않는다. 그 열쇠는 운영을 바꾸는 길까지 열기 때문이다
+        return if layer.organization(credential).is_ok() {
+            failure(Failure::Forbidden(
+                "git 의 길은 작업에 한정된 토큰으로만 엽니다. service key 로는 열지 않습니다. 팩토리의 서버가 작업을 열어 받은 토큰을 쓰세요".to_owned(),
+            ))
+        } else {
+            challenged(failure(Failure::Unauthorized))
+        };
+    }
+    let Ok(instance) = InstanceId::parse(id) else {
+        return failure(Failure::NotFound);
+    };
+    let Some(route) = git_route(method, tail, query) else {
+        return failure(Failure::NotFound);
+    };
+    let served = layer
+        .authorize(credential, &instance, route.service().action())
+        .and_then(|()| match route {
+            GitRoute::Advertise(service) => layer.git_advertise(&instance, service),
+            GitRoute::Exchange(service) => {
+                let inflated;
+                let request = if gzipped {
+                    inflated =
+                        orbital_source::gunzip(body, layer.upload_limit()).map_err(|_| {
+                            Failure::Problems(vec!["줄인(gzip) 요청을 풀지 못했습니다".to_owned()])
+                        })?;
+                    &inflated[..]
+                } else {
+                    body
+                };
+                layer.git_exchange(&instance, service, request)
+            }
+        });
+    match served {
+        Ok(body) => Reply {
+            status: 200,
+            content_type: route.content_type(),
+            body,
+            location: None,
+            cors: false,
+            challenge: false,
+        },
+        Err(Failure::Unauthorized) => challenged(failure(Failure::Unauthorized)),
+        Err(other) => failure(other),
+    }
+}
+
 /// 요청 하나를 처리한다.
 pub fn handle(layer: &Layer, method: &str, path: &str, bearer: Option<&str>, body: &[u8]) -> Reply {
+    handle_request(layer, method, path, bearer, false, body)
+}
+
+/// 요청 하나를 처리한다. `gzipped` 는 본문이 `Content-Encoding: gzip` 으로 왔는지다(git 이 받는 요청을 줄여 보낸다).
+pub fn handle_request(
+    layer: &Layer,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    gzipped: bool,
+    body: &[u8],
+) -> Reply {
     let whole = path;
     let path: Vec<&str> = path
         .split('?')
@@ -558,6 +657,17 @@ pub fn handle(layer: &Layer, method: &str, path: &str, bearer: Option<&str>, bod
         return failure(Failure::NotFound);
     };
     let query = whole.split_once('?').map_or("", |(_, query)| query);
+    // git 이 바로 붙는 길. 자격이 없을 때 git 이 알아듣는 답(401 과 Basic 의 요청)을 해야 해서 따로 본다
+    if let ["instances", id, "git", tail @ ..] = rest {
+        let incoming = Incoming {
+            method,
+            query,
+            credential: bearer,
+            gzipped,
+            body,
+        };
+        return git(layer, id, tail, &incoming);
+    }
     // 사람의 브라우저가 입력 표로 값을 보내는 곳. 쿠키도 키도 보지 않는다(실려 와도 읽지 않는다)
     if let ["secret-entries", ticket] = rest {
         return entry(layer, method, ticket, body);
@@ -587,6 +697,21 @@ pub fn handle(layer: &Layer, method: &str, path: &str, bearer: Option<&str>, bod
     result.unwrap_or_else(failure)
 }
 
+/// `Authorization` 머리말의 자격. `Bearer` 는 그대로, `Basic` 은 비밀번호 자리만 꺼낸다(git 의 자격 도우미가 이렇게 보낸다).
+fn credential(value: &str) -> Option<String> {
+    use base64::Engine as _;
+    if let Some(token) = value.strip_prefix("Bearer ") {
+        return Some(token.trim().to_owned());
+    }
+    let encoded = value.strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    let (_, password) = text.split_once(':')?;
+    (!password.is_empty()).then(|| password.to_owned())
+}
+
 /// 요청을 받는다. 멈추지 않는다.
 pub fn serve(layer: Arc<Layer>, server: tiny_http::Server) {
     for request in server.incoming_requests() {
@@ -597,23 +722,35 @@ pub fn serve(layer: Arc<Layer>, server: tiny_http::Server) {
 
 /// 받은 요청 하나에 답한다. 테스트가 멈출 수 있는 받기 고리를 짤 때도 쓴다.
 pub fn answer(layer: &Layer, mut request: tiny_http::Request) {
-    let bearer = request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv("authorization"))
-        .and_then(|header| header.value.as_str().strip_prefix("Bearer "))
-        .map(str::to_owned);
+    let header = |name: &'static str| {
+        request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv(name))
+            .map(|header| header.value.as_str().to_owned())
+    };
+    let bearer = header("authorization").and_then(|value| credential(&value));
+    let gzipped = header("content-encoding").is_some_and(|value| value.trim() == "gzip");
     let method = request.method().as_str().to_owned();
     let path = request.url().to_owned();
+    let limit = layer.upload_limit();
     let mut body = Vec::new();
     let read = request
         .as_reader()
-        .take(MAX_BUNDLE as u64 + 1)
+        .take(limit as u64 + 1)
         .read_to_end(&mut body);
-    let reply = if read.is_err() || body.len() > MAX_BUNDLE {
-        problem(413, "too_large", "요청의 본문이 너무 큽니다", Vec::new())
+    let reply = if read.is_err() || body.len() > limit {
+        problem(
+            413,
+            "too_large",
+            &format!(
+                "요청의 본문이 너무 큽니다. {}MiB 안이어야 합니다",
+                limit / (1024 * 1024)
+            ),
+            Vec::new(),
+        )
     } else {
-        handle(layer, &method, &path, bearer.as_deref(), &body)
+        handle_request(layer, &method, &path, bearer.as_deref(), gzipped, &body)
     };
     let header = tiny_http::Header::from_bytes("Content-Type", reply.content_type)
         .expect("고정된 머리말이다");
@@ -626,6 +763,19 @@ pub fn answer(layer: &Layer, mut request: tiny_http::Request) {
             ("Access-Control-Allow-Methods", "POST, OPTIONS"),
             ("Access-Control-Allow-Headers", "content-type"),
             ("Access-Control-Max-Age", "600"),
+            ("Cache-Control", "no-store"),
+        ] {
+            if let Ok(header) = tiny_http::Header::from_bytes(name, value) {
+                response.add_header(header);
+            }
+        }
+    }
+    if reply.challenge {
+        for (name, value) in [
+            (
+                "WWW-Authenticate",
+                "Basic realm=\"Orbital\", charset=\"UTF-8\"",
+            ),
             ("Cache-Control", "no-store"),
         ] {
             if let Ok(header) = tiny_http::Header::from_bytes(name, value) {

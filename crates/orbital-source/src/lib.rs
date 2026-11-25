@@ -1,10 +1,13 @@
 //! 코드 저장소. 인스턴스마다 레이어 안에 git 이력을 둔다. GitHub 을 거치지 않는다.
 //!
-//! 인스턴스의 저장소는 스캐폴드의 한 버전에서 갈라지고(`create`), 에이전트는 묶음(git bundle)으로 받아 가서 고친 뒤 묶음으로 올린다(`receive`).
-//! 올린 묶음은 `main` 의 이력을 잇는 것만 받는다. 레이어는 여기서 commit 하나의 파일을 읽고(`read`), 나무를 꺼내 직접 빌드한다(`export`).
+//! 인스턴스의 저장소는 스캐폴드의 한 버전에서 갈라진다(`create`). 에이전트는 평범한 git 으로 받아 가서 고친 뒤 올린다
+//! (smart HTTP: `advertise` · `upload_pack` · `receive_pack`). 묶음(git bundle)으로 주고받는 길(`bundle` · `receive`)도 남아 있다.
+//! 올리는 두 길은 같은 자리(`ingest`)를 지난다. 무엇을 받는지는 core 의 `git::judge_push` 가 정하고, 객체는 격리한 폴더에 먼저 받아
+//! 검사한 뒤에야 저장소로 옮긴다. 그래서 깨진 것이나 받지 않은 것은 저장소에 아무것도 남기지 않는다.
+//! 레이어는 여기서 commit 하나의 파일을 읽고(`read`), 나무를 꺼내 직접 빌드한다(`export`).
 //! 승인한 commit 과 운영에서 도는 코드가 같으려면 빌드의 재료가 이 저장소에서만 나와야 한다.
 //!
-//! git 은 명령으로 부른다. 묶음은 밖에서 온 것이라 받을 때 객체를 검사한다.
+//! git 은 명령으로 부른다. 저장소의 훅은 어느 명령에서도 돌지 않는다(`core.hooksPath=/dev/null`).
 
 use std::fmt;
 use std::fs;
@@ -13,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use orbital_core::git::{self as wire, Refusal, Service};
 use orbital_core::name::InstanceId;
 
 pub mod assemble;
@@ -52,8 +56,10 @@ pub enum Error {
     NoSuchVersion,
     /// 이 저장소에 없는 commit 이다.
     NoSuchCommit,
-    /// 올린 묶음을 읽지 못했다.
+    /// 올린 묶음이나 객체를 읽지 못했다. 깨졌거나 빠진 객체가 있다.
     BadBundle,
+    /// 올린 ref 를 받지 않는다. 까닭은 core 가 판정한 것이다.
+    Refused(Vec<Refusal>),
     /// 올린 묶음이 `main` 의 이력을 잇지 않는다.
     NotFastForward,
     /// 저장소 안의 경로로 쓸 수 없는 글자열이다.
@@ -71,12 +77,13 @@ impl fmt::Display for Error {
             Self::NoSuchCommit => write!(f, "이 저장소에 없는 commit 입니다"),
             Self::BadBundle => write!(
                 f,
-                "올린 묶음을 읽지 못했습니다. `orbital push` 로 다시 올려 주세요"
+                "올린 것을 읽지 못했습니다. 깨졌거나 빠진 객체가 있습니다. 다시 올려 주세요"
             ),
-            Self::NotFastForward => write!(
-                f,
-                "올린 commit 이 저장소의 최신 commit 을 잇지 않습니다. `orbital pull` 로 받아 합친 뒤 다시 올려 주세요"
-            ),
+            Self::Refused(refusals) => {
+                let texts: Vec<String> = refusals.iter().map(ToString::to_string).collect();
+                f.write_str(&texts.join(" / "))
+            }
+            Self::NotFastForward => write!(f, "{}", Refusal::NotFastForward),
             Self::BadPath => write!(f, "저장소 안의 경로로 쓸 수 없는 글자열입니다"),
             Self::Failed { doing } => write!(f, "{doing} 하다가 실패했습니다"),
         }
@@ -121,13 +128,55 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const MAIN: &str = "refs/heads/main";
 const BASE: &str = "refs/orbital/base";
-const INCOMING: &str = "refs/orbital/incoming";
 /// 앱(위쪽)에서 받아 둔 commit. 업데이트 하나마다 `refs/orbital/upstream/<commit>` 하나다.
 const UPSTREAM: &str = "refs/orbital/upstream";
 /// 앱의 버전들을 받아 오는 자리.
 const APP: &str = "refs/orbital/app";
 /// 열린 rollout 의 업데이트 commit. 묶음에 함께 담겨, 에이전트가 받은 저장소에서 `origin/update` 로 보인다.
 const UPDATE: &str = "refs/heads/update";
+
+/// git 으로 올린 것을 받은 결과. `report` 는 그대로 `git push` 에 돌려줄 줄이다. 받았으면 `commit` 이 `main` 의 새 끝이다.
+#[derive(Debug, Clone)]
+pub struct Received {
+    pub report: Vec<u8>,
+    pub commit: Option<Commit>,
+}
+
+/// gzip 으로 줄인 요청을 푼다. 푼 크기가 `limit` 를 넘으면 받지 않는다. git 은 받는 요청이 크면 줄여 보낸다.
+pub fn gunzip(bytes: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
+    let mut child = Command::new("gzip")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .arg("-dc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| failed("줄인 요청을 풀"))?;
+    let mut stdin = child.stdin.take().ok_or(failed("줄인 요청을 풀"))?;
+    let mut stdout = child.stdout.take().ok_or(failed("줄인 요청을 풀"))?;
+    let read = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _ = stdin.write_all(bytes);
+        });
+        let mut out = Vec::new();
+        let read = std::io::Read::read_to_end(
+            &mut std::io::Read::take(&mut stdout, limit as u64 + 1),
+            &mut out,
+        );
+        read.map(|_| out)
+    });
+    let _ = child.kill();
+    let status = child.wait().map_err(|_| failed("줄인 요청을 풀"))?;
+    let out = read.map_err(|_| failed("줄인 요청을 풀"))?;
+    if out.len() > limit {
+        return Err(Error::BadBundle);
+    }
+    if !status.success() {
+        return Err(Error::BadBundle);
+    }
+    Ok(out)
+}
 
 /// 레이어가 업데이트를 합쳐 본 결과.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +222,8 @@ impl SourceStore {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
+            // 저장소에 훅이 놓여 있어도 돌리지 않는다(ref 를 옮길 때의 reference-transaction 같은)
+            .args(["-c", "core.hooksPath=/dev/null"])
             .arg("--git-dir")
             .arg(repository)
             .stdin(Stdio::null())
@@ -278,69 +329,250 @@ impl SourceStore {
         Self::output(&mut command, "묶음을 만들")?.ok_or(failed("묶음을 만들"))
     }
 
-    /// 에이전트가 올린 묶음을 받는다. `main` 의 이력을 잇는 것만 받고, 받으면 `main` 이 그 끝으로 옮겨 간다.
+    /// 에이전트가 올린 묶음을 받는다. git 으로 올린 것과 같은 자리(`ingest`)를 지나 같은 규칙으로 판정한다.
     pub fn receive(&self, instance: &InstanceId, bundle: &[u8]) -> Result<Commit, Error> {
         let path = self.existing(instance)?;
-        let before = Self::resolve(&path, MAIN)?.ok_or(failed("최신 commit 을 찾"))?;
-        let file = path.join(format!(
-            "incoming-{}-{}.bundle",
+        let head = Self::resolve(&path, MAIN)?.ok_or(failed("최신 commit 을 찾"))?;
+        let header = wire::read_bundle(bundle).map_err(|_| Error::BadBundle)?;
+        // 묶음이 앞에 있다고 적은 commit 은 이 저장소에 있어야 한다
+        for prerequisite in &header.prerequisites {
+            if Self::resolve(&path, prerequisite)?.is_none() {
+                return Err(Error::BadBundle);
+            }
+        }
+        let updates = wire::bundle_updates(&header, head.as_str());
+        self.ingest(&path, &head, &updates, &bundle[header.pack_at..])
+    }
+
+    /// 올린 것을 받는 한 자리. 묶음과 git 의 두 길이 함께 쓴다.
+    ///
+    /// 1. 어느 ref 를 어디로 옮기는지를 core 가 판정한다(`main` 하나, 앞으로만).
+    /// 2. 객체를 격리한 폴더에 받으며 검사한다(`index-pack --strict`). 저장소의 객체는 읽기만 한다.
+    /// 3. 옮길 commit 에서 닿는 객체가 모두 있는지, 그 commit 이 `main` 을 잇는지 본다.
+    /// 4. 그때서야 객체를 저장소로 옮기고, 그사이 `main` 이 옮겨 가지 않았을 때만 `main` 을 옮긴다.
+    ///
+    /// 어느 단계에서 멈추든 격리한 폴더를 지우므로 저장소는 그대로다.
+    fn ingest(
+        &self,
+        path: &Path,
+        head: &Commit,
+        updates: &[wire::RefUpdate],
+        pack: &[u8],
+    ) -> Result<Commit, Error> {
+        let target = wire::judge_push(updates, head.as_str()).map_err(Error::Refused)?;
+        let target = Commit::parse(&target).ok_or(Error::Refused(vec![Refusal::Malformed]))?;
+        let quarantine = path.join(format!(
+            "orbital-incoming-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::File::create(&file)
-            .and_then(|mut handle| handle.write_all(bundle))
-            .map_err(|_| failed("묶음을 받"))?;
-
-        let received = self.receive_file(&path, &file, &before);
-        let _ = fs::remove_file(&file);
-        let _ = Self::output(
-            Self::git(&path).args(["update-ref", "-d", INCOMING]),
-            "받던 자리를 치우",
-        );
-        received
+        let received = Self::quarantined(path, &quarantine, head, &target, pack);
+        let _ = fs::remove_dir_all(&quarantine);
+        received?;
+        // 그사이 다른 올리기가 main 을 옮겼으면 실패한다
+        Self::output(
+            Self::git(path).args(["update-ref", MAIN, target.as_str(), head.as_str()]),
+            "main 을 옮기",
+        )?
+        .ok_or(Error::Refused(vec![Refusal::Stale]))?;
+        Ok(target)
     }
 
-    fn receive_file(&self, path: &Path, file: &Path, before: &Commit) -> Result<Commit, Error> {
-        // 밖에서 온 객체다. 받으면서 검사한다
-        let refspec = format!("+{MAIN}:{INCOMING}");
-        let fetched = Self::output(
-            Self::git(path)
-                .args([
-                    "-c",
-                    "transfer.fsckObjects=true",
-                    "fetch",
-                    "--quiet",
-                    "--no-tags",
-                ])
-                .arg(file)
-                .arg(&refspec),
-            "묶음을 읽",
-        )?;
-        if fetched.is_none() {
+    /// 격리한 폴더에 객체를 받아 검사하고, 통과하면 저장소로 옮긴다.
+    fn quarantined(
+        path: &Path,
+        quarantine: &Path,
+        head: &Commit,
+        target: &Commit,
+        pack: &[u8],
+    ) -> Result<(), Error> {
+        let objects = fs::canonicalize(path.join("objects")).map_err(|_| failed("객체를 받"))?;
+        fs::create_dir_all(quarantine.join("pack")).map_err(|_| failed("객체를 받"))?;
+        let quarantine = fs::canonicalize(quarantine).map_err(|_| failed("객체를 받"))?;
+        let isolated = |command: &mut Command| {
+            command
+                .env("GIT_OBJECT_DIRECTORY", &quarantine)
+                .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &objects);
+        };
+        if !pack.is_empty() {
+            let mut index = Self::git(path);
+            isolated(&mut index);
+            let indexed = Self::fed(
+                index.args(["index-pack", "--stdin", "--fix-thin", "--strict"]),
+                pack,
+                "객체를 받",
+            )?;
+            if indexed.is_none() {
+                return Err(Error::BadBundle);
+            }
+        }
+        // 옮길 commit 에서 닿는 객체가 앞의 끝까지 모두 있어야 한다. 빠진 것이 있으면 받지 않는다
+        let mut connected = Self::git(path);
+        isolated(&mut connected);
+        let connected = connected
+            .args([
+                "rev-list",
+                "--objects",
+                "--quiet",
+                target.as_str(),
+                "--not",
+                head.as_str(),
+            ])
+            .stdout(Stdio::null())
+            .status()
+            .map_err(|_| failed("객체를 견주"))?
+            .success();
+        if !connected {
             return Err(Error::BadBundle);
         }
-        let incoming = Self::resolve(path, INCOMING)?.ok_or(Error::BadBundle)?;
-        let continues = Self::git(path)
+        let mut forward = Self::git(path);
+        isolated(&mut forward);
+        let forward = forward
             .args([
                 "merge-base",
                 "--is-ancestor",
-                before.as_str(),
-                incoming.as_str(),
+                head.as_str(),
+                target.as_str(),
             ])
             .stdout(Stdio::null())
             .status()
             .map_err(|_| failed("이력을 견주"))?
             .success();
-        if !continues {
+        if !forward {
             return Err(Error::NotFastForward);
         }
-        // 그사이 다른 올리기가 main 을 옮겼으면 실패한다
-        Self::output(
-            Self::git(path).args(["update-ref", MAIN, incoming.as_str(), before.as_str()]),
-            "main 을 옮기",
+        // 검사를 지났다. pack 을 저장소로 옮긴다. 색인(.idx)을 마지막에 옮겨, 옮기는 중에 반쪽짜리 pack 이 보이지 않게 한다
+        let mut files: Vec<PathBuf> = fs::read_dir(quarantine.join("pack"))
+            .map_err(|_| failed("객체를 옮기"))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
+        files.sort_by_key(|file| file.extension().is_some_and(|ext| ext == "idx"));
+        for file in files {
+            let name = file.file_name().ok_or(failed("객체를 옮기"))?;
+            fs::rename(&file, objects.join("pack").join(name))
+                .map_err(|_| failed("객체를 옮기"))?;
+        }
+        Ok(())
+    }
+
+    /// 표준 입력에 `input` 을 넣고 명령을 부른다. 성공하면 표준 출력을, 실패하면 `None` 을 돌려준다.
+    /// 출력이 차서 서로 기다리지 않게 입력은 따로 넣는다.
+    fn fed(
+        command: &mut Command,
+        input: &[u8],
+        doing: &'static str,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|_| failed(doing))?;
+        let mut stdin = child.stdin.take().ok_or(failed(doing))?;
+        let output = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                // 명령이 먼저 끝나 입력을 닫아도 결과는 종료 코드로 본다
+                let _ = stdin.write_all(input);
+            });
+            child.wait_with_output()
+        })
+        .map_err(|_| failed(doing))?;
+        Ok(output.status.success().then_some(output.stdout))
+    }
+
+    /// git 의 광고. 받기는 `main` 과 (열린 rollout 이 있으면) `update` 만 보이고, 레이어가 안에서 쓰는 ref(`refs/orbital/**`)는 보이지 않는다.
+    /// 올리기는 `main` 하나만 알린다.
+    pub fn advertise(&self, instance: &InstanceId, service: Service) -> Result<Vec<u8>, Error> {
+        let path = self.existing(instance)?;
+        match service {
+            Service::ReceivePack => {
+                let head = Self::resolve(&path, MAIN)?.ok_or(failed("최신 commit 을 찾"))?;
+                Ok(wire::advertise_receive(head.as_str()))
+            }
+            Service::UploadPack => {
+                let refs = Self::output(
+                    Self::upload_pack_command(&path)
+                        .args(["--advertise-refs"])
+                        .arg(&path),
+                    "ref 를 알리",
+                )?
+                .ok_or(failed("ref 를 알리"))?;
+                let mut out = wire::advertise_upload_prefix();
+                out.extend(refs);
+                Ok(out)
+            }
+        }
+    }
+
+    /// `git upload-pack` 을 부를 명령. 숨길 ref 와 보낼 수 있는 객체의 규칙을 명령줄에 적어, 저장소의 설정이 무엇이든 이것을 따른다.
+    fn upload_pack_command(path: &Path) -> Command {
+        let mut command = Self::git(path);
+        command.args([
+            "-c",
+            "uploadpack.hideRefs=refs/orbital",
+            "-c",
+            "uploadpack.allowTipSHA1InWant=false",
+            "-c",
+            "uploadpack.allowReachableSHA1InWant=false",
+            "-c",
+            "uploadpack.allowAnySHA1InWant=false",
+            "-c",
+            "uploadpack.allowFilter=false",
+            "upload-pack",
+            "--stateless-rpc",
+            "--strict",
+        ]);
+        command
+    }
+
+    /// 받는 쪽(`git clone` · `git fetch`)과 객체를 주고받는다. 요청은 한 번에 하나이고 상태를 갖지 않는다.
+    pub fn upload_pack(&self, instance: &InstanceId, request: &[u8]) -> Result<Vec<u8>, Error> {
+        let path = self.existing(instance)?;
+        Self::fed(
+            Self::upload_pack_command(&path).arg(&path),
+            request,
+            "객체를 보내",
         )?
-        .ok_or(Error::NotFastForward)?;
-        Ok(incoming)
+        .ok_or(Error::BadBundle)
+    }
+
+    /// 올리는 쪽(`git push`)의 요청을 받는다. 묶음과 같은 자리(`ingest`)를 지나고, 결과는 git 이 읽는 줄(report-status)로 돌려준다.
+    /// 받지 않은 까닭도 그 줄에 실려 에이전트의 `git push` 에 그대로 보인다.
+    pub fn receive_pack(&self, instance: &InstanceId, request: &[u8]) -> Result<Received, Error> {
+        let path = self.existing(instance)?;
+        let head = Self::resolve(&path, MAIN)?.ok_or(failed("최신 commit 을 찾"))?;
+        let Ok(commands) = wire::read_commands(request) else {
+            return Ok(Received {
+                report: wire::report(Err(&Refusal::Malformed.to_string()), &[]),
+                commit: None,
+            });
+        };
+        let names = |result: &Result<(), String>| -> Vec<(String, Result<(), String>)> {
+            commands
+                .updates
+                .iter()
+                .map(|update| (update.name.clone(), result.clone()))
+                .collect()
+        };
+        match self.ingest(
+            &path,
+            &head,
+            &commands.updates,
+            &request[commands.pack_at..],
+        ) {
+            Ok(commit) => Ok(Received {
+                report: wire::report(Ok(()), &names(&Ok(()))),
+                commit: Some(commit),
+            }),
+            Err(error @ Error::BadBundle) => Ok(Received {
+                report: wire::report(Err(&error.to_string()), &names(&Err(error.to_string()))),
+                commit: None,
+            }),
+            Err(error @ (Error::Refused(_) | Error::NotFastForward)) => Ok(Received {
+                report: wire::report(Ok(()), &names(&Err(error.to_string()))),
+                commit: None,
+            }),
+            Err(other) => Err(other),
+        }
     }
 
     fn known(&self, instance: &InstanceId, commit: &Commit) -> Result<PathBuf, Error> {
