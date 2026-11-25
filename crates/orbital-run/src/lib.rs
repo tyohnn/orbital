@@ -130,6 +130,34 @@ fn signal(child: &Child, name: &str) {
         .status();
 }
 
+/// 묶음에 아직 도는 프로세스가 있는가. 죽었지만 거두어지지 않은 것(좀비)은 세지 않는다.
+/// 좀비는 포트도 파일도 쥐고 있지 않고, 거두는 것은 이 프로세스가 아니라 기다려도 소용이 없다.
+fn group_running(child: &Child) -> bool {
+    let group = child.id().to_string();
+    let Ok(output) = Command::new("ps")
+        .args(["-A", "-o", "pgid=,stat="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some(group.as_str())
+            && fields.next().is_some_and(|state| !state.starts_with('Z'))
+    })
+}
+
+/// 묶음에 도는 프로세스가 없어질 때까지 기다린다. 신호는 보낸 뒤에 닿으므로, 멈췄다고 답하기 전에 실제로 사라졌는지 본다.
+/// 그러지 않으면 낳은 프로세스가 잠깐 더 살아 포트를 쥐고 있다.
+fn wait_for_group(child: &Child, limit: Duration) {
+    let started = Instant::now();
+    while group_running(child) && started.elapsed() < limit {
+        sleep(Duration::from_millis(10));
+    }
+}
+
 fn wait_until(child: &mut Child, limit: Duration) -> Option<std::process::ExitStatus> {
     let started = Instant::now();
     loop {
@@ -144,17 +172,16 @@ fn wait_until(child: &mut Child, limit: Duration) -> Option<std::process::ExitSt
 }
 
 fn stop(child: &mut Child) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        // 맨 처음 프로세스가 끝났어도 낳은 프로세스가 남아 있을 수 있다
-        signal(child, "KILL");
-        return;
+    if matches!(child.try_wait(), Ok(None)) {
+        signal(child, "TERM");
+        if wait_until(child, Duration::from_secs(3)).is_none() {
+            signal(child, "KILL");
+            let _ = child.wait();
+        }
     }
-    signal(child, "TERM");
-    if wait_until(child, Duration::from_secs(3)).is_none() {
-        signal(child, "KILL");
-        let _ = child.wait();
-    }
+    // 맨 처음 프로세스가 끝났어도 낳은 프로세스가 남아 있을 수 있다
     signal(child, "KILL");
+    wait_for_group(child, Duration::from_secs(2));
 }
 
 struct LocalProcess(Child);
