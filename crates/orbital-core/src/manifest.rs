@@ -76,7 +76,8 @@ impl ServiceAuth {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Auth {
-    /// 로그인 방법. 지금은 `email_link` 만 받는다. 모르는 값은 [`Manifest::check`] 가 고칠 것으로 돌려준다.
+    /// 로그인 방법. `email_link` 와 `google` 을 받는다. 모르는 값은 [`Manifest::check`] 가 고칠 것으로 돌려준다.
+    /// 둘 다 운영에서는 팩토리가 넣은 키(메일 발송 · Google 클라이언트)가 있어야 오른다.
     pub methods: Vec<String>,
     /// 앱의 로그인 화면. 어느 서비스의 `path` 아래여야 한다.
     pub login_path: String,
@@ -113,8 +114,17 @@ fn yes() -> bool {
 }
 
 impl Auth {
+    /// 메일로 가는 로그인 링크.
+    pub const EMAIL_LINK: &'static str = "email_link";
+    /// Google 계정으로 들어오기. 콜백은 레이어의 주소 하나로 받는다.
+    pub const GOOGLE: &'static str = "google";
     /// 레이어가 아는 로그인 방법.
-    pub const METHODS: [&'static str; 1] = ["email_link"];
+    pub const METHODS: [&'static str; 2] = [Self::EMAIL_LINK, Self::GOOGLE];
+
+    /// 이 로그인 방법을 선언했는가.
+    pub fn uses(&self, method: &str) -> bool {
+        self.methods.iter().any(|declared| declared == method)
+    }
 }
 
 /// 누가 들어올 수 있는가.
@@ -956,6 +966,11 @@ directory = ["manager"]
                 method: "password".to_owned()
             }]
         );
+        let google = WITH_AUTH.replace(
+            "methods = [\"email_link\"]",
+            "methods = [\"email_link\", \"google\"]",
+        );
+        assert!(parse(&google).check().is_ok());
     }
 
     #[test]

@@ -602,6 +602,7 @@ mod release {
                 },
                 access_findings,
                 rehearsal,
+                missing_keys: Vec::new(),
             })
     }
 

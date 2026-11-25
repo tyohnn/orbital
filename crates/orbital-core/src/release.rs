@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::manifest::{Auth, ValidManifest};
+
 /// release 의 식별자. 레이어가 commit · 선언 · 권한 표 · 마이그레이션의 내용에서 짓는다. 넷 중 하나라도 바뀌면 달라진다.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -40,6 +42,43 @@ pub struct Release {
     /// 권한 검사가 찾은 어긋남의 수. 0 이어야 통과다.
     pub access_findings: usize,
     pub rehearsal: Rehearsed,
+    /// 선언의 로그인 방법이 쓰는데 팩토리가 넣지 않은 키. [`missing_keys`] 가 셈한다.
+    #[serde(default)]
+    pub missing_keys: Vec<FactoryKey>,
+}
+
+/// 운영의 로그인이 쓰는 팩토리의 키. 레이어는 공용 발송 도메인도 공용 Google 클라이언트도 갖지 않는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactoryKey {
+    /// 메일 발송(Resend)의 키와 보내는 주소. 이메일 링크가 쓴다.
+    Mail,
+    /// Google 클라이언트의 키. Google 로그인이 쓴다.
+    Google,
+}
+
+/// 팩토리가 지금 넣어 둔 키. 값이 아니라 있는지만 담는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Keys {
+    pub mail: bool,
+    pub google: bool,
+    /// 레이어의 운영자가 개발용 메일함을 명시해 켰다. 메일은 파일에 쌓이고, 메일의 키가 없어도 운영에 오른다.
+    pub dev_mailbox: bool,
+}
+
+/// 선언의 로그인 방법이 쓰는데 팩토리가 넣지 않은 키. 비어 있어야 운영에 오른다. 미리보기는 키 없이 선다.
+pub fn missing_keys(manifest: &ValidManifest, keys: &Keys) -> Vec<FactoryKey> {
+    let Some(auth) = &manifest.get().auth else {
+        return Vec::new();
+    };
+    let mut missing = Vec::new();
+    if auth.uses(Auth::EMAIL_LINK) && !keys.mail && !keys.dev_mailbox {
+        missing.push(FactoryKey::Mail);
+    }
+    if auth.uses(Auth::GOOGLE) && !keys.google {
+        missing.push(FactoryKey::Google);
+    }
+    missing
 }
 
 /// 승격을 막는 것.
@@ -47,9 +86,15 @@ pub struct Release {
 #[serde(tag = "blocker", rename_all = "snake_case")]
 pub enum Blocker {
     NotBuiltByLayer,
-    AccessCheckFailed { findings: usize },
+    AccessCheckFailed {
+        findings: usize,
+    },
     RehearsalNotRun,
     RehearsalFailed,
+    /// 팩토리가 키를 넣지 않았다. 에이전트가 고칠 수 없고 팩토리의 관리자가 설정에 넣어야 한다.
+    KeyMissing {
+        key: FactoryKey,
+    },
 }
 
 /// 이 release 의 승격을 막는 것을 모두 돌려준다. 비어 있어야 승격을 요청할 수 있다.
@@ -68,6 +113,12 @@ pub fn blockers(release: &Release) -> Vec<Blocker> {
         Rehearsed::NotRun => found.push(Blocker::RehearsalNotRun),
         Rehearsed::Failed => found.push(Blocker::RehearsalFailed),
     }
+    found.extend(
+        release
+            .missing_keys
+            .iter()
+            .map(|&key| Blocker::KeyMissing { key }),
+    );
     found
 }
 
@@ -191,7 +242,113 @@ mod tests {
             built_by: BuiltBy::Layer,
             access_findings: 0,
             rehearsal: Rehearsed::Passed,
+            missing_keys: Vec::new(),
         }
+    }
+
+    fn manifest(methods: &str) -> ValidManifest {
+        let text = format!(
+            r#"
+[[service]]
+name = "web"
+kind = "server"
+build = "true"
+start = "true"
+path = "/"
+roles = ["member"]
+
+[database]
+schemas = ["app"]
+migrations = "db/migrations"
+roles = ["member"]
+
+[auth]
+methods = [{methods}]
+login_path = "/login"
+"#
+        );
+        toml::from_str::<crate::manifest::Manifest>(&text)
+            .unwrap()
+            .check()
+            .unwrap()
+    }
+
+    #[test]
+    fn 메일_키가_없으면_이메일_링크를_선언한_release_는_운영에_오르지_못한다() {
+        let none = Keys::default();
+        assert_eq!(
+            missing_keys(&manifest(r#""email_link""#), &none),
+            vec![FactoryKey::Mail]
+        );
+        let mail = Keys {
+            mail: true,
+            ..Keys::default()
+        };
+        assert_eq!(missing_keys(&manifest(r#""email_link""#), &mail), vec![]);
+        let mut release = release("r1");
+        release.missing_keys = vec![FactoryKey::Mail];
+        assert_eq!(
+            blockers(&release),
+            vec![Blocker::KeyMissing {
+                key: FactoryKey::Mail
+            }]
+        );
+    }
+
+    #[test]
+    fn google_키가_없으면_google_을_선언한_release_는_운영에_오르지_못한다() {
+        let mail = Keys {
+            mail: true,
+            ..Keys::default()
+        };
+        assert_eq!(
+            missing_keys(&manifest(r#""email_link", "google""#), &mail),
+            vec![FactoryKey::Google]
+        );
+        let both = Keys {
+            mail: true,
+            google: true,
+            dev_mailbox: false,
+        };
+        assert_eq!(
+            missing_keys(&manifest(r#""email_link", "google""#), &both),
+            vec![]
+        );
+        // Google 만 선언했으면 메일의 키는 묻지 않는다
+        assert_eq!(
+            missing_keys(&manifest(r#""google""#), &Keys::default()),
+            vec![FactoryKey::Google]
+        );
+    }
+
+    #[test]
+    fn 개발용_메일함은_메일_키를_대신하지만_google_키는_대신하지_않는다() {
+        let dev = Keys {
+            dev_mailbox: true,
+            ..Keys::default()
+        };
+        assert_eq!(missing_keys(&manifest(r#""email_link""#), &dev), vec![]);
+        assert_eq!(
+            missing_keys(&manifest(r#""email_link", "google""#), &dev),
+            vec![FactoryKey::Google]
+        );
+    }
+
+    #[test]
+    fn 로그인을_맡기지_않은_앱은_키를_묻지_않는다() {
+        let text = r#"
+[[service]]
+name = "web"
+kind = "server"
+build = "true"
+start = "true"
+path = "/"
+"#;
+        let manifest = toml::from_str::<crate::manifest::Manifest>(text)
+            .unwrap()
+            .check()
+            .unwrap();
+        assert_eq!(missing_keys(&manifest, &Keys::default()), vec![]);
     }
 
     fn approval(id: &str, by: Approver) -> Approval {
@@ -275,8 +432,9 @@ mod tests {
             built_by: BuiltBy::Uploaded,
             access_findings: 1,
             rehearsal: Rehearsed::Failed,
+            missing_keys: vec![FactoryKey::Mail, FactoryKey::Google],
         };
-        assert_eq!(blockers(&release).len(), 3);
+        assert_eq!(blockers(&release).len(), 5);
     }
 
     #[test]
@@ -344,6 +502,17 @@ mod tests {
         assert_eq!(
             after_promotion(false, Migrations::Destructive),
             Aftermath::AskHuman
+        );
+    }
+
+    #[test]
+    fn 키가_없어_막힌_까닭은_json_으로_어느_키인지_알린다() {
+        assert_eq!(
+            serde_json::to_string(&Blocker::KeyMissing {
+                key: FactoryKey::Google
+            })
+            .unwrap(),
+            r#"{"blocker":"key_missing","key":"google"}"#
         );
     }
 
