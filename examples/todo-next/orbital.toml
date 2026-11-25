@@ -5,9 +5,11 @@
 name = "web"
 kind = "server"
 build = "npm ci && npm run build"
-start = "npm run start"           # next start 가 PORT 를 읽고 127.0.0.1 에서 듣는다
+start = "npm run start"           # next start 는 PORT 를 읽는다. 듣는 주소는 package.json 의 -H 127.0.0.1 이 정한다(HOSTNAME 은 읽지 않는다)
 path = "/"
 roles = ["member"]
+auth = "required"                 # 로그인한 사람만 들어온다. 아니면 레이어가 [auth].login_path 로 보낸다
+public = ["/_next/static"]        # 로그인 화면의 스크립트와 글꼴. 로그인 없이 내주고 신원은 싣지 않는다
 
 [database]
 schemas = ["todo"]
@@ -15,8 +17,7 @@ migrations = "db/migrations"
 roles = ["member"]
 seed = "db/seed"
 
-# 로그인은 레이어가 맡는다. 서비스는 로그인 없이도 열리고(auth 의 기본은 optional), 앱이 신원이 없으면 /login 으로 보낸다.
-# auth = "required" 로 두면 로그인 화면의 스크립트(/_next/static/…)까지 막혀 화면이 뜨지 않는다
+# 로그인은 레이어가 맡는다. 로그인 화면(/login)과 그 아래, 공개 경로는 로그인 없이 열린다
 [auth]
 methods = ["email_link"]
 login_path = "/login"

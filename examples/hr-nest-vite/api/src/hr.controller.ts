@@ -1,4 +1,4 @@
-import { Controller, Get, Headers, HttpCode, Post, UnauthorizedException } from "@nestjs/common";
+import { Controller, ForbiddenException, Get, Headers, HttpCode, Post, UnauthorizedException } from "@nestjs/common";
 
 import { Db, ROLES, Role } from "./db";
 
@@ -81,11 +81,19 @@ export class HrController
         return { as: role, payslips };
     }
 
-    /** 선언의 `[[schedule]]` 이 부르는 자리. 은행 키의 값은 돌려주지 않고 있는지만 답한다. */
+    /**
+     * 선언의 `[[schedule]]` 이 부르는 자리. 레이어가 router 를 거쳐 부르고 `x-orbital-schedule` 을 싣는다.
+     * 밖에서 온 `x-orbital-` 머리말은 router 가 언제나 지우고 이 경로는 밖에서 닿지 못하므로, 그 머리말이 있으면 레이어가 부른 것이다.
+     * 은행 키의 값은 돌려주지 않고 있는지만 답한다.
+     */
     @Post("jobs/payroll")
     @HttpCode(200)
-    payroll(): { ran: boolean; bank: "set" | "missing" }
+    payroll(@Headers("x-orbital-schedule") schedule?: string): { ran: boolean; bank: "set" | "missing" }
     {
+        if (schedule === undefined || schedule === "")
+        {
+            throw new ForbiddenException();
+        }
         return { ran: true, bank: process.env.BANK_API_KEY ? "set" : "missing" };
     }
 }
