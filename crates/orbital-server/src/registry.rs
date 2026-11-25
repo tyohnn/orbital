@@ -17,6 +17,9 @@ pub struct ReleaseRecord {
     /// 미리보기 DB 에서 권한 검사가 찾은 어긋남의 수.
     pub access_findings: usize,
     pub rehearsal: Rehearsed,
+    /// 선언이 밖에서 넣는다고 적은 비밀의 이름(`[secrets] external`). 에이전트가 요청할 수 있는 이름을 가른다.
+    #[serde(default)]
+    pub external: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

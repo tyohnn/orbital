@@ -30,6 +30,10 @@ use orbital_core::release::{
 use orbital_core::scope::{
     Action, Capability, DenyReason, OrganizationId, Request, Token, Verdict, judge,
 };
+use orbital_core::secrets::{
+    Entry, EntryRefusal, Place, RequestProblem, Stage as SecretStage, ValueProblem,
+    entry_expires_at, judge_request, judge_value, missing_secrets, newly_received,
+};
 use orbital_pg::Admin;
 use orbital_pg::auth::AuthStore;
 use orbital_pg::rehearsal::RestorePoint;
@@ -53,6 +57,7 @@ use crate::registry::{InstanceRecord, ProductionRecord, Registry, ReleaseRecord}
 use crate::seal::SealKey;
 use crate::settings::{Settings, SettingsError};
 use crate::token;
+use crate::vault::{RedeemError, SecretValue, Vault, VaultError};
 
 /// 일이 안 됐을 때 부른 쪽에 돌려주는 것. 에이전트가 읽고 고칠 수 있게 적는다.
 #[derive(Debug)]
@@ -77,6 +82,8 @@ pub enum Failure {
     /// 승격의 규칙이 막았다.
     Denied(PromoteDenied),
     Conflict(String),
+    /// 한 번 쓰는 것을 이미 썼거나 만료됐다(입력 표).
+    Gone(String),
     Internal(String),
 }
 
@@ -123,6 +130,23 @@ fn tail(log: &Path) -> String {
 enum Stage {
     Preview,
     Production,
+}
+
+impl Stage {
+    /// 금고의 칸. 프리뷰는 프리뷰의 칸만, 운영은 운영의 칸만 읽는다.
+    fn vault(self) -> SecretStage {
+        match self {
+            Self::Preview => SecretStage::Preview,
+            Self::Production => SecretStage::Production,
+        }
+    }
+
+    fn of(stage: SecretStage) -> Self {
+        match stage {
+            SecretStage::Preview => Self::Preview,
+            SecretStage::Production => Self::Production,
+        }
+    }
 }
 
 struct LiveService {
@@ -189,14 +213,38 @@ struct ServiceStarter {
     folder: PathBuf,
     command: String,
     env: Vec<(String, String)>,
+    /// 밖에서 넣는 비밀. 띄울 때마다 금고에서 읽어, 값을 바꾼 뒤 깬 프로세스는 새 값을 받는다.
+    external: External,
     log: PathBuf,
     wake_timeout: Duration,
+}
+
+/// 서버 서비스에 건넬 밖에서 넣는 비밀의 자리. 프리뷰는 프리뷰의 칸만, 운영은 운영의 칸만 읽는다.
+struct External {
+    vault: Arc<Vault>,
+    organization: String,
+    instance: InstanceId,
+    stage: SecretStage,
+    names: Vec<SecretName>,
 }
 
 impl Starter for ServiceStarter {
     fn start(&self, port: u16) -> Result<Box<dyn Running>, WakeFailure> {
         let mut env = vec![("PORT".to_owned(), port.to_string())];
         env.extend(self.env.iter().cloned());
+        let external = &self.external;
+        env.extend(
+            external
+                .vault
+                .values(
+                    &external.organization,
+                    &external.instance,
+                    external.stage,
+                    &external.names,
+                )
+                .into_iter()
+                .map(|(name, value)| (name.as_str().to_owned(), value.expose().to_owned())),
+        );
         let mut process = self
             .runner
             .start(&Job {
@@ -314,6 +362,8 @@ pub struct PreviewReport {
     pub blockers: Vec<String>,
     /// 실패는 아니지만 알아 둘 것. 로그인을 레이어에 맡겼는데 행 단위 규칙을 꺼서 역할 제한이 걸리지 않는 표.
     pub notices: Vec<String>,
+    /// 밖에서 넣는 비밀 가운데 프리뷰의 값이 없어 환경 변수 없이 선 것의 이름. 사람에게 입력을 요청한다.
+    pub missing_secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -344,7 +394,44 @@ pub struct PendingPromotion {
     pub changes: Vec<String>,
     /// 운영에 아직 돌지 않은 마이그레이션의 이름.
     pub migrations: Vec<String>,
+    /// 이번 변경으로 앱이 새로 받게 되는 밖에서 넣는 비밀의 이름. 지금의 운영과 견준다.
+    pub new_secrets: Vec<String>,
 }
+
+/// 비밀 하나의 모습. 값은 싣지 않는다(지문도 길이도 없다).
+#[derive(Debug, Clone, Serialize)]
+pub struct SecretReport {
+    pub name: String,
+    /// 이 인스턴스의 release(프리뷰로 세운 것과 운영의 것) 가운데 밖에서 넣는다고 선언한 것이 있는가.
+    pub declared: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<RequestedReport>,
+    pub preview: SlotReport,
+    pub production: SlotReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestedReport {
+    pub reason: String,
+    pub at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SlotReport {
+    pub set: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_at: Option<u64>,
+}
+
+/// 사람이 값을 넣을 입력 표. 주소에 표가 실려 있다. 10분 안에 한 번 쓴다.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryTicket {
+    pub url: String,
+    pub expires_at: u64,
+}
+
+/// 지금 시각(유닉스 초)을 주는 것. 테스트가 갈아 끼운다.
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 pub struct Options {
     /// 레이어가 저장소 · 빌드 · 기록을 두는 폴더.
@@ -368,6 +455,8 @@ pub struct Options {
     pub wake_timeout: Duration,
     /// 인스턴스마다의 하위 도메인. 없으면 인스턴스마다 포트 하나를 낸다(개발과 지금의 테스트).
     pub hosting: Option<Hosting>,
+    /// 비밀의 입력 표와 요청이 읽는 시계. 테스트가 갈아 끼워 표의 만료를 잰다.
+    pub clock: Clock,
 }
 
 /// 하위 도메인으로 인스턴스를 가르는 레이어의 설정.
@@ -400,6 +489,7 @@ impl Options {
             sleep_after: Duration::from_secs(5 * 60),
             wake_timeout: Duration::from_secs(30),
             hosting: None,
+            clock: Arc::new(now),
         }
     }
 }
@@ -410,6 +500,9 @@ pub struct Layer {
     pg_url: String,
     /// 팩토리의 설정(메일 · Google 의 키). 봉인한 글로만 파일에 있다.
     settings: Arc<Settings>,
+    /// 밖에서 넣는 비밀의 금고. 봉인한 글로만 파일에 있다.
+    vault: Arc<Vault>,
+    clock: Clock,
     /// 개발용 메일함. 명시해 켰을 때만 있다.
     outbox: Option<Arc<Outbox>>,
     public_url: String,
@@ -466,6 +559,8 @@ fn auth_failure(error: orbital_pg::auth::AuthError) -> Failure {
 pub const OUTBOX: &str = "outbox.jsonl";
 /// 팩토리의 설정 파일. `ORBITAL_HOME` 아래에 둔다.
 pub const SETTINGS: &str = "settings.json";
+/// 밖에서 넣는 비밀의 금고. `ORBITAL_HOME` 아래에 둔다.
+pub const VAULT: &str = "vault.json";
 
 fn digest(text: &str) -> [u8; 32] {
     Sha256::digest(text.as_bytes()).into()
@@ -542,6 +637,7 @@ impl Layer {
             }
         };
 
+        let vault = Vault::open(options.home.join(VAULT), options.seal_key.clone())?;
         let settings = Settings::open(options.home.join(SETTINGS), options.seal_key)?;
         let runtime =
             Runtime::new().map_err(|_| "proxy 의 런타임을 띄우지 못했습니다".to_owned())?;
@@ -568,6 +664,8 @@ impl Layer {
         let layer = Self {
             sources: SourceStore::new(options.home.join("sources")),
             settings: Arc::new(settings),
+            vault: Arc::new(vault),
+            clock: options.clock,
             outbox: options
                 .dev_mailbox
                 .then(|| Arc::new(Outbox::new(options.home.join(OUTBOX)))),
@@ -654,6 +752,7 @@ impl Layer {
                     let kind = match failure {
                         Failure::BuildFailed { .. } => "build_failed",
                         Failure::StartFailed { .. } => "start_failed",
+                        Failure::Denied(_) => "secret_missing",
                         _ => "internal",
                     };
                     eprintln!("orbitald: 운영 {id} 를 되살리지 못했습니다({kind})");
@@ -673,6 +772,16 @@ impl Layer {
             .and_then(|release| Commit::parse(&release.commit))
             .ok_or_else(|| internal("운영의 release 를 찾지 못했습니다"))?;
         let assembled = self.assembled(instance, &commit)?;
+        // 운영의 비밀이 금고에서 풀리지 않으면(열쇠가 바뀌었거나 줄이 빠졌으면) 값 없이 세우지 않는다
+        let missing = self.missing_secrets(&record.organization, instance, &assembled.manifest);
+        if !missing.is_empty() {
+            return Err(Failure::Denied(PromoteDenied::Blocked {
+                blockers: missing
+                    .into_iter()
+                    .map(|secret| orbital_core::release::Blocker::SecretMissing { secret })
+                    .collect(),
+            }));
+        }
         let folder = self.build(instance, &assembled)?;
         let names = Names::new(instance.clone());
         let identity_key = token::unhex(&production.identity_key)
@@ -1039,6 +1148,13 @@ impl Layer {
                 folder: folder.to_path_buf(),
                 command: service.start.clone().unwrap_or_default(),
                 env,
+                external: External {
+                    vault: Arc::clone(&self.vault),
+                    organization: stand.organization.to_owned(),
+                    instance: instance.clone(),
+                    stage: stage.vault(),
+                    names: assembled.manifest.get().secrets.external.clone(),
+                },
                 log: log.clone(),
                 wake_timeout: self.wake_timeout,
             });
@@ -1180,6 +1296,29 @@ impl Layer {
             .collect()
     }
 
+    /// 운영에 올라 있는 release 가 밖에서 넣는다고 선언한 비밀. 운영이 없으면 비어 있다.
+    fn production_external(
+        &self,
+        instance: &InstanceId,
+        record: &InstanceRecord,
+    ) -> Outcome<Vec<SecretName>> {
+        let Some(production) = &record.production else {
+            return Ok(Vec::new());
+        };
+        let commit = record
+            .releases
+            .get(&production.release)
+            .and_then(|release| Commit::parse(&release.commit))
+            .ok_or_else(|| internal("운영의 release 를 찾지 못했습니다"))?;
+        Ok(self
+            .assembled(instance, &commit)?
+            .manifest
+            .get()
+            .secrets
+            .external
+            .clone())
+    }
+
     /// 운영에 올라 있는 release 의 권한 표. 운영이 없으면 빈 표다.
     fn production_access(&self, instance: &InstanceId, record: &InstanceRecord) -> Outcome<Access> {
         let Some(production) = &record.production else {
@@ -1286,7 +1425,11 @@ impl Layer {
                 access_findings: findings.len(),
                 rehearsal,
                 missing_keys: self.missing_keys(&record.organization, &assembled.manifest),
-                missing_secrets: Vec::new(),
+                missing_secrets: self.missing_secrets(
+                    &record.organization,
+                    instance,
+                    &assembled.manifest,
+                ),
             })
             .iter()
             .map(blocker_text)
@@ -1299,6 +1442,15 @@ impl Layer {
                     )
                 })
                 .collect(),
+            missing_secrets: missing_secrets(
+                &assembled.manifest,
+                &self
+                    .vault
+                    .filled(&record.organization, instance, SecretStage::Preview),
+            )
+            .iter()
+            .map(|name| name.as_str().to_owned())
+            .collect(),
         };
 
         let stored = inner
@@ -1313,6 +1465,14 @@ impl Layer {
                 commit: commit.to_string(),
                 access_findings: findings.len(),
                 rehearsal,
+                external: assembled
+                    .manifest
+                    .get()
+                    .secrets
+                    .external
+                    .iter()
+                    .map(|name| name.as_str().to_owned())
+                    .collect(),
             },
         );
         inner.registry.save().map_err(Failure::Internal)?;
@@ -1551,7 +1711,7 @@ impl Layer {
             access_findings,
             rehearsal,
             missing_keys: self.missing_keys(&organization, &manifest),
-            missing_secrets: Vec::new(),
+            missing_secrets: self.missing_secrets(&organization, instance, &manifest),
         });
         if !found.is_empty() {
             return Err(Failure::Denied(PromoteDenied::Blocked { blockers: found }));
@@ -1592,7 +1752,8 @@ impl Layer {
             rehearsal: known.rehearsal,
             // 팩토리의 키는 올리는 때의 것을 본다. 앞에서 넣었다가 지웠으면 막힌다
             missing_keys: self.missing_keys(organization, &assembled.manifest),
-            missing_secrets: Vec::new(),
+            // 밖에서 넣는 비밀도 올리는 때의 운영 칸을 본다
+            missing_secrets: self.missing_secrets(organization, instance, &assembled.manifest),
         };
         // 승인은 호출에 적힌 release 하나에 묶인다. 승인한 뒤 commit 이 더해졌으면 식별자가 달라 여기서 찾지 못하거나 예행연습이 다시 필요하다
         let approval = Approval {
@@ -1796,10 +1957,10 @@ impl Layer {
         };
         match after_promotion(false, kind) {
             Aftermath::Keep => failure,
-            Aftermath::RollBackCode => {
-                self.relaunch(inner, prior, production);
-                failure
-            }
+            Aftermath::RollBackCode => match self.relaunch(inner, prior, production) {
+                Ok(()) => failure,
+                Err(blocked) => blocked,
+            },
             Aftermath::AskHuman => {
                 // 마이그레이션이 돈 직후이고 아직 아무도 쓰지 않았다. 되돌릴 지점으로 돌려도 잃는 데이터가 없다
                 let manifest = prior
@@ -1812,8 +1973,10 @@ impl Layer {
                 if let (Some(point), Some(manifest)) = (point, manifest)
                     && inner.admin.restore(prior.names, &manifest, point).is_ok()
                 {
-                    self.relaunch(inner, prior, production);
-                    return failure;
+                    return match self.relaunch(inner, prior, production) {
+                        Ok(()) => failure,
+                        Err(blocked) => blocked,
+                    };
                 }
                 Failure::Conflict(
                     "새 release 가 서지 못했고 운영 DB 를 앞의 모습으로 돌리지도 못했습니다. 운영이 내려가 있습니다. 사람이 확인해야 합니다".to_owned(),
@@ -1822,8 +1985,14 @@ impl Layer {
         }
     }
 
-    /// 앞의 release 의 서버를 다시 띄운다.
-    fn relaunch(&self, inner: &mut Inner, prior: &Prior<'_>, production: &ProductionRecord) {
+    /// 앞의 release 의 서버를 다시 띄운다. 승격과 같은 판정을 지나서, 그 release 가 쓰는 비밀의 운영 값이 빠졌으면
+    /// 값 없이 띄우지 않고 까닭을 돌려준다.
+    fn relaunch(
+        &self,
+        inner: &mut Inner,
+        prior: &Prior<'_>,
+        production: &ProductionRecord,
+    ) -> Result<(), Failure> {
         let previous = prior
             .record
             .releases
@@ -1831,10 +2000,25 @@ impl Layer {
             .and_then(|release| Commit::parse(&release.commit))
             .and_then(|commit| self.assembled(prior.instance, &commit).ok());
         let Some(assembled) = previous else {
-            return;
+            return Ok(());
         };
+        let missing = self.missing_secrets(
+            &prior.record.organization,
+            prior.instance,
+            &assembled.manifest,
+        );
+        if !missing.is_empty() {
+            let names: Vec<String> = missing
+                .iter()
+                .map(|name| format!("`{}`", name.as_str()))
+                .collect();
+            return Err(Failure::Conflict(format!(
+                "새 release 가 서지 못했고, 앞의 release 가 쓰는 비밀 {} 의 운영 값이 없어 앞의 release 로 되돌리지도 못했습니다. 운영이 내려가 있습니다. 사람이 입력 카드에서 운영의 값을 넣은 뒤 다시 올려 주세요",
+                names.join(", ")
+            )));
+        }
         let Ok(folder) = self.build(prior.instance, &assembled) else {
-            return;
+            return Ok(());
         };
         // 권한을 앞의 권한 표로 되돌린다. 새 release 의 권한이 남아 있으면 안 된다
         let _ = inner
@@ -1863,6 +2047,7 @@ impl Layer {
                 },
             );
         }
+        Ok(())
     }
 
     /// 사람의 승인을 기다리는 승격 요청. 없으면 `None` 이다. 권한의 변화는 읽는 때의 운영과 견준다.
@@ -1895,6 +2080,7 @@ impl Layer {
                 .map_err(internal)?,
         };
         let before = self.production_access(instance, &record)?;
+        let received = self.production_external(instance, &record)?;
         Ok(Some(PendingPromotion {
             release,
             commit: commit.to_string(),
@@ -1903,6 +2089,10 @@ impl Layer {
                 .map(|change| change.sentence)
                 .collect(),
             migrations,
+            new_secrets: newly_received(&received, &assembled.manifest.get().secrets.external)
+                .iter()
+                .map(|name| name.as_str().to_owned())
+                .collect(),
         }))
     }
 
@@ -2061,6 +2251,7 @@ impl Layer {
             .destroy(&Names::new(instance.clone()))
             .map_err(internal)?;
         self.sources.destroy(instance).map_err(internal)?;
+        self.vault.forget(instance).map_err(vault_failure)?;
         inner.registry.state.instances.remove(instance.as_str());
         inner.registry.save().map_err(Failure::Internal)
     }
@@ -2187,5 +2378,334 @@ impl Layer {
             "{origin}/_orbital/auth/google/finish?ticket={}",
             ticket.to_text()
         ))
+    }
+}
+
+// ---- 밖에서 넣는 비밀 ----
+
+/// 봉인의 열쇠가 없는 레이어에서 값을 넣으려 했을 때의 까닭.
+const NO_SEAL_KEY: &str = "레이어에 봉인의 열쇠가 없어 비밀의 값을 넣지 못합니다. 레이어의 운영자가 `ORBITAL_SEAL_KEY` 를 넣고 다시 띄워야 합니다";
+
+/// 금고의 거절을 HTTP 의 답으로 옮긴다.
+fn vault_failure(error: VaultError) -> Failure {
+    match error {
+        VaultError::NoSealKey => Failure::Conflict(NO_SEAL_KEY.to_owned()),
+        VaultError::Internal(message) => Failure::Internal(message),
+    }
+}
+
+/// 비밀의 이름을 읽는다. 틀린 이름은 되풀이하지 않는다. 이름 자리에 값을 잘못 넣었을 수 있다.
+fn secret_name(name: &str) -> Outcome<SecretName> {
+    SecretName::parse(name).map_err(|error| {
+        Failure::Problems(vec![format!(
+            "비밀의 이름이 틀렸습니다({error}). `orbital.toml` 의 `[secrets] external` 에 적은 이름(대문자 · 숫자 · 밑줄)을 써 주세요"
+        )])
+    })
+}
+
+fn undeclared(name: &SecretName) -> String {
+    format!(
+        "비밀 `{}` 은 이 인스턴스의 어느 release 도 밖에서 넣는다고 선언하지 않았습니다. `orbital.toml` 의 `[secrets] external` 에 적고 프리뷰를 세운 뒤 요청해 주세요",
+        name.as_str()
+    )
+}
+
+/// 값을 받지 않는 까닭. 값은 되풀이하지 않는다.
+fn value_failure(problems: &[ValueProblem]) -> Failure {
+    Failure::Problems(
+        problems
+            .iter()
+            .map(|problem| match problem {
+                ValueProblem::Empty => "값이 비었습니다. 값을 붙여 넣어 주세요".to_owned(),
+                ValueProblem::TooLarge { max } => {
+                    format!("값이 {max}바이트보다 큽니다. 비밀의 값만 넣어 주세요")
+                }
+                ValueProblem::Nul => {
+                    "값에 NUL 글자가 들었습니다. 환경 변수에 실을 수 없으니 값을 다시 복사해 넣어 주세요"
+                        .to_owned()
+                }
+            })
+            .collect(),
+    )
+}
+
+impl Layer {
+    /// 선언이 밖에서 넣는다고 적었는데 운영의 칸에 풀리는 값이 없는 비밀. 판정은 core 가 한다.
+    fn missing_secrets(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        manifest: &ValidManifest,
+    ) -> Vec<SecretName> {
+        missing_secrets(
+            manifest,
+            &self
+                .vault
+                .filled(organization, instance, SecretStage::Production),
+        )
+    }
+
+    /// 인스턴스가 속한 팩토리. 토큰의 길이 범위를 판정받은 뒤에 쓴다.
+    pub fn instance_organization(&self, instance: &InstanceId) -> Outcome<String> {
+        self.lock()
+            .registry
+            .state
+            .instances
+            .get(instance.as_str())
+            .map(|record| record.organization.clone())
+            .ok_or(Failure::NotFound)
+    }
+
+    /// 그 인스턴스의 release(프리뷰로 세운 것과 운영의 것)가 밖에서 넣는다고 선언한 이름. 다른 팩토리의 것은 없는 것으로 답한다.
+    fn declared_secrets(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+    ) -> Outcome<BTreeSet<SecretName>> {
+        let mut inner = self.lock();
+        let record = Self::owned(&mut inner, organization, instance)?;
+        Ok(record
+            .releases
+            .values()
+            .flat_map(|release| release.external.iter())
+            .filter_map(|name| SecretName::parse(name).ok())
+            .collect())
+    }
+
+    /// 이름마다 선언됐는지 · 요청됐는지 · 단계마다 채워졌는지. 값은 어떤 열쇠로도 돌려주지 않는다.
+    pub fn list_secrets(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+    ) -> Outcome<Vec<SecretReport>> {
+        let declared = self.declared_secrets(organization, instance)?;
+        let status = self.vault.status(organization, instance);
+        let requests = self.vault.requests(instance);
+        let mut names: BTreeSet<String> = declared
+            .iter()
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        names.extend(status.keys().map(|name| name.as_str().to_owned()));
+        names.extend(requests.keys().cloned());
+        let slot = |at: Option<u64>| SlotReport {
+            set: at.is_some(),
+            set_at: at,
+        };
+        Ok(names
+            .into_iter()
+            .map(|name| {
+                let parsed = SecretName::parse(&name).ok();
+                let filled = parsed
+                    .as_ref()
+                    .and_then(|parsed| status.get(parsed).cloned())
+                    .unwrap_or_default();
+                SecretReport {
+                    declared: parsed.is_some_and(|parsed| declared.contains(&parsed)),
+                    requested: requests.get(&name).map(|requested| RequestedReport {
+                        reason: requested.reason.clone(),
+                        at: requested.at,
+                    }),
+                    preview: slot(filled.preview),
+                    production: slot(filled.production),
+                    name,
+                }
+            })
+            .collect())
+    }
+
+    /// 사람에게 비밀의 입력을 요청한다. 에이전트의 토큰(`secrets:request`)이나 service key 로 부른다.
+    pub fn request_secret(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        name: &str,
+        reason: &str,
+    ) -> Outcome<()> {
+        let name = secret_name(name)?;
+        let declared = self.declared_secrets(organization, instance)?;
+        let problems = judge_request(&declared, &name, reason);
+        if !problems.is_empty() {
+            return Err(Failure::Problems(
+                problems
+                    .iter()
+                    .map(|problem| match problem {
+                        RequestProblem::Undeclared => undeclared(&name),
+                        RequestProblem::ReasonEmpty => {
+                            "까닭(reason)을 적어 주세요. 사람이 카드에서 무엇에 쓰는 값인지 읽습니다"
+                                .to_owned()
+                        }
+                        RequestProblem::ReasonTooLong { max } => {
+                            format!("까닭(reason)은 {max}자 안으로 줄여 주세요")
+                        }
+                    })
+                    .collect(),
+            ));
+        }
+        self.vault
+            .request(instance, &name, reason.trim(), (self.clock)())
+            .map_err(vault_failure)
+    }
+
+    /// 값을 넣는다(service key 만). 그 단계에 떠 있는 서비스는 재워, 다음 요청이 새 값으로 깨게 한다.
+    pub fn put_secret(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        name: &str,
+        stage: SecretStage,
+        value: &SecretValue,
+    ) -> Outcome<()> {
+        let name = secret_name(name)?;
+        if !self
+            .declared_secrets(organization, instance)?
+            .contains(&name)
+        {
+            return Err(Failure::Problems(vec![undeclared(&name)]));
+        }
+        let problems = judge_value(value.expose());
+        if !problems.is_empty() {
+            return Err(value_failure(&problems));
+        }
+        let place = Place {
+            instance: instance.clone(),
+            name,
+            stage,
+        };
+        self.vault
+            .put(organization, &place, value, (self.clock)())
+            .map_err(vault_failure)?;
+        self.refresh(&place);
+        Ok(())
+    }
+
+    /// 값을 지운다(service key 만). 지금 운영의 release 가 쓰는 비밀의 운영 값은 지우지 못한다.
+    pub fn remove_secret(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        name: &str,
+        stage: SecretStage,
+    ) -> Outcome<bool> {
+        let name = secret_name(name)?;
+        let record = {
+            let mut inner = self.lock();
+            Self::owned(&mut inner, organization, instance)?.clone()
+        };
+        if stage == SecretStage::Production
+            && self.production_external(instance, &record)?.contains(&name)
+        {
+            return Err(Failure::Conflict(format!(
+                "지금 운영의 release 가 쓰는 비밀 `{}` 의 운영 값은 지우지 못합니다. 값을 바꾸려면 새 값을 넣어 주세요. 지우려면 먼저 `[secrets] external` 에서 뺀 release 를 운영에 올려 주세요",
+                name.as_str()
+            )));
+        }
+        let place = Place {
+            instance: instance.clone(),
+            name,
+            stage,
+        };
+        let removed = self.vault.remove(&place).map_err(vault_failure)?;
+        if removed {
+            self.refresh(&place);
+        }
+        Ok(removed)
+    }
+
+    /// 사람이 값을 넣을 입력 표를 낸다(service key 만). 표는 인스턴스 · 이름 · 단계 하나에 묶이고 10분 안에 한 번 쓴다.
+    /// 레이어는 표의 sha256 만 적는다. 사람의 브라우저가 돌려받은 주소로 레이어에 바로 값을 보낸다.
+    pub fn open_entry(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        name: &str,
+        stage: SecretStage,
+    ) -> Outcome<EntryTicket> {
+        let name = secret_name(name)?;
+        if !self
+            .declared_secrets(organization, instance)?
+            .contains(&name)
+        {
+            return Err(Failure::Problems(vec![undeclared(&name)]));
+        }
+        // 넣지 못할 값을 받을 표는 내지 않는다
+        if !self.vault.can_seal() {
+            return Err(Failure::Conflict(NO_SEAL_KEY.to_owned()));
+        }
+        let ticket = token::hex(&random(32)?);
+        let now = (self.clock)();
+        let expires_at = entry_expires_at(now);
+        self.vault
+            .issue(
+                organization,
+                &sha256_hex(&ticket),
+                Entry {
+                    place: Place {
+                        instance: instance.clone(),
+                        name,
+                        stage,
+                    },
+                    expires_at,
+                    used: false,
+                },
+                now,
+            )
+            .map_err(vault_failure)?;
+        Ok(EntryTicket {
+            url: format!("{}/v1/secret-entries/{ticket}", self.public_url),
+            expires_at,
+        })
+    }
+
+    /// 입력 표로 값을 넣는다. 쿠키도 키도 보지 않고 표만 본다. 본문이 적은 이름과 단계는 표의 것과 같아야 한다.
+    pub fn redeem_entry(
+        &self,
+        ticket: &str,
+        name: Option<&str>,
+        stage: Option<SecretStage>,
+        value: &SecretValue,
+    ) -> Outcome<Place> {
+        if ticket.len() != 64 || !ticket.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Failure::NotFound);
+        }
+        let name = name.map(secret_name).transpose()?;
+        let place = self
+            .vault
+            .redeem(&sha256_hex(ticket), (name, stage), value, (self.clock)())
+            .map_err(|error| match error {
+                RedeemError::Unknown => Failure::NotFound,
+                RedeemError::Refused(EntryRefusal::Used) => Failure::Gone(
+                    "이미 쓴 입력 표입니다. 카드에서 표를 새로 받아 주세요".to_owned(),
+                ),
+                RedeemError::Refused(EntryRefusal::Expired) => Failure::Gone(
+                    "입력 표가 만료되었습니다(10분). 카드에서 표를 새로 받아 주세요".to_owned(),
+                ),
+                RedeemError::Refused(EntryRefusal::OtherPlace) => Failure::Invalid(
+                    "입력 표는 묶인 이름과 단계에만 값을 넣습니다. 본문에는 `value` 만 적어 주세요"
+                        .to_owned(),
+                ),
+                RedeemError::Value(problems) => value_failure(&problems),
+                RedeemError::Vault(error) => vault_failure(error),
+            })?;
+        self.refresh(&place);
+        Ok(place)
+    }
+
+    /// 그 단계에 떠 있는 앱이 이 비밀을 선언했으면 서버 서비스를 재운다. 다음 요청이 새 값으로 깬다.
+    fn refresh(&self, place: &Place) {
+        let inner = self.lock();
+        let Some(live) = inner
+            .live
+            .get(&(place.instance.as_str().to_owned(), Stage::of(place.stage)))
+        else {
+            return;
+        };
+        if !live.manifest.get().secrets.external.contains(&place.name) {
+            return;
+        }
+        for service in &live.services {
+            if let Some(server) = &service.server {
+                server.refresh();
+            }
+        }
     }
 }

@@ -4,20 +4,25 @@
 //! 토큰으로 되는 일과 service key 로 되는 일은 길이 다르다. 운영을 바꾸는 길은 service key 쪽에만 있다.
 //! 열쇠 없이 오는 길은 Google 의 콜백(`GET /v1/auth/google/callback`) 하나다. 무엇을 할지는 레이어가 서명한 `state` 가 정한다.
 //! 팩토리의 로그인 설정(`/v1/settings/auth`)은 service key 에만 있고, 넣은 비밀은 어떤 답에도 싣지 않는다.
+//! 밖에서 넣는 비밀(`/v1/instances/{id}/secrets`)의 값은 service key 와 입력 표(`/v1/secret-entries/{표}`)로만 들어오고 어떤 열쇠로도 나가지 않는다.
+//! 입력 표의 길은 쿠키도 키도 보지 않고 표만 보며, 사람의 브라우저(팩토리의 카드)가 다른 출처에서 부르므로 CORS 를 연다.
 //! 무엇이 허락되는지는 여기서 정하지 않는다. 토큰은 core 의 `scope::judge` 가, 승격은 core 의 `release::promote` 가 판정한다.
 
 use std::collections::BTreeSet;
 use std::io::Read as _;
 use std::sync::Arc;
 
+use orbital_core::auth::query_value;
 use orbital_core::name::InstanceId;
 use orbital_core::release::{Approver, Change, PromoteDenied};
 use orbital_core::scope::{Action, Capability};
+use orbital_core::secrets::Stage as SecretStage;
 use orbital_source::Commit;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::layer::{Failure, Layer};
+use crate::vault::SecretValue;
 
 /// 묶음(코드)의 상한.
 const MAX_BUNDLE: usize = 64 * 1024 * 1024;
@@ -28,6 +33,8 @@ pub struct Reply {
     pub body: Vec<u8>,
     /// 302 로 보낼 곳. Google 의 콜백만 쓴다.
     pub location: Option<String>,
+    /// 다른 출처의 브라우저에 연다(`Access-Control-Allow-Origin: *`, 자격 증명 없이). 입력 표의 길만 쓴다.
+    pub cors: bool,
 }
 
 fn ok(value: Value) -> Reply {
@@ -36,6 +43,7 @@ fn ok(value: Value) -> Reply {
         content_type: "application/json",
         body: value.to_string().into_bytes(),
         location: None,
+        cors: false,
     }
 }
 
@@ -45,6 +53,7 @@ fn found(location: String) -> Reply {
         content_type: "application/json",
         body: b"{}".to_vec(),
         location: Some(location),
+        cors: false,
     }
 }
 
@@ -55,6 +64,7 @@ fn problem(status: u16, code: &str, message: &str, details: Vec<String>) -> Repl
         content_type: "application/json",
         body: body.to_string().into_bytes(),
         location: None,
+        cors: false,
     }
 }
 
@@ -115,6 +125,7 @@ fn failure(failure: Failure) -> Reply {
         Failure::Invalid(message) => problem(400, "invalid", &message, Vec::new()),
         Failure::Denied(why) => denied(&why),
         Failure::Conflict(message) => problem(409, "conflict", &message, Vec::new()),
+        Failure::Gone(message) => problem(410, "gone", &message, Vec::new()),
         Failure::Internal(message) => problem(500, "internal", &message, Vec::new()),
     }
 }
@@ -122,6 +133,84 @@ fn failure(failure: Failure) -> Reply {
 fn parse<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, Failure> {
     serde_json::from_slice(body)
         .map_err(|error| Failure::Problems(vec![format!("요청의 본문을 읽지 못했습니다: {error}")]))
+}
+
+/// 비밀이 실릴 수 있는 본문을 읽는다. JSON 의 오류 문구는 본문의 조각(값)을 되풀이할 수 있어 싣지 않고 모양만 알린다.
+fn parse_quietly<'a, T: Deserialize<'a>>(body: &'a [u8], shape: &str) -> Result<T, Failure> {
+    serde_json::from_slice(body).map_err(|_| {
+        Failure::Problems(vec![format!(
+            "요청의 본문은 `{shape}` 모양의 JSON 이어야 합니다. 모르는 칸은 받지 않습니다"
+        )])
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewSecretRequest {
+    reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewSecretValue {
+    stage: SecretStage,
+    value: SecretValue,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewEntry {
+    stage: SecretStage,
+}
+
+/// 입력 표로 보낸 본문. 이름과 단계는 적지 않아도 되고, 적었으면 표의 것과 같아야 한다.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnteredValue {
+    value: SecretValue,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    stage: Option<SecretStage>,
+}
+
+/// 비밀의 이름마다의 모습. 값은 싣지 않는다.
+fn secrets_reply(
+    layer: &Layer,
+    organization: &str,
+    instance: &InstanceId,
+) -> Result<Reply, Failure> {
+    Ok(ok(
+        json!({ "secrets": layer.list_secrets(organization, instance)? }),
+    ))
+}
+
+/// 사람의 브라우저가 입력 표로 값을 보내는 길. 쿠키도 키도 보지 않고, 다른 출처에서 부르므로 CORS 를 연다.
+fn entry(layer: &Layer, method: &str, ticket: &str, body: &[u8]) -> Reply {
+    let mut reply = match method {
+        // 브라우저의 사전 요청. 무엇이든 표가 맞는지는 본 요청에서 본다
+        "OPTIONS" => Reply {
+            status: 204,
+            content_type: "application/json",
+            body: Vec::new(),
+            location: None,
+            cors: true,
+        },
+        "POST" => parse_quietly::<EnteredValue>(body, "{ \"value\": \"…\" }")
+            .and_then(|entered| {
+                layer.redeem_entry(
+                    ticket,
+                    entered.name.as_deref(),
+                    entered.stage,
+                    &entered.value,
+                )
+            })
+            .map(|place| ok(json!({ "name": place.name, "stage": place.stage })))
+            .unwrap_or_else(failure),
+        _ => failure(Failure::NotFound),
+    };
+    reply.cors = true;
+    reply
 }
 
 #[derive(Deserialize)]
@@ -200,6 +289,7 @@ fn with_token(
                 content_type: "application/octet-stream",
                 body: layer.source_bundle(&instance)?,
                 location: None,
+                cors: false,
             })
         }
         ("POST", ["source"]) => {
@@ -249,6 +339,22 @@ fn with_token(
         }
         // 운영을 바꾸는 길을 토큰으로 두드리면 core 가 「service key 로만」이라고 답한다
         ("POST", ["promotions"]) => allow(Action::Promote).map(|()| ok(json!({}))),
+        // 비밀은 이름과 채워졌는지만 본다
+        ("GET", ["secrets"]) => {
+            allow(Action::SecretsList)?;
+            secrets_reply(layer, &layer.instance_organization(&instance)?, &instance)
+        }
+        ("POST", ["secrets", name, "request"]) => {
+            allow(Action::SecretsRequest)?;
+            let request: NewSecretRequest = parse_quietly(body, "{ \"reason\": \"…\" }")?;
+            let organization = layer.instance_organization(&instance)?;
+            layer.request_secret(&organization, &instance, name, &request.reason)?;
+            Ok(ok(json!({ "requested": true })))
+        }
+        // 값을 넣거나 지우고 입력 표를 받는 길은 토큰으로 두드려도 core 가 「service key 로만」이라고 답한다. 본문은 읽지 않는다
+        ("PUT" | "DELETE", ["secrets", _]) | ("POST", ["secrets", _, "entries"]) => {
+            allow(Action::SecretsWrite).map(|()| ok(json!({})))
+        }
         // 사용자를 초대하는 길(`users`)은 service key 에만 있다. 토큰에는 없는 길이라 없는 것으로 답한다
         _ => Err(Failure::NotFound),
     }
@@ -259,6 +365,7 @@ fn with_service_key(
     layer: &Layer,
     method: &str,
     path: &[&str],
+    query: &str,
     key: &str,
     body: &[u8],
 ) -> Result<Reply, Failure> {
@@ -336,6 +443,48 @@ fn with_service_key(
                     layer.remove_user(&organization, &instance, user)?;
                     Ok(ok(json!({ "removed": true })))
                 }
+                ("GET", ["secrets"]) => secrets_reply(layer, &organization, &instance),
+                ("POST", ["secrets", name, "request"]) => {
+                    let request: NewSecretRequest = parse_quietly(body, "{ \"reason\": \"…\" }")?;
+                    layer.request_secret(&organization, &instance, name, &request.reason)?;
+                    Ok(ok(json!({ "requested": true })))
+                }
+                ("PUT", ["secrets", name]) => {
+                    let request: NewSecretValue = parse_quietly(
+                        body,
+                        "{ \"stage\": \"preview\" | \"production\", \"value\": \"…\" }",
+                    )?;
+                    layer.put_secret(
+                        &organization,
+                        &instance,
+                        name,
+                        request.stage,
+                        &request.value,
+                    )?;
+                    Ok(ok(json!({ "name": name, "stage": request.stage })))
+                }
+                ("DELETE", ["secrets", name]) => {
+                    let stage = query_value(query, "stage")
+                        .and_then(|stage| SecretStage::parse(&stage))
+                        .ok_or_else(|| {
+                            Failure::Problems(vec![
+                                "지울 단계를 `?stage=preview` 나 `?stage=production` 으로 적어 주세요"
+                                    .to_owned(),
+                            ])
+                        })?;
+                    let removed = layer.remove_secret(&organization, &instance, name, stage)?;
+                    Ok(ok(json!({ "removed": removed })))
+                }
+                ("POST", ["secrets", name, "entries"]) => {
+                    let request: NewEntry =
+                        parse_quietly(body, "{ \"stage\": \"preview\" | \"production\" }")?;
+                    Ok(ok(json!(layer.open_entry(
+                        &organization,
+                        &instance,
+                        name,
+                        request.stage
+                    )?)))
+                }
                 ("DELETE", []) => {
                     layer.destroy_instance(&organization, &instance)?;
                     Ok(ok(json!({ "destroyed": true })))
@@ -360,9 +509,13 @@ pub fn handle(layer: &Layer, method: &str, path: &str, bearer: Option<&str>, bod
     let ["v1", rest @ ..] = path.as_slice() else {
         return failure(Failure::NotFound);
     };
+    let query = whole.split_once('?').map_or("", |(_, query)| query);
+    // 사람의 브라우저가 입력 표로 값을 보내는 곳. 쿠키도 키도 보지 않는다(실려 와도 읽지 않는다)
+    if let ["secret-entries", ticket] = rest {
+        return entry(layer, method, ticket, body);
+    }
     // Google 이 브라우저를 돌려보내는 곳. 열쇠 없이 오고, 무엇을 할지는 레이어가 서명한 `state` 가 정한다
     if method == "GET" && rest == ["auth", "google", "callback"] {
-        let query = whole.split_once('?').map_or("", |(_, query)| query);
         return match layer.google_callback(query) {
             Ok(location) => found(location),
             Err(error) => failure(error),
@@ -377,52 +530,68 @@ pub fn handle(layer: &Layer, method: &str, path: &str, bearer: Option<&str>, bod
             _ => Err(Failure::NotFound),
         }
     } else {
-        with_service_key(layer, method, rest, bearer, body)
+        with_service_key(layer, method, rest, query, bearer, body)
     };
     result.unwrap_or_else(failure)
 }
 
 /// 요청을 받는다. 멈추지 않는다.
 pub fn serve(layer: Arc<Layer>, server: tiny_http::Server) {
-    for mut request in server.incoming_requests() {
+    for request in server.incoming_requests() {
         let layer = Arc::clone(&layer);
-        std::thread::spawn(move || {
-            let bearer = request
-                .headers()
-                .iter()
-                .find(|header| header.field.equiv("authorization"))
-                .and_then(|header| header.value.as_str().strip_prefix("Bearer "))
-                .map(str::to_owned);
-            let method = request.method().as_str().to_owned();
-            let path = request.url().to_owned();
-            let mut body = Vec::new();
-            let read = request
-                .as_reader()
-                .take(MAX_BUNDLE as u64 + 1)
-                .read_to_end(&mut body);
-            let reply = if read.is_err() || body.len() > MAX_BUNDLE {
-                problem(413, "too_large", "요청의 본문이 너무 큽니다", Vec::new())
-            } else {
-                handle(&layer, &method, &path, bearer.as_deref(), &body)
-            };
-            let header = tiny_http::Header::from_bytes("Content-Type", reply.content_type)
-                .expect("고정된 머리말이다");
-            let mut response = tiny_http::Response::from_data(reply.body)
-                .with_status_code(reply.status)
-                .with_header(header);
-            if let Some(location) = reply.location {
-                // 한 번 쓰는 표가 든 주소가 기록이나 다음 화면의 Referer 로 남지 않게 한다
-                for (name, value) in [
-                    ("Location", location.as_str()),
-                    ("Cache-Control", "no-store"),
-                    ("Referrer-Policy", "no-referrer"),
-                ] {
-                    if let Ok(header) = tiny_http::Header::from_bytes(name, value) {
-                        response.add_header(header);
-                    }
-                }
-            }
-            let _ = request.respond(response);
-        });
+        std::thread::spawn(move || answer(&layer, request));
     }
+}
+
+/// 받은 요청 하나에 답한다. 테스트가 멈출 수 있는 받기 고리를 짤 때도 쓴다.
+pub fn answer(layer: &Layer, mut request: tiny_http::Request) {
+    let bearer = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("authorization"))
+        .and_then(|header| header.value.as_str().strip_prefix("Bearer "))
+        .map(str::to_owned);
+    let method = request.method().as_str().to_owned();
+    let path = request.url().to_owned();
+    let mut body = Vec::new();
+    let read = request
+        .as_reader()
+        .take(MAX_BUNDLE as u64 + 1)
+        .read_to_end(&mut body);
+    let reply = if read.is_err() || body.len() > MAX_BUNDLE {
+        problem(413, "too_large", "요청의 본문이 너무 큽니다", Vec::new())
+    } else {
+        handle(layer, &method, &path, bearer.as_deref(), &body)
+    };
+    let header = tiny_http::Header::from_bytes("Content-Type", reply.content_type)
+        .expect("고정된 머리말이다");
+    let mut response = tiny_http::Response::from_data(reply.body)
+        .with_status_code(reply.status)
+        .with_header(header);
+    if reply.cors {
+        for (name, value) in [
+            ("Access-Control-Allow-Origin", "*"),
+            ("Access-Control-Allow-Methods", "POST, OPTIONS"),
+            ("Access-Control-Allow-Headers", "content-type"),
+            ("Access-Control-Max-Age", "600"),
+            ("Cache-Control", "no-store"),
+        ] {
+            if let Ok(header) = tiny_http::Header::from_bytes(name, value) {
+                response.add_header(header);
+            }
+        }
+    }
+    if let Some(location) = reply.location {
+        // 한 번 쓰는 표가 든 주소가 기록이나 다음 화면의 Referer 로 남지 않게 한다
+        for (name, value) in [
+            ("Location", location.as_str()),
+            ("Cache-Control", "no-store"),
+            ("Referrer-Policy", "no-referrer"),
+        ] {
+            if let Ok(header) = tiny_http::Header::from_bytes(name, value) {
+                response.add_header(header);
+            }
+        }
+    }
+    let _ = request.respond(response);
 }

@@ -7,8 +7,10 @@
 //! - `ORBITAL_LISTEN`: 듣는 주소(기본 `127.0.0.1:7400`)
 //! - `ORBITAL_PUBLIC_URL`: 레이어의 바깥 주소(기본 `http://<ORBITAL_LISTEN>`). Google 의 콜백이 `<바깥 주소>/v1/auth/google/callback` 에 서고,
 //!   팩토리는 이 주소 하나를 Google 콘솔에 등록한다
-//! - `ORBITAL_SEAL_KEY`: 팩토리가 넣은 키(Resend · Google)를 봉인하는 열쇠. 32바이트를 hex 64자로. 없으면 팩토리가 설정을 넣지 못한다(409).
-//!   기록(`ORBITAL_HOME`)과 다른 자리에 둔다. 바꾸면 앞에서 넣은 키가 풀리지 않아 팩토리가 다시 넣어야 한다
+//!   비밀의 입력 표(`<바깥 주소>/v1/secret-entries/<표>`)도 이 아래에 선다. 사람의 브라우저가 바로 닿는 주소여야 한다
+//! - `ORBITAL_SEAL_KEY`: 팩토리가 넣은 키(Resend · Google)와 밖에서 넣는 비밀(금고, `ORBITAL_HOME/vault.json`)을 봉인하는 열쇠.
+//!   32바이트를 hex 64자로. 없으면 팩토리가 설정과 비밀의 값을 넣지 못하고(409), 밖에서 넣는 비밀을 선언한 release 는 운영에 오르지 못한다.
+//!   기록(`ORBITAL_HOME`)과 다른 자리에 둔다. 바꾸면 앞에서 넣은 키와 값이 풀리지 않아 다시 넣어야 한다
 //! - `ORBITAL_DEV_MAIL`: `outbox` 일 때만 개발용 메일함을 켠다. 팩토리의 메일 키가 없어도 운영에 오르고, 로그인 링크를 보내지 않고
 //!   `ORBITAL_HOME/outbox.jsonl`(주인만 읽는 파일)에 한 줄씩 쌓는다. 테스트가 이 파일에서 링크를 꺼낸다. 운영의 레이어에서는 켜지 않는다
 //! - `ORBITAL_SLEEP_AFTER`: 마지막 요청이 끝난 뒤 이 초만큼 요청이 없으면 서버 서비스의 프로세스를 내린다(기본 300). 다음 요청에 깬다
