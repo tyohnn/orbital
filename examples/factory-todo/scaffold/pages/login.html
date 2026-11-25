@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>로그인</title>
+<!-- 로그인 화면은 이메일 주소만 다뤄요. 링크를 만들고 보내고 받는 일은 레이어(/_orbital/auth/…)가 해요 -->
+<main>
+    <h1>할 일 카드에 들어가기</h1>
+    <form id="login">
+        <label for="email">이메일</label>
+        <input id="email" name="email" type="email" autocomplete="email" required>
+        <button type="submit">로그인 링크 받기</button>
+    </form>
+    <p id="sent" hidden>메일함을 확인해 주세요. 받은 링크를 이 브라우저에서 열면 들어와요.</p>
+    <p id="failed" role="alert" hidden>링크를 보내지 못했어요. 잠시 뒤에 다시 해 주세요.</p>
+</main>
+<script type="module">
+    import { sendLoginLink } from "/vendor/orbital-app.js";
+
+    const form = document.getElementById("login");
+    const next = new URLSearchParams(location.search).get("next") ?? "/";
+    form.addEventListener("submit", async (event) =>
+    {
+        event.preventDefault();
+        document.getElementById("failed").hidden = true;
+        try
+        {
+            await sendLoginLink({ email: form.email.value, next });
+            form.hidden = true;
+            document.getElementById("sent").hidden = false;
+        }
+        catch
+        {
+            document.getElementById("failed").hidden = false;
+        }
+    });
+</script>
+</html>

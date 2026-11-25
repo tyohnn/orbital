@@ -1,0 +1,28 @@
+# MCP 의 인가 한 바퀴 테스트가 쓰는 스캐폴드. 앱(server.js · db/)은 `fixtures/todo` 의 것을 그대로 쓰고 이 파일만 덮는다.
+# 앱에는 MCP 의 자리(/mcp)와 동의 화면(/oauth/consent)이 있고 인가 코드는 없다. 인가는 레이어가 맡는다
+
+[[service]]
+name = "web"
+kind = "server"
+build = "node --check server.js"
+start = "node server.js"
+path = "/"
+roles = ["member"]
+
+[database]
+schemas = ["todo"]
+migrations = "db/migrations"
+roles = ["member"]
+seed = "db/seed"
+
+[secrets]
+generated = ["SESSION_KEY"]
+
+[auth]
+methods = ["email_link"]
+login_path = "/login"
+
+[auth.mcp]
+service = "web"
+path = "/mcp"
+consent_path = "/oauth/consent"

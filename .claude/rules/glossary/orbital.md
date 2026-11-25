@@ -23,7 +23,20 @@ paths:
 | 권한 검사 | 실제 DB 가 선언과 권한 표에 정확히 맞는지 보는 일. 승격의 관문 | `Snapshot`, `Finding`, `check::judge` |
 | 토큰 | 에이전트의 작업 한 번 동안의 권한. 인스턴스 하나, 미리보기까지 | `Token`, `Capability`, `scope::judge` |
 | 예행연습 | 운영 DB 의 사본에 마이그레이션을 미리 돌리는 일. 숫자만 돌아온다 | `orbital-pg` |
-| 서명된 신원 | router 가 로그인을 확인해 서명한 것. 행 단위 규칙은 이것만 읽는다 | `orbital-pg` |
+| 서명된 신원 | router 가 세션을 확인해 서명한 것(`v2`: 사람 · 세션 · 업무 역할). 요청마다 60초짜리로 앱에 싣는다. 행 단위 규칙은 이것만 읽는다 | `orbital-pg::identity`, `Claims` |
+| 역할 제한 정책 | `[auth]` 를 선언한 인스턴스의 표마다 레이어가 두는 제한하는 정책. 연결의 업무 역할이 신원에 없으면 어떤 행도 내주지 않는다 | `Step::SetRolePolicy`, `orbital.granted()`, `ROLE_POLICY` |
+| router | 미리보기 · 운영마다 하나가 포트 하나를 듣고, 요청을 서비스로 가르고, 세션을 확인해 신원을 싣는 것. `/_orbital/` 은 직접 답한다 | `orbital-router`, `auth::route` |
+| 사용자 | 인스턴스의 앱에 로그인하는 사람. 인스턴스의 database 안 `orbital_auth` 에 있다. 씨앗 사용자는 미리보기에만 있다 | `SessionUser`, `User`, `SeedUser` |
+| 초대 | 그 이메일이 들어올 수 있게 하고 처음 가질 업무 역할을 정한 것. 14일 동안 받아들여진다 | `AuthStore::invite`, `judge_invitation` |
+| 로그인 링크 | 메일로 가는 한 번 쓰는 주소. 15분, 요청한 브라우저에서만 열린다. 같은 이메일로는 1분에 하나 | `AuthStore::request_link` · `enter`, `judge_link` |
+| 세션 | 로그인한 브라우저의 쿠키(`__Host-orbital-session`)가 가리키는 것. 거두거나 사용자를 빼면 다음 요청부터 없는 것이다 | `AuthStore::session`, `judge_session` |
+| 인가 서버 · 자원 서버 | MCP 의 인가에서 Orbital Auth 가 토큰을 내는 쪽(발급자는 router 의 주소), router 가 MCP 주소에서 토큰을 확인하는 쪽 | `orbital_core::oauth`, `orbital_router::oauth` |
+| 승인(grant) | 사용자가 클라이언트 하나에 준 허락. 코드와 토큰은 승인에 딸리고, 승인을 거두면 함께 끊긴다 | `oauth_grant`, `AuthStore::decide` · `revoke_grant` |
+| 인가 코드 · access 토큰 · refresh 토큰 | 5분 한 번 · 1시간 · 30일(쓸 때마다 간다). 해시로만 둔다 | `oauth_code`, `oauth_token`, `judge_code` · `judge_token` |
+| metadata 문서 | `https` 주소를 `client_id` 로 쓰는 클라이언트가 자신을 밝힌 문서. 받아 와서 그 답의 `max-age` 만큼(5분에서 하루 사이) 기억한다 | `DocumentFetcher`, `judge_document`, `document_lifetime` |
+| 인증 역할 | `orbital_auth` 의 표만 읽고 쓰는 Postgres 역할. 앱의 스키마에는 닿지 못한다 | `Names::auth` |
+| 인증의 주인 | `orbital_auth` 의 표와 `orbital.me` · `orbital.users` 뷰의 주인. 로그인하지 못하고 아무도 이 역할이 되지 못하며 앱의 표에 닿지 못한다 | `Names::auth_owner` |
+| 동적 등록의 한도 | 인스턴스마다 1분에 열 번, 살아 있는 동적 클라이언트 200개. 한 번도 승인받지 못한 것은 하루 뒤에 지운다 | `registration_wait`, `AuthStore::register_dynamic` |
 | 스캐폴드 | 팩토리가 올린 앱의 원본. 버전(태그)이 있고 인스턴스가 그 하나에서 갈라진다 | `receive_scaffold`, `SourceStore::create` |
 | 묶음 | 코드를 주고받는 git bundle. 에이전트가 받아 가서 고친 뒤 올린다 | `SourceStore::bundle` · `receive` |
 | release | commit 하나와 거기서 읽은 선언 · 권한 표 · 마이그레이션. 식별자가 commit 에 묶인다 | `ReleaseId`, `Assembled`, `release_id` |

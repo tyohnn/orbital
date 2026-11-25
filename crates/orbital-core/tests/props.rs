@@ -6,9 +6,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use orbital_core::access::{Access, Grant, Privilege, RawAccess, Reach};
 use orbital_core::check::{
-    Finding, Membership, RoleState, Snapshot, TableState, judge as judge_database,
+    Finding, Membership, RolePolicy, RoleState, Snapshot, TableState, judge as judge_database,
 };
-use orbital_core::manifest::{Database, Manifest, Service, ServiceKind, ValidManifest};
+use orbital_core::manifest::{
+    Auth, Database, Manifest, Service, ServiceAuth, ServiceKind, Signup, ValidManifest,
+};
 use orbital_core::name::{Ident, InstanceId, TableRef};
 use orbital_core::plan::{Names, Step, grants, provision};
 use orbital_core::scope::{
@@ -35,6 +37,11 @@ fn names() -> Names {
 
 /// 서비스 둘이 역할의 부분집합을 쓰는 선언.
 fn manifest(api: &[bool; 3], worker: &[bool; 3]) -> ValidManifest {
+    manifest_with(api, worker, false)
+}
+
+/// `auth` 이면 로그인을 레이어에 맡긴다(`[auth]`).
+fn manifest_with(api: &[bool; 3], worker: &[bool; 3], auth: bool) -> ValidManifest {
     let pick = |mask: &[bool; 3]| {
         ROLES
             .iter()
@@ -51,6 +58,7 @@ fn manifest(api: &[bool; 3], worker: &[bool; 3]) -> ValidManifest {
         output: None,
         path: path.to_owned(),
         roles: pick(mask),
+        auth: ServiceAuth::Optional,
     };
     Manifest {
         services: vec![
@@ -62,6 +70,14 @@ fn manifest(api: &[bool; 3], worker: &[bool; 3]) -> ValidManifest {
             roles: ROLES.iter().map(|role| ident(role)).collect(),
             ..Database::default()
         },
+        auth: auth.then(|| Auth {
+            methods: vec!["email_link".to_owned()],
+            login_path: "/api/login".to_owned(),
+            signup: Signup::Invite,
+            default_roles: Vec::new(),
+            directory: Vec::new(),
+            mcp: None,
+        }),
         ..Manifest::default()
     }
     .check()
@@ -128,6 +144,10 @@ fn applied(names: &Names, manifest: &ValidManifest, access: &Access) -> Snapshot
             _ => {}
         }
     }
+    // `[auth]` 를 선언했으면 레이어가 `orbital_auth` 를 둔다(`Admin::install_auth`)
+    if manifest.get().auth.is_some() {
+        snapshot.schemas.push("orbital_auth".to_owned());
+    }
     for table in tables() {
         snapshot.tables.push(TableState {
             schema: table.schema.to_string(),
@@ -135,10 +155,34 @@ fn applied(names: &Names, manifest: &ValidManifest, access: &Access) -> Snapshot
             owner: names.owner(),
             rls: true,
             privileges: BTreeMap::new(),
+            role_policy: None,
         });
     }
     for step in grants(names, manifest, access, &tables()) {
         match step {
+            // Postgres 가 정책을 읽어 줄 때의 모양이다(`pg_get_expr`). 구현의 상수를 부르지 않고 그대로 적는다
+            Step::SetRolePolicy { table } => {
+                let state = snapshot
+                    .tables
+                    .iter_mut()
+                    .find(|state| state.table == table.table.as_str())
+                    .unwrap();
+                state.role_policy = Some(RolePolicy {
+                    restrictive: true,
+                    command: "*".to_owned(),
+                    roles: vec!["public".to_owned()],
+                    using: Some("( SELECT orbital.granted() AS granted)".to_owned()),
+                    check: Some("( SELECT orbital.granted() AS granted)".to_owned()),
+                });
+            }
+            Step::DropRolePolicy { table } => {
+                let state = snapshot
+                    .tables
+                    .iter_mut()
+                    .find(|state| state.table == table.table.as_str())
+                    .unwrap();
+                state.role_policy = None;
+            }
             Step::RevokeTable { table, role } => {
                 let state = snapshot
                     .tables
@@ -251,6 +295,34 @@ proptest! {
         snapshot.tables[table].rls = false;
         prop_assert_eq!(judge_database(&names, &manifest, &access, &snapshot).len(), 1);
     }
+
+    #[test]
+    fn 어떤_선언이든_계획대로_세운_db_는_역할_제한_정책까지_넣어_권한_검사를_통과한다(
+        api in mask(), worker in mask(), words in words(), auth in any::<bool>()
+    ) {
+        let (names, manifest) = (names(), manifest_with(&api, &worker, auth));
+        let access = access(&words, &manifest);
+        let snapshot = applied(&names, &manifest, &access);
+        prop_assert_eq!(judge_database(&names, &manifest, &access, &snapshot), vec![]);
+        // 정책은 auth 를 선언했을 때만, 권한 표의 표마다 있다(생성기의 권한 표는 모든 표의 행 단위 규칙을 켠다)
+        let guarded = snapshot.tables.iter().filter(|state| state.role_policy.is_some()).count();
+        prop_assert_eq!(guarded, if auth { TABLES.len() } else { 0 });
+    }
+
+    #[test]
+    fn 통과한_db_에서_역할_제한_정책을_하나라도_지우면_검사가_실패한다(
+        api in mask(), worker in mask(), words in words(), table in 0usize..4
+    ) {
+        let (names, manifest) = (names(), manifest_with(&api, &worker, true));
+        let access = access(&words, &manifest);
+        let mut snapshot = applied(&names, &manifest, &access);
+        snapshot.tables[table].role_policy = None;
+        let (schema, name) = TABLES[table];
+        prop_assert_eq!(
+            judge_database(&names, &manifest, &access, &snapshot),
+            vec![Finding::RolePolicyMissing { table: TableRef { schema: ident(schema), table: ident(name) } }]
+        );
+    }
 }
 
 fn capability() -> impl Strategy<Value = Capability> {
@@ -354,6 +426,49 @@ proptest! {
     }
 }
 
+/// 로그인 뒤에 돌아갈 곳의 후보. 브라우저가 주소를 다르게 읽게 만드는 글자(`/` · `\` · `:` · 제어 문자 · 공백)가 자주 나오게 좁힌다.
+fn next() -> impl Strategy<Value = String> {
+    const PIECES: [&str; 22] = [
+        "/",
+        "/",
+        "//",
+        "\\",
+        ":",
+        ".",
+        "..",
+        "@",
+        "a",
+        "evil.example",
+        "https:",
+        "javascript:",
+        "?",
+        "#",
+        "%2F",
+        "\t",
+        "\n",
+        "\r",
+        "\u{0}",
+        " ",
+        "\u{7f}",
+        "\u{3000}",
+    ];
+    proptest::collection::vec(0usize..PIECES.len(), 0..8)
+        .prop_map(|picks| picks.into_iter().map(|index| PIECES[index]).collect())
+}
+
+proptest! {
+    #[test]
+    fn 어떤_next_를_넣어도_돌아갈_곳은_이_주소_안이다(next in next()) {
+        // 오라클은 브라우저와 같은 규칙(WHATWG URL)으로 읽는 `url` 이다. 이 주소에서 돌아갈 곳을 읽었을 때 주소가 바뀌지 않아야 한다
+        let here = url::Url::parse("https://app.example/inbox/").unwrap();
+        let safe = orbital_core::auth::safe_next(&next);
+        let resolved = here.join(&safe).unwrap();
+        prop_assert_eq!(resolved.origin(), here.origin(), "{:?} → {:?}", next, safe);
+        // 바꾼다면 첫 화면으로만 바꾼다. 받은 것은 고치지 않고 그대로 돌려준다
+        prop_assert!(safe == "/" || safe == next, "{:?} → {:?}", next, safe);
+    }
+}
+
 #[test]
 fn 권한의_말은_닿는_범위로_읽힌다() {
     // 생성기가 쓰는 다섯 말이 구현이 받는 말과 같은지 붙잡아 둔다
@@ -372,6 +487,92 @@ fn 권한의_말은_닿는_범위로_읽힌다() {
             (Reach::Own, Reach::Own)
         ]
     );
+}
+
+mod oauth {
+    use orbital_core::oauth::{
+        Authorize, AuthorizeQuery, KnownClient, Stop, judge_authorize, same_redirect,
+    };
+    use proptest::prelude::*;
+    use sha2::{Digest, Sha256};
+
+    const RESOURCE: &str = "http://127.0.0.1:4100/mcp";
+
+    /// 모양이 맞는 challenge 를 만든다(S256 의 43자). redirect 의 판정에만 쓴다.
+    fn challenge_of(verifier: &str) -> String {
+        let digest = Sha256::digest(verifier.as_bytes());
+        let table: Vec<char> = ('A'..='Z')
+            .chain('a'..='z')
+            .chain('0'..='9')
+            .chain(['-', '_'])
+            .collect();
+        let mut bits = String::new();
+        for byte in digest {
+            bits.push_str(&format!("{byte:08b}"));
+        }
+        bits.as_bytes()
+            .chunks(6)
+            .map(|chunk| {
+                let mut six = String::from_utf8(chunk.to_vec()).unwrap();
+                while six.len() < 6 {
+                    six.push('0');
+                }
+                table[usize::from_str_radix(&six, 2).unwrap()]
+            })
+            .collect()
+    }
+
+    fn redirect() -> impl Strategy<Value = String> {
+        "https://[a-z]{1,6}\\.example(:[0-9]{2,4})?/[a-z/]{0,10}(\\?[a-z]=[0-9])?"
+    }
+
+    /// 등록된 redirect 를 한 글자 고친다: 넣기 · 빼기 · 바꾸기. 바꾼 글자가 같으면 그대로일 수도 있다.
+    fn edit() -> impl Strategy<Value = (usize, u8, char)> {
+        (
+            0usize..64,
+            0u8..3,
+            prop::sample::select(vec!['a', 'A', '/', ':', '.', '%', '?', '#', ' ', '0']),
+        )
+    }
+
+    fn apply(text: &str, (at, op, c): (usize, u8, char)) -> String {
+        let mut chars: Vec<char> = text.chars().collect();
+        let at = at % (chars.len() + 1);
+        match op {
+            0 => chars.insert(at, c),
+            1 if at < chars.len() => {
+                chars.remove(at);
+            }
+            _ if at < chars.len() => chars[at] = c,
+            _ => chars.push(c),
+        }
+        chars.into_iter().collect()
+    }
+
+    proptest! {
+        #[test]
+        fn 어떤_redirect_든_등록된_것과_한_글자라도_다르면_받지_않는다(registered in redirect(), change in edit()) {
+            let given = apply(&registered, change);
+            let client = KnownClient { id: "c_1".to_owned(), redirect_uris: vec![registered.clone()] };
+            let query = AuthorizeQuery {
+                response_type: Some("code".to_owned()),
+                client_id: Some("c_1".to_owned()),
+                redirect_uri: Some(given.clone()),
+                code_challenge: Some(challenge_of(&"v".repeat(43))),
+                code_challenge_method: Some("S256".to_owned()),
+                resource: Some(RESOURCE.to_owned()),
+                scope: None,
+                state: None,
+            };
+            let verdict = judge_authorize(&query, Some(&client), RESOURCE, "http://127.0.0.1:4100");
+            prop_assert_eq!(same_redirect(&client.redirect_uris, &given), given == registered);
+            if given == registered {
+                prop_assert!(matches!(verdict, Authorize::Accept { .. }), "{:?}", verdict);
+            } else {
+                prop_assert_eq!(verdict, Authorize::Stop { reason: Stop::BadRedirect });
+            }
+        }
+    }
 }
 
 mod release {

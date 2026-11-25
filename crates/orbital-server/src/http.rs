@@ -132,7 +132,26 @@ struct OfRelease {
 
 #[derive(Deserialize)]
 struct NewIdentity {
-    subject: String,
+    /// 미리보기의 씨앗 사용자의 식별자.
+    user: String,
+}
+
+#[derive(Deserialize)]
+struct NewOauthClient {
+    name: String,
+    redirect_uris: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct NewRoles {
+    roles: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct NewUser {
+    email: String,
+    #[serde(default)]
+    roles: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -190,11 +209,12 @@ fn with_token(
             layer.stop_preview(&instance)?;
             Ok(ok(json!({ "stopped": true })))
         }
+        // 미리보기의 씨앗 사용자로 세션을 만들어, 요청에 그대로 붙일 `Cookie` 머리말의 값을 돌려준다
         ("POST", ["previews", "identities"]) => {
             allow(Action::PreviewDatabase)?;
             let request: NewIdentity = parse(body)?;
             Ok(ok(
-                json!({ "identity": layer.preview_identity(&instance, &request.subject)? }),
+                json!({ "cookie": layer.preview_session(&instance, &request.user)? }),
             ))
         }
         ("POST", ["rehearsals"]) => {
@@ -210,9 +230,7 @@ fn with_token(
         }
         // 운영을 바꾸는 길을 토큰으로 두드리면 core 가 「service key 로만」이라고 답한다
         ("POST", ["promotions"]) => allow(Action::Promote).map(|()| ok(json!({}))),
-        ("POST", ["production", "identities"]) => {
-            allow(Action::ProductionDatabase).map(|()| ok(json!({})))
-        }
+        // 사용자를 초대하는 길(`users`)은 service key 에만 있다. 토큰에는 없는 길이라 없는 것으로 답한다
         _ => Err(Failure::NotFound),
     }
 }
@@ -266,11 +284,32 @@ fn with_service_key(
                 ("GET", ["production"]) => {
                     Ok(ok(json!(layer.production(&organization, &instance)?)))
                 }
-                ("POST", ["production", "identities"]) => {
-                    let request: NewIdentity = parse(body)?;
-                    Ok(ok(
-                        json!({ "identity": layer.production_identity(&organization, &instance, &request.subject)? }),
-                    ))
+                ("POST", ["oauth-clients"]) => {
+                    let request: NewOauthClient = parse(body)?;
+                    let client_id = layer.register_oauth_client(
+                        &organization,
+                        &instance,
+                        &request.name,
+                        &request.redirect_uris,
+                    )?;
+                    Ok(ok(json!({ "client_id": client_id })))
+                }
+                ("GET", ["users"]) => Ok(ok(
+                    json!({ "users": layer.users(&organization, &instance)? }),
+                )),
+                ("POST", ["users"]) => {
+                    let request: NewUser = parse(body)?;
+                    layer.invite(&organization, &instance, &request.email, &request.roles)?;
+                    Ok(ok(json!({ "invited": true })))
+                }
+                ("PUT", ["users", user, "roles"]) => {
+                    let request: NewRoles = parse(body)?;
+                    layer.set_roles(&organization, &instance, user, &request.roles)?;
+                    Ok(ok(json!({ "roles": request.roles })))
+                }
+                ("DELETE", ["users", user]) => {
+                    layer.remove_user(&organization, &instance, user)?;
+                    Ok(ok(json!({ "removed": true })))
                 }
                 ("DELETE", []) => {
                     layer.destroy_instance(&organization, &instance)?;

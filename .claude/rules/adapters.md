@@ -2,6 +2,7 @@
 paths:
   - "crates/orbital-pg/**"
   - "crates/orbital-proxy/**"
+  - "crates/orbital-router/**"
   - "crates/orbital-source/**"
   - "crates/orbital-run/**"
 ---

@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use orbital_router::Outbox;
 use orbital_run::LocalRunner;
 use orbital_server::http::handle;
-use orbital_server::layer::{Layer, Options};
+use orbital_server::layer::{Layer, OUTBOX, Options};
 use serde_json::{Value, json};
 
 const FACTORY: &str = "sk_test_factory";
@@ -270,11 +271,11 @@ fn url(report: &Value) -> String {
     report["services"][0]["url"].as_str().unwrap().to_owned()
 }
 
-/// 띄운 앱에 요청한다. 신원은 router 가 실을 자리에 테스트가 싣는다.
-fn app(method: &str, url: &str, identity: Option<&str>, body: &str) -> (u16, Value) {
+/// 띄운 앱에 router 를 거쳐 요청한다. `cookie` 는 세션 쿠키(`Cookie` 머리말의 값)다. 신원은 router 가 그 세션을 보고 싣는다.
+fn app(method: &str, url: &str, cookie: Option<&str>, body: &str) -> (u16, Value) {
     let mut request = ureq::request(method, url);
-    if let Some(identity) = identity {
-        request = request.set("x-orbital-identity", identity);
+    if let Some(cookie) = cookie {
+        request = request.set("Cookie", cookie);
     }
     let response = if body.is_empty() {
         request.call()
@@ -291,6 +292,38 @@ fn app(method: &str, url: &str, identity: Option<&str>, body: &str) -> (u16, Val
         }
         Err(error) => panic!("{url}: {error}"),
     }
+}
+
+/// 답의 `Set-Cookie` 가운데 이 이름의 것을 `이름=값` 으로 돌려준다.
+fn cookie_pair(response: &ureq::Response, name: &str) -> String {
+    response
+        .all("set-cookie")
+        .into_iter()
+        .find(|cookie| cookie.starts_with(&format!("{name}=")))
+        .and_then(|cookie| cookie.split(';').next())
+        .unwrap_or_else(|| panic!("`{name}` 쿠키가 없습니다"))
+        .to_owned()
+}
+
+/// 운영의 사람이 하듯이 들어온다. 로그인 링크를 요청하고, 메일함에서 링크를 꺼내 같은 브라우저로 연다. 세션 쿠키를 돌려준다.
+fn sign_in(bench: &Bench, origin: &str, email: &str) -> String {
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let asked = agent
+        .post(&format!("{origin}/_orbital/auth/email-link"))
+        .set("Origin", origin)
+        .send_json(json!({ "email": email }))
+        .unwrap();
+    assert_eq!(asked.status(), 202);
+    let browser = cookie_pair(&asked, "__Host-orbital-browser");
+    let link = Outbox::read(&bench.scratch.path("home").join(OUTBOX))
+        .into_iter()
+        .rev()
+        .find(|mail| mail.to == email)
+        .expect("메일함에 링크가 없습니다")
+        .link;
+    let opened = agent.get(&link).set("Cookie", &browser).call().unwrap();
+    assert_eq!(opened.status(), 302);
+    cookie_pair(&opened, "__Host-orbital-session")
 }
 
 fn titles(cards: &Value) -> Vec<String> {
@@ -327,13 +360,13 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
         200
     );
 
-    // 씨앗 데이터의 사람으로 요청하면 자기 카드만 보인다. 신원이 없으면 아무것도 보이지 않는다
+    // 씨앗 사용자로 들어가 요청하면 자기 카드만 보인다. 세션이 없으면 아무것도 보이지 않는다
     let (_, identity) = bench.post(
         &path("previews/identities"),
         &token,
-        json!({ "subject": "u1" }),
+        json!({ "user": "u1" }),
     );
-    let u1 = identity["identity"].as_str().unwrap().to_owned();
+    let u1 = identity["cookie"].as_str().unwrap().to_owned();
     let (status, cards) = app("GET", &format!("{preview_url}/cards"), Some(&u1), "");
     assert_eq!(status, 200, "{cards}");
     assert_eq!(titles(&cards), vec!["씨앗 카드 하나", "씨앗 카드 둘"]);
@@ -416,13 +449,15 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
         (200, Value::Null)
     );
 
-    // 운영에는 씨앗 데이터가 없다. 미리보기의 신원은 운영에서 읽히지 않는다
-    let (_, identity) = bench.post(
-        &path("production/identities"),
+    // 운영에는 씨앗 데이터도 씨앗 사용자도 없다. 미리보기의 세션은 운영에서 읽히지 않는다.
+    // 운영의 사람은 팩토리가 초대하고, 링크로 들어온다
+    let (status, body) = bench.post(
+        &path("users"),
         FACTORY,
-        json!({ "subject": "u9" }),
+        json!({ "email": "u9@example.test", "roles": ["member"] }),
     );
-    let u9 = identity["identity"].as_str().unwrap().to_owned();
+    assert_eq!(status, 200, "{body}");
+    let u9 = sign_in(&bench, &live, "u9@example.test");
     assert_eq!(
         app("GET", &format!("{live}/cards"), Some(&u9), "").1,
         json!([])
@@ -443,17 +478,19 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
         titles(&app("GET", &format!("{live}/cards"), Some(&u9), "").1),
         vec!["첫 일", "첫 일"]
     );
-    // 운영의 신원에 서명하는 길은 토큰에게 없다
-    assert_eq!(
-        bench
-            .post(
-                &path("production/identities"),
-                &token,
-                json!({ "subject": "u9" })
-            )
-            .0,
-        403
-    );
+    // 신원을 밖으로 내주는 길은 없다. 팩토리에게도, 에이전트에게도
+    for bearer in [FACTORY, token.as_str()] {
+        assert_eq!(
+            bench
+                .post(
+                    &path("production/identities"),
+                    bearer,
+                    json!({ "subject": "u9" })
+                )
+                .0,
+            404
+        );
+    }
 
     // ---- 고치기: 에이전트가 코드를 받아 열을 더하고 올린다 ----
     let work = bench.clone(&instance, &token, "work");
@@ -499,7 +536,14 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
         (rehearsal["needed"].as_bool(), rehearsal["passed"].as_bool()),
         (Some(true), Some(true))
     );
-    assert_eq!(rehearsal["tables"], json!([["todo.card", 2, 2]]));
+    // 사용자의 표(orbital_auth)도 사본에 함께 있다. 앱의 표만 본다
+    let card = rehearsal["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row[0] == "todo.card")
+        .cloned();
+    assert_eq!(card, Some(json!(["todo.card", 2, 2])));
     assert!(
         !rehearsal.to_string().contains("첫 일"),
         "예행연습의 결과에 행의 내용이 있습니다"
@@ -617,12 +661,13 @@ fn 운영에서만_뜨지_않는_release_는_앞의_release_와_앞의_db_로_�
     // 첫 release 가 운영에 서고 사람이 카드를 하나 적는다
     let (first, status, production) = ship(&bench);
     assert_eq!(status, 200, "{production}");
-    let (_, identity) = bench.post(
-        &path("production/identities"),
+    let (status, body) = bench.post(
+        &path("users"),
         FACTORY,
-        json!({ "subject": "u9" }),
+        json!({ "email": "u9@example.test", "roles": ["member"] }),
     );
-    let u9 = identity["identity"].as_str().unwrap().to_owned();
+    assert_eq!(status, 200, "{body}");
+    let u9 = sign_in(&bench, &url(&production), "u9@example.test");
     assert_eq!(
         app(
             "POST",
@@ -749,7 +794,9 @@ fn 토큰은_발급받은_인스턴스에서_받은_능력만큼만_쓴다() {
         404
     );
     // 서명이 틀리거나 없는 토큰
-    let forged = format!("{}00", &token[..token.len() - 2]);
+    // 끝 두 글자를 늘 다른 것으로 바꾼다(원래 끝이 `00` 이면 `00` 으로 바꿔도 같은 토큰이다)
+    let tail = if token.ends_with("00") { "11" } else { "00" };
+    let forged = format!("{}{tail}", &token[..token.len() - 2]);
     assert_eq!(
         bench
             .call(

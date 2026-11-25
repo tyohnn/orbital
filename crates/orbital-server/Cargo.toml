@@ -15,6 +15,7 @@ path = "src/main.rs"
 orbital-core = { path = "../orbital-core" }
 orbital-pg = { path = "../orbital-pg" }
 orbital-proxy = { path = "../orbital-proxy" }
+orbital-router = { path = "../orbital-router" }
 orbital-run = { path = "../orbital-run" }
 orbital-source = { path = "../orbital-source" }
 hmac.workspace = true

@@ -1,0 +1,19 @@
+{
+    "name": "factory-todo",
+    "version": "0.1.0",
+    "description": "내 할 일 앱을 에이전트가 고치고, 내가 승인한 것만 운영에 올라가요.",
+    "author": { "name": "할 일 카드 공방" },
+    "extensions": {
+        "com.openai": {
+            "interface": {
+                "displayName": "할 일 카드 공방",
+                "shortDescription": "내 할 일 앱을 고치고 승인해 올려요.",
+                "defaultPrompt": ["할 일 카드에 마감일 칸을 더해 줘", "운영에 뭐가 올라가 있는지 보여 줘", "승인 기다리는 것 보여 줘"]
+            }
+        },
+        "os-playground": {
+            "displayName": "할 일 카드 공방",
+            "description": "내 할 일 앱을 에이전트가 고치고, 내가 승인한 것만 운영에 올라가요."
+        }
+    }
+}

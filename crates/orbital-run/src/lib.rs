@@ -389,7 +389,15 @@ mod tests {
 
     #[test]
     fn 열리지_않는_포트는_기다리다_아니라고_답한다() {
-        let port = free_port().unwrap();
+        // 포트를 잡아 두되 듣지는 않는다(bind 만 하고 listen 하지 않는다). 잡아 둔 동안은 다른 프로세스가 그 포트를 열지 못하고,
+        // 듣지 않으니 연결은 거절된다. 빈 포트를 받았다 놓으면 그 사이에 다른 프로세스가 열 수 있어 겨루게 된다
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket
+            .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        let port = socket.local_addr().unwrap().as_socket().unwrap().port();
         assert!(!wait_for_port(port, Duration::from_millis(200)));
+        drop(socket);
     }
 }

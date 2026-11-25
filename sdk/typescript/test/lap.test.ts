@@ -62,6 +62,35 @@ async function freePort(): Promise<number>
     return port;
 }
 
+/** 답의 `Set-Cookie` 가운데 이 이름의 것을 `이름=값` 으로 돌려준다. */
+function cookiePair(response: Response, name: string): string
+{
+    return response.headers.getSetCookie().find((cookie) => cookie.startsWith(`${name}=`))?.split(";")[0] ?? "";
+}
+
+/**
+ * 운영의 사람이 하듯이 들어온다. 로그인 링크를 요청하고, 레이어의 개발용 메일함(`ORBITAL_HOME/outbox.jsonl`)에서
+ * 링크를 꺼내 같은 브라우저로 연다. 세션 쿠키(`이름=값`)를 돌려준다.
+ */
+async function signIn(live: string, email: string): Promise<string>
+{
+    const asked = await fetch(`${live}/_orbital/auth/email-link`, {
+        method: "POST",
+        headers: { origin: live, "content-type": "application/json" },
+        body: JSON.stringify({ email }),
+    });
+    assert.equal(asked.status, 202);
+    const browser = cookiePair(asked, "__Host-orbital-browser");
+    const mails = readFileSync(join(scratch, "home", "outbox.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { to: string; link: string });
+    const link = mails.filter((mail) => mail.to === email).at(-1)?.link ?? "";
+    const opened = await fetch(link, { headers: { cookie: browser }, redirect: "manual" });
+    assert.equal(opened.status, 302);
+    return cookiePair(opened, "__Host-orbital-session");
+}
+
 async function rejection(work: Promise<unknown>): Promise<OrbitalError>
 {
     const caught: unknown = await work.then(
@@ -201,21 +230,46 @@ test("팩토리의 서버가 인스턴스를 세워 토큰을 내고 에이전�
     assert.equal(await orbital.releases.pending(instance.id), null);
     assert.equal((await orbital.production.get(instance.id))?.release, release);
 
-    // 운영의 앱이 돌고, 서명한 신원으로 자기 카드만 읽고 쓴다
+    // 운영의 앱이 돈다. 팩토리가 초대한 사람이 링크로 들어와 자기 카드만 읽고 쓴다
     const health = (await (await fetch(`${live}/health`)).json()) as { version: number };
     assert.equal(health.version, 2);
-    const identity = await orbital.production.identity({ instance: instance.id, subject: "u9" });
+    await orbital.users.invite({ instance: instance.id, email: "u9@example.test", roles: ["member"] });
+    await orbital.users.invite({ instance: instance.id, email: "u8@example.test", roles: ["member"] });
+    const u9 = await signIn(live, "u9@example.test");
     const written = await fetch(`${live}/cards`, {
         method: "POST",
-        headers: { "x-orbital-identity": identity },
+        headers: { cookie: u9 },
         body: "첫 일",
     });
     assert.equal(written.status, 201);
-    const other = await orbital.production.identity({ instance: instance.id, subject: "u8" });
-    const cards = async (who: string): Promise<unknown[]> =>
-        (await (await fetch(`${live}/cards`, { headers: { "x-orbital-identity": who } })).json()) as unknown[];
-    assert.equal((await cards(identity)).length, 1);
-    assert.equal((await cards(other)).length, 0);
+    const u8 = await signIn(live, "u8@example.test");
+    const cards = async (cookie: string): Promise<unknown[]> =>
+        (await (await fetch(`${live}/cards`, { headers: { cookie } })).json()) as unknown[];
+    assert.equal((await cards(u9)).length, 1);
+    assert.equal((await cards(u8)).length, 0);
+    // 팩토리의 관리 화면: 사용자 목록, 업무 역할 바꾸기, 빼기
+    const listed = await orbital.users.list(instance.id);
+    assert.deepEqual(
+        listed.map((user) => [user.email, user.roles, user.disabled]).sort(),
+        [["u8@example.test", ["member"], false], ["u9@example.test", ["member"], false]],
+    );
+    assert.ok(listed.every((user) => typeof user.lastSignedInAt === "number" && user.id.startsWith("u_")));
+    const u8id = listed.find((user) => user.email === "u8@example.test")?.id ?? "";
+    await orbital.users.setRoles({ instance: instance.id, user: u8id, roles: [] });
+    assert.deepEqual((await orbital.users.list(instance.id)).find((user) => user.id === u8id)?.roles, []);
+    const undeclared = await rejection(orbital.users.setRoles({ instance: instance.id, user: u8id, roles: ["auditor"] }));
+    assert.deepEqual([undeclared.status, undeclared.code], [422, "problems"]);
+    await orbital.users.remove({ instance: instance.id, user: u8id });
+    assert.equal((await fetch(`${live}/_orbital/auth/me`, { headers: { cookie: u8 } })).status, 401);
+    assert.equal((await orbital.users.list(instance.id)).find((user) => user.id === u8id)?.disabled, true);
+
+    // MCP 를 선언하지 않은 앱에는 OAuth 클라이언트를 미리 등록하지 못하고 까닭이 돌아온다
+    const noMcp = await rejection(orbital.oauthClients.register({ instance: instance.id, name: "팩토리의 앱", redirectUris: ["https://factory.example/callback"] }));
+    assert.deepEqual([noMcp.status, noMcp.code], [422, "problems"]);
+    assert.match(noMcp.details.join("\n"), /auth\.mcp/);
+
+    // 밖에서 신원 머리말을 실어 보내도 앱에는 닿지 않는다
+    assert.equal((await (await fetch(`${live}/cards`, { headers: { "x-orbital-identity": "v1.00.00" } })).json() as unknown[]).length, 0);
 });
 
 test("다른 팩토리의 service key 로는 인스턴스가 없는 것으로 보인다", { skip }, async () =>
@@ -229,6 +283,11 @@ test("다른 팩토리의 service key 로는 인스턴스가 없는 것으로 �
         () => stranger.releases.pending(instance.id),
         () => stranger.sessions.open({ instance: instance.id, can: ["source"] }),
         () => stranger.instances.destroy(instance.id),
+        () => stranger.users.invite({ instance: instance.id, email: "kim@example.test", roles: ["member"] }),
+        () => stranger.users.list(instance.id),
+        () => stranger.oauthClients.register({ instance: instance.id, name: "x", redirectUris: ["https://factory.example/callback"] }),
+        () => stranger.users.setRoles({ instance: instance.id, user: "u_aaaaaaaaaaaaaaaaaaaa", roles: [] }),
+        () => stranger.users.remove({ instance: instance.id, user: "u_aaaaaaaaaaaaaaaaaaaa" }),
     ];
     for (const attempt of attempts)
     {

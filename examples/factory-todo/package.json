@@ -1,0 +1,22 @@
+{
+    "name": "@harmony/factory-todo",
+    "version": "0.0.0",
+    "private": true,
+    "description": "팩토리의 본보기. 에이전트 플랫폼의 앱(MCP 서버 + 스킬)으로 서서 Orbital 의 service key 를 저만 갖는다",
+    "type": "module",
+    "scripts": {
+        "start": "node src/main.ts",
+        "pack": "node src/pack.ts",
+        "typecheck": "tsc --noEmit",
+        "test": "node --test test/*.test.ts"
+    },
+    "dependencies": {
+        "@harmony/orbital": "*",
+        "@modelcontextprotocol/server": "2.4.0"
+    },
+    "devDependencies": {
+        "@modelcontextprotocol/client": "2.4.0",
+        "@types/node": "26.6.9",
+        "typescript": "7.0.2"
+    }
+}

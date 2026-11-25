@@ -61,14 +61,16 @@ CREATE TABLE payroll.payslip (
 );
 ALTER TABLE payroll.payslip ENABLE ROW LEVEL SECURITY;
 CREATE POLICY own ON payroll.payslip FOR SELECT
-    USING (orbital.role() = 'employee' AND employee = (SELECT orbital.subject()));
+    USING ((SELECT orbital.role()) = 'employee' AND employee = (SELECT orbital.subject()));
 CREATE POLICY admin ON payroll.payslip
-    USING (orbital.role() = 'payroll_admin') WITH CHECK (orbital.role() = 'payroll_admin');
+    USING ((SELECT orbital.role()) = 'payroll_admin') WITH CHECK ((SELECT orbital.role()) = 'payroll_admin');
 INSERT INTO hr.department (name) VALUES ('인사'), ('재무');
 INSERT INTO payroll.payslip (employee, amount) VALUES ('emp_1', 100), ('emp_1', 110), ('emp_2', 200);
 "#;
 
 const KEY: &[u8] = b"test-signing-key-not-a-real-secret";
+/// 테스트의 신원에 싣는 업무 역할. 선언의 역할을 모두 싣는다(역할을 견주는 일은 `roles.rs` 가 잰다).
+const ROLES: [&str; 3] = ["employee", "manager", "payroll_admin"];
 const FAR_FUTURE: u64 = 4_000_000_000;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -116,15 +118,18 @@ impl Bench {
             .unwrap();
         let access = access(&manifest, ACCESS);
         admin.provision(&names, &manifest).unwrap();
-        admin.install_identity(&names, KEY).unwrap();
-        admin.migrate(&names, &[MIGRATION]).unwrap();
-        admin.grant(&names, &manifest, &access).unwrap();
-        Some(Self {
+        // 세우다가 깨져도 걷히도록, 여기부터는 다 지은 값 위에서 세운다(값이 떨어질 때 `Drop` 이 걷는다)
+        let mut bench = Self {
             admin,
             names,
             manifest,
             access,
-        })
+        };
+        let (admin, names, manifest) = (&mut bench.admin, &bench.names, &bench.manifest);
+        admin.install_identity(names, KEY).unwrap();
+        admin.migrate(names, &[MIGRATION]).unwrap();
+        admin.grant(names, manifest, &bench.access).unwrap();
+        Some(bench)
     }
 
     /// 서비스가 업무 역할로 들어간 연결.
@@ -154,7 +159,10 @@ impl Bench {
             KEY,
             &self.names,
             &Claims {
-                subject: subject.to_owned(),
+                subject: Some(subject.to_owned()),
+                roles: ROLES.iter().map(|role| (*role).to_owned()).collect(),
+                session: None,
+                client: None,
                 expires_at: FAR_FUTURE,
             },
         )
@@ -530,7 +538,10 @@ fn 서명이_없거나_틀린_신원으로는_어떤_행도_읽지_못한다() {
         b"another-key",
         &bench.names,
         &Claims {
-            subject: "emp_1".to_owned(),
+            subject: Some("emp_1".to_owned()),
+            roles: ROLES.iter().map(|role| (*role).to_owned()).collect(),
+            session: None,
+            client: None,
             expires_at: FAR_FUTURE,
         },
     );
@@ -563,7 +574,10 @@ fn 만료된_신원과_다른_인스턴스의_신원은_읽히지_않는다() {
         KEY,
         &bench.names,
         &Claims {
-            subject: "emp_1".to_owned(),
+            subject: Some("emp_1".to_owned()),
+            roles: ROLES.iter().map(|role| (*role).to_owned()).collect(),
+            session: None,
+            client: None,
             expires_at: 1,
         },
     );
@@ -577,7 +591,10 @@ fn 만료된_신원과_다른_인스턴스의_신원은_읽히지_않는다() {
         KEY,
         &elsewhere,
         &Claims {
-            subject: "emp_1".to_owned(),
+            subject: Some("emp_1".to_owned()),
+            roles: ROLES.iter().map(|role| (*role).to_owned()).collect(),
+            session: None,
+            client: None,
             expires_at: FAR_FUTURE,
         },
     );

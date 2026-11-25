@@ -49,9 +49,9 @@ const MIGRATION: &str = r#"
 CREATE TABLE payroll.payslip (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, employee text NOT NULL, amount int NOT NULL);
 ALTER TABLE payroll.payslip ENABLE ROW LEVEL SECURITY;
 CREATE POLICY own ON payroll.payslip FOR SELECT
-    USING (orbital.role() = 'employee' AND employee = (SELECT orbital.subject()));
+    USING ((SELECT orbital.role()) = 'employee' AND employee = (SELECT orbital.subject()));
 CREATE POLICY admin ON payroll.payslip
-    USING (orbital.role() = 'payroll_admin') WITH CHECK (orbital.role() = 'payroll_admin');
+    USING ((SELECT orbital.role()) = 'payroll_admin') WITH CHECK ((SELECT orbital.role()) = 'payroll_admin');
 INSERT INTO payroll.payslip (employee, amount) VALUES ('emp_1', 100), ('emp_1', 110), ('emp_2', 200);
 "#;
 
@@ -131,7 +131,10 @@ impl Bench {
             KEY,
             &self.names,
             &Claims {
-                subject: subject.to_owned(),
+                subject: Some(subject.to_owned()),
+                roles: vec!["employee".to_owned(), "payroll_admin".to_owned()],
+                session: None,
+                client: None,
                 expires_at: 4_000_000_000,
             },
         )

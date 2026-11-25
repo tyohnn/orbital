@@ -6,6 +6,7 @@
 use std::fmt;
 
 use orbital_core::access::{Access, RawAccess};
+use orbital_core::auth::{SeedUser, SeedUsers};
 use orbital_core::manifest::{Manifest, ValidManifest};
 use orbital_core::name::InstanceId;
 use orbital_core::release::ReleaseId;
@@ -15,6 +16,8 @@ use crate::{Commit, Error, SourceStore};
 
 pub const MANIFEST: &str = "orbital.toml";
 pub const ACCESS: &str = "db/access.toml";
+/// 미리보기의 씨앗 사용자. 선언의 `seed` 폴더와 상관없이 이 자리에서 읽는다.
+pub const SEED_USERS: &str = "db/seed/users.toml";
 
 /// 순서대로 돌릴 SQL 파일 하나.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +36,8 @@ pub struct Assembled {
     pub migrations: Vec<Script>,
     /// 미리보기 DB 에 넣을 가짜 데이터.
     pub seed: Vec<Script>,
+    /// 미리보기에 넣을 씨앗 사용자(`db/seed/users.toml`). 운영에는 들어가지 않는다.
+    pub seed_users: Vec<SeedUser>,
 }
 
 #[derive(Debug)]
@@ -179,6 +184,25 @@ pub fn assemble(
 
     let migrations = scripts(store, instance, commit, database.migrations.as_deref())?;
     let seed = scripts(store, instance, commit, database.seed.as_deref())?;
+    let seed_users = match text(store, instance, commit, SEED_USERS)? {
+        None => Vec::new(),
+        Some(users_text) => {
+            let raw: SeedUsers = toml::from_str(&users_text).map_err(|error| {
+                AssembleError::Problems(vec![format!(
+                    "`{SEED_USERS}` 을 읽지 못했습니다: {}",
+                    error.message()
+                )])
+            })?;
+            raw.check(&manifest).map_err(|problems| {
+                AssembleError::Problems(
+                    problems
+                        .iter()
+                        .map(|problem| format!("`{SEED_USERS}`: {problem}"))
+                        .collect(),
+                )
+            })?
+        }
+    };
     Ok(Assembled {
         release: release_id(instance, commit),
         commit: commit.clone(),
@@ -186,5 +210,6 @@ pub fn assemble(
         access,
         migrations,
         seed,
+        seed_users,
     })
 }

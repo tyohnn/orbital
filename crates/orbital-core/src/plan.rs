@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::access::{Access, Privilege, Reach};
+use crate::access::{Access, Privilege, Reach, Rls};
 use crate::manifest::ValidManifest;
 use crate::name::{Ident, InstanceId, TableRef};
 
@@ -57,6 +57,16 @@ impl Names {
     /// 서비스가 업무 역할로 들어갈 때의 로그인.
     pub fn login(&self, service: &Ident, role: &Ident) -> String {
         format!("{}_s_{service}_{role}", self.prefix())
+    }
+
+    /// Orbital Auth 의 역할. 레이어의 로그인 뒤쪽이 이 역할로 `orbital_auth` 의 표를 읽고 쓴다. 앱의 스키마에는 닿지 못한다.
+    pub fn auth(&self) -> String {
+        format!("{}_auth", self.prefix())
+    }
+
+    /// `orbital_auth` 의 표와 `orbital.me` · `orbital.users` 뷰의 주인. 로그인하지 못하고, 어느 역할의 묶음도 아니다.
+    pub fn auth_owner(&self) -> String {
+        format!("{}_auth_owner", self.prefix())
     }
 
     /// 이 이름이 이 인스턴스의 것인가. 머리말 뒤가 `_` 로 이어져야 한다(`i_abc` 는 `i_abcd_owner` 의 주인이 아니다).
@@ -129,6 +139,32 @@ pub enum Step {
         role: String,
         privileges: Vec<Privilege>,
     },
+    /// 표에 역할 제한 정책을 (다시) 둔다. 신원에 없는 업무 역할의 연결에서는 어떤 행도 읽고 쓰지 못한다.
+    SetRolePolicy {
+        table: TableRef,
+    },
+    /// 표의 역할 제한 정책을 걷는다. 없으면 아무것도 하지 않는다.
+    DropRolePolicy {
+        table: TableRef,
+    },
+}
+
+/// 역할 제한 정책의 이름. 앱의 마이그레이션은 이 이름을 쓰지 못한다(권한 검사가 잡는다).
+pub const ROLE_POLICY: &str = "orbital_role";
+/// 역할 제한 정책의 조건. 지금 연결의 업무 역할이 서명된 신원에 있는가.
+/// `SELECT` 로 감싸 문장마다 한 번만 검증한다(행마다 서명을 확인하지 않는다).
+pub const ROLE_POLICY_EXPR: &str = "(SELECT orbital.granted() AS granted)";
+
+/// 이 표에 역할 제한 정책을 두는가. `[auth]` 를 선언했고 권한 표에서 행 단위 규칙을 켠 표만이다.
+///
+/// 행 단위 규칙을 끈 표(`rls = "off: 까닭"`)에는 정책이 걸리지 않는다. 그런 표는 [`crate::check::unguarded`] 가 따로 알린다.
+/// `[auth]` 가 없는 인스턴스에는 사용자도 신원도 없으므로 정책을 두지 않는다. 두면 어떤 표도 아무에게도 읽히지 않는다.
+pub fn role_guarded(manifest: &ValidManifest, access: &Access, table: &TableRef) -> bool {
+    manifest.get().auth.is_some()
+        && access
+            .tables
+            .get(table)
+            .is_some_and(|declared| declared.rls == Rls::On)
 }
 
 fn quote(name: &str) -> String {
@@ -245,6 +281,20 @@ impl Step {
                 quote_table(table),
                 quote(role)
             ),
+            Self::SetRolePolicy { table } => {
+                let table = quote_table(table);
+                format!(
+                    "DROP POLICY IF EXISTS {ROLE_POLICY} ON {table}; \
+                     CREATE POLICY {ROLE_POLICY} ON {table} AS RESTRICTIVE FOR ALL TO PUBLIC \
+                     USING ({ROLE_POLICY_EXPR}) WITH CHECK ({ROLE_POLICY_EXPR})"
+                )
+            }
+            Self::DropRolePolicy { table } => {
+                format!(
+                    "DROP POLICY IF EXISTS {ROLE_POLICY} ON {}",
+                    quote_table(table)
+                )
+            }
         }
     }
 }
@@ -272,6 +322,16 @@ pub fn logins(names: &Names, manifest: &ValidManifest) -> Vec<Login> {
     logins
 }
 
+/// 인스턴스의 database 에 접속하는 역할. 마이그레이션 역할, 인증 역할(`[auth]` 를 선언했을 때), 서비스의 로그인이다.
+pub fn connectors(names: &Names, manifest: &ValidManifest) -> Vec<String> {
+    let mut roles = vec![names.migrator()];
+    if manifest.get().auth.is_some() {
+        roles.push(names.auth());
+    }
+    roles.extend(logins(names, manifest).into_iter().map(|login| login.name));
+    roles
+}
+
 /// 인스턴스를 처음 세울 때의 단계. 역할, database, 스키마까지다. 표의 권한은 마이그레이션 뒤에 [`grants`] 가 세운다.
 ///
 /// database 의 주인은 레이어의 관리 역할이다. 인스턴스의 소유자는 선언한 스키마만 갖고, 새 스키마를 만들지 못한다.
@@ -293,6 +353,18 @@ pub fn provision(names: &Names, manifest: &ValidManifest) -> Vec<Step> {
             set: true,
         },
     ];
+    if manifest.get().auth.is_some() {
+        // 어느 묶음에도 딸리지 않는다. 권한은 `orbital_auth` 를 둘 때 그 표에만 준다
+        steps.push(Step::CreateRole {
+            name: names.auth(),
+            login: true,
+        });
+        // orbital_auth 의 표와 두 뷰의 주인. 레이어의 관리 역할 대신 이 역할이 뷰를 돌린다. 아무도 이 역할이 되지 못한다
+        steps.push(Step::CreateRole {
+            name: names.auth_owner(),
+            login: false,
+        });
+    }
     for role in &database.roles {
         steps.push(Step::CreateRole {
             name: names.group(role),
@@ -318,14 +390,10 @@ pub fn provision(names: &Names, manifest: &ValidManifest) -> Vec<Step> {
     steps.push(Step::RevokeDatabaseFromPublic {
         database: names.database(),
     });
-    steps.push(Step::GrantConnect {
-        database: names.database(),
-        role: names.migrator(),
-    });
-    for login in &logins {
+    for role in connectors(names, manifest) {
         steps.push(Step::GrantConnect {
             database: names.database(),
-            role: login.name.clone(),
+            role,
         });
     }
     steps.push(Step::RevokePublicSchemaFromPublic);
@@ -415,12 +483,29 @@ pub fn grants(
             }
         }
     }
+
+    // 역할 제한 정책은 권한을 다 준 뒤에 맞춘다. 둘 표에는 다시 두고, 그 밖의 표에서는 걷는다
+    // (앞에서 auth 를 선언했다가 뺐거나 행 단위 규칙을 껐으면 남은 정책이 없어야 한다)
+    let (guarded, open): (Vec<&TableRef>, Vec<&TableRef>) = actual
+        .iter()
+        .copied()
+        .partition(|table| role_guarded(manifest, access, table));
+    steps.extend(open.into_iter().map(|table| Step::DropRolePolicy {
+        table: table.clone(),
+    }));
+    steps.extend(guarded.into_iter().map(|table| Step::SetRolePolicy {
+        table: table.clone(),
+    }));
     steps
 }
 
 /// 클러스터에 남아 있지만 선언에는 없는 이 인스턴스의 역할. 서비스나 역할을 선언에서 빼면 생긴다.
 pub fn stale_roles(names: &Names, manifest: &ValidManifest, existing: &[String]) -> Vec<String> {
-    let mut wanted: BTreeSet<String> = [names.owner(), names.migrator()].into();
+    let mut wanted: BTreeSet<String> = [names.owner()].into();
+    if manifest.get().auth.is_some() {
+        wanted.insert(names.auth_owner());
+    }
+    wanted.extend(connectors(names, manifest));
     wanted.extend(
         manifest
             .get()
@@ -429,7 +514,6 @@ pub fn stale_roles(names: &Names, manifest: &ValidManifest, existing: &[String])
             .iter()
             .map(|role| names.group(role)),
     );
-    wanted.extend(logins(names, manifest).into_iter().map(|login| login.name));
     existing
         .iter()
         .filter(|name| names.owns(name) && !wanted.contains(*name))
@@ -633,6 +717,194 @@ pub(crate) mod tests {
                 "i_k3f9x2ab_s_worker_employee".to_owned(),
                 "i_k3f9x2ab_r_auditor".to_owned()
             ]
+        );
+    }
+
+    pub(crate) fn with_auth() -> ValidManifest {
+        let text = format!(
+            "{}\n[auth]\nmethods = [\"email_link\"]\nlogin_path = \"/login\"\ndirectory = [\"manager\"]\n",
+            crate::access::tests::MANIFEST
+        );
+        toml::from_str::<crate::manifest::Manifest>(&text)
+            .unwrap()
+            .check()
+            .unwrap()
+    }
+
+    #[test]
+    fn 인증_역할의_이름은_인스턴스의_머리말에_auth_를_단다() {
+        assert_eq!(names().auth(), "i_k3f9x2ab_auth");
+        assert!(names().owns(&names().auth()));
+    }
+
+    #[test]
+    fn auth_를_선언하면_인증_역할이_로그인으로_서고_database_에만_접속하고_어느_묶음에도_딸리지_않는다()
+     {
+        let steps = provision(&names(), &with_auth());
+        assert!(steps.contains(&Step::CreateRole {
+            name: "i_k3f9x2ab_auth".to_owned(),
+            login: true
+        }));
+        assert!(steps.contains(&Step::GrantConnect {
+            database: "i_k3f9x2ab".to_owned(),
+            role: "i_k3f9x2ab_auth".to_owned()
+        }));
+        assert!(!steps.iter().any(|step| matches!(
+            step,
+            Step::GrantMembership { group, member, .. } if group == "i_k3f9x2ab_auth" || member == "i_k3f9x2ab_auth"
+        )));
+    }
+
+    #[test]
+    fn auth_를_선언하지_않은_선언의_계획에는_인증_역할이_없다() {
+        let steps = provision(&names(), &manifest());
+        let with = provision(&names(), &with_auth());
+        assert!(!format!("{steps:?}").contains("_auth"));
+        // auth 를 더해도 그 밖의 단계는 같다
+        let rest: Vec<_> = with
+            .into_iter()
+            .filter(|step| !format!("{step:?}").contains("i_k3f9x2ab_auth"))
+            .collect();
+        assert_eq!(rest, steps);
+    }
+
+    #[test]
+    fn auth_를_선언하면_orbital_auth_의_주인이_로그인하지_못하는_역할로_서고_어디에도_접속하지_않는다()
+     {
+        assert_eq!(names().auth_owner(), "i_k3f9x2ab_auth_owner");
+        assert!(names().owns(&names().auth_owner()));
+        let steps = provision(&names(), &with_auth());
+        assert!(steps.contains(&Step::CreateRole {
+            name: "i_k3f9x2ab_auth_owner".to_owned(),
+            login: false
+        }));
+        assert!(!steps.iter().any(|step| matches!(
+            step,
+            Step::GrantMembership { group, member, .. } if group == "i_k3f9x2ab_auth_owner" || member == "i_k3f9x2ab_auth_owner"
+        ) || matches!(
+            step,
+            Step::GrantConnect { role, .. } if role == "i_k3f9x2ab_auth_owner"
+        )));
+        assert!(!connectors(&names(), &with_auth()).contains(&names().auth_owner()));
+        assert!(!format!("{:?}", provision(&names(), &manifest())).contains("auth_owner"));
+    }
+
+    #[test]
+    fn 인증_역할은_auth_를_선언했을_때만_남은_역할이_아니다() {
+        let existing = [
+            "i_k3f9x2ab_auth".to_owned(),
+            "i_k3f9x2ab_auth_owner".to_owned(),
+        ];
+        assert_eq!(
+            stale_roles(&names(), &with_auth(), &existing),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            stale_roles(&names(), &manifest(), &existing),
+            existing.to_vec()
+        );
+    }
+
+    #[test]
+    fn auth_를_선언하면_행_단위_규칙을_켠_표마다_역할_제한_정책을_세우고_나머지에서는_걷는다() {
+        let access = crate::access::Access::parse(
+            &toml::from_str::<crate::access::RawAccess>(ACCESS).unwrap(),
+            &with_auth(),
+        )
+        .unwrap();
+        let tables = [
+            table("payroll", "payslip"),
+            table("hr", "department"),
+            table("payroll", "bonus"),
+        ];
+        let steps = grants(&names(), &with_auth(), &access, &tables);
+        let policies: Vec<&Step> = steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step,
+                    Step::SetRolePolicy { .. } | Step::DropRolePolicy { .. }
+                )
+            })
+            .collect();
+        assert_eq!(
+            policies,
+            vec![
+                &Step::DropRolePolicy {
+                    table: table("hr", "department")
+                },
+                &Step::DropRolePolicy {
+                    table: table("payroll", "bonus")
+                },
+                &Step::SetRolePolicy {
+                    table: table("payroll", "payslip")
+                },
+            ]
+        );
+        // 정책은 권한을 다 준 뒤에 세운다
+        let last_grant = steps
+            .iter()
+            .rposition(|step| {
+                matches!(
+                    step,
+                    Step::GrantTable { .. }
+                        | Step::GrantSchemaUsage { .. }
+                        | Step::GrantSequences { .. }
+                )
+            })
+            .unwrap();
+        let first_policy = steps
+            .iter()
+            .position(|step| {
+                matches!(
+                    step,
+                    Step::SetRolePolicy { .. } | Step::DropRolePolicy { .. }
+                )
+            })
+            .unwrap();
+        assert!(last_grant < first_policy);
+    }
+
+    #[test]
+    fn auth_를_선언하지_않으면_역할_제한_정책을_세우지_않는다() {
+        let access = access(ACCESS).unwrap();
+        let tables = [table("payroll", "payslip"), table("hr", "department")];
+        let steps = grants(&names(), &manifest(), &access, &tables);
+        assert!(
+            !steps
+                .iter()
+                .any(|step| matches!(step, Step::SetRolePolicy { .. }))
+        );
+        // 앞에서 auth 를 선언했다가 뺐으면 남은 정책을 걷는다
+        assert!(steps.contains(&Step::DropRolePolicy {
+            table: table("payroll", "payslip")
+        }));
+    }
+
+    #[test]
+    fn 역할_제한_정책은_제한하는_정책이고_모든_명령과_모든_역할에_걸린다() {
+        assert_eq!(
+            Step::SetRolePolicy {
+                table: table("payroll", "payslip")
+            }
+            .sql(),
+            "DROP POLICY IF EXISTS orbital_role ON \"payroll\".\"payslip\"; \
+             CREATE POLICY orbital_role ON \"payroll\".\"payslip\" AS RESTRICTIVE FOR ALL TO PUBLIC \
+             USING ((SELECT orbital.granted() AS granted)) WITH CHECK ((SELECT orbital.granted() AS granted))"
+        );
+        assert_eq!(
+            Step::DropRolePolicy {
+                table: table("payroll", "payslip")
+            }
+            .sql(),
+            "DROP POLICY IF EXISTS orbital_role ON \"payroll\".\"payslip\""
+        );
+        assert_eq!(
+            Step::DropRolePolicy {
+                table: table("payroll", "payslip")
+            }
+            .place(),
+            Place::Database
         );
     }
 

@@ -200,6 +200,7 @@ impl Remote {
             ("권한 검사에서 어긋난 것", "findings"),
             ("운영과 견준 권한의 변화(승인 카드에 섭니다)", "changes"),
             ("승격을 막는 것", "blockers"),
+            ("알아 둘 것", "notices"),
         ] {
             let found = lines(key);
             if !found.is_empty() {
@@ -215,15 +216,12 @@ impl Remote {
         Ok(text)
     }
 
-    fn identity(&self, subject: &str) -> Result<String, String> {
-        let reply = self.json(
-            "POST",
-            "previews/identities",
-            Some(json!({ "subject": subject })),
-        )?;
+    /// 미리보기의 씨앗 사용자로 세션을 만들고, 요청에 그대로 붙일 `Cookie` 머리말의 값을 한 줄로 찍는다.
+    fn identity(&self, user: &str) -> Result<String, String> {
+        let reply = self.json("POST", "previews/identities", Some(json!({ "user": user })))?;
         Ok(format!(
             "{}\n",
-            reply["identity"].as_str().unwrap_or_default()
+            reply["cookie"].as_str().unwrap_or_default()
         ))
     }
 
@@ -268,7 +266,7 @@ impl Remote {
             "pull" => self.pull(),
             "push" => self.push(),
             "preview" => self.preview(),
-            "identity" => need("씨앗 데이터의 사람을").and_then(|subject| self.identity(subject)),
+            "identity" => need("씨앗 사용자를").and_then(|user| self.identity(user)),
             "rehearse" => need("release 를").and_then(|release| self.rehearse(release)),
             "request-promotion" => {
                 need("release 를").and_then(|release| self.request_promotion(release))

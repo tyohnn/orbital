@@ -6,36 +6,69 @@
 //! 그 값은 누구나 바꿀 수 있는 설정에 담기지만, DB 안의 검증 함수가 읽을 때마다 서명을 확인한다. 서명의 열쇠는 업무 역할이 읽지 못하는
 //! 표에 있다. 그래서 앱 코드나 주입된 SQL 이 값을 바꿔도 다른 사람이 되지 못하고, 서명이 틀리면 아무도 아닌 것(NULL)이 된다.
 //!
-//! 모양은 `v1.<claims 의 hex>.<HMAC-SHA256 의 hex>` 다. hex 를 쓰는 것은 DB 안에서 읽기 쉬워서다.
+//! 모양은 `v2.<claims 의 hex>.<HMAC-SHA256 의 hex>` 다. hex 를 쓰는 것은 DB 안에서 읽기 쉬워서다.
+//! claims 는 `iid`(인스턴스) · `exp`(만료) · `roles`(업무 역할) 와, 사람이면 `sub`(사용자) · `sid`(세션)이다.
+//! DB 는 지금 연결의 업무 역할이 `roles` 에 있을 때만 사람을 돌려주고(`orbital.subject()`), 역할 제한 정책은 `orbital.granted()` 로
+//! 그 밖의 연결에서 모든 행을 막는다. 앞의 형식(`v1`, 업무 역할이 없다)은 읽지 않는다.
 
 use hmac::{Hmac, Mac};
+use orbital_core::name::Ident;
 use orbital_core::plan::Names;
 use sha2::Sha256;
 
 use crate::{Admin, Error, pg};
 
-/// 서명에 담는 것.
+/// 서명에 담는 것(`v2`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claims {
-    /// 로그인한 사람. 팩토리가 정한 식별자다.
-    pub subject: String,
+    /// 로그인한 사람(`orbital_auth.users.id`). 사람 없는 실행(스케줄)에는 없다.
+    pub subject: Option<String>,
+    /// 이 신원이 쓸 수 있는 업무 역할. 지금 연결의 업무 역할이 여기에 없으면 DB 는 어떤 행도 내주지 않는다.
+    pub roles: Vec<String>,
+    /// 세션을 가리키는 것. 세션의 토큰이 아니다. 사람 없는 실행에는 없다.
+    pub session: Option<String>,
+    /// MCP 로 들어왔으면 그 클라이언트(`cid`). 브라우저의 세션이면 없다.
+    pub client: Option<String>,
     /// 이 시각(유닉스 초)부터 읽히지 않는다.
     pub expires_at: u64,
+}
+
+impl Claims {
+    /// 사람 없이 업무 역할 하나만 실은 신원. 레이어가 스케줄을 부를 때 쓴다(HTTP 로는 내주지 않는다).
+    /// 이 신원으로는 그 역할의 「모든 행」 권한만 쓰고 「자기 행」은 읽지 못한다.
+    pub fn for_role(role: &Ident, expires_at: u64) -> Self {
+        Self {
+            subject: None,
+            roles: vec![role.as_str().to_owned()],
+            session: None,
+            client: None,
+            expires_at,
+        }
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// 신원에 서명한다. router 가 부른다. 열쇠는 레이어만 갖는다.
+/// 신원에 서명한다. 레이어(router)만 부른다. 열쇠는 레이어만 갖는다.
 pub fn sign(key: &[u8], names: &Names, claims: &Claims) -> String {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "iid": names.instance().as_str(),
-        "sub": claims.subject,
         "exp": claims.expires_at,
-    })
-    .to_string();
-    let signed = format!("v1.{}", hex(body.as_bytes()));
+        "roles": claims.roles,
+    });
+    if let Some(subject) = &claims.subject {
+        body["sub"] = serde_json::Value::from(subject.as_str());
+    }
+    if let Some(session) = &claims.session {
+        body["sid"] = serde_json::Value::from(session.as_str());
+    }
+    if let Some(client) = &claims.client {
+        body["cid"] = serde_json::Value::from(client.as_str());
+    }
+    let body = body.to_string();
+    let signed = format!("v2.{}", hex(body.as_bytes()));
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC 은 어떤 길이의 열쇠도 받는다");
     mac.update(signed.as_bytes());
     format!("{signed}.{}", hex(&mac.finalize().into_bytes()))
@@ -68,14 +101,15 @@ BEGIN
         RETURN NULL;
     END IF;
     parts := string_to_array(token, '.');
-    IF cardinality(parts) <> 3 OR parts[1] <> 'v1' THEN
+    -- v2 만 읽는다. 앞의 형식(v1)에는 업무 역할이 없어서, 바르게 서명됐어도 읽지 않는다
+    IF cardinality(parts) <> 3 OR parts[1] <> 'v2' THEN
         RETURN NULL;
     END IF;
     SELECT * INTO me FROM orbital.instance;
     IF NOT FOUND THEN
         RETURN NULL;
     END IF;
-    expected := orbital.hmac(convert_to('v1.' || parts[2], 'UTF8'), me.signing_key, 'sha256');
+    expected := orbital.hmac(convert_to('v2.' || parts[2], 'UTF8'), me.signing_key, 'sha256');
     -- 두 값을 한 번 더 해시해 견준다. 글자를 앞에서부터 견주면 걸린 시간으로 서명을 맞혀 갈 수 있다
     IF sha256(expected) IS DISTINCT FROM sha256(decode(parts[3], 'hex')) THEN
         RETURN NULL;
@@ -87,16 +121,13 @@ BEGIN
     IF (claims ->> 'exp')::bigint <= extract(epoch FROM now()) THEN
         RETURN NULL;
     END IF;
+    IF jsonb_typeof(claims -> 'roles') IS DISTINCT FROM 'array' THEN
+        RETURN NULL;
+    END IF;
     RETURN claims;
 EXCEPTION WHEN OTHERS THEN
     RETURN NULL;
 END
-$$;
-
--- 로그인한 사람. 행 단위 규칙은 이것만 읽는다.
-CREATE OR REPLACE FUNCTION orbital.subject() RETURNS text
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path = orbital, pg_catalog AS $$
-    SELECT orbital.claims() ->> 'sub'
 $$;
 
 -- 지금 연결의 업무 역할. 마이그레이션이 인스턴스의 식별자를 몰라도 행 단위 규칙에서 역할을 가를 수 있다.
@@ -109,6 +140,26 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = orbital, pg_catalog AS $$
     JOIN pg_roles g ON g.oid = a.roleid
     WHERE left(g.rolname, length(i.prefix) + 3) = i.prefix || '_r_'
     LIMIT 1
+$$;
+
+-- 지금 연결의 업무 역할이 서명된 신원의 업무 역할에 있는가. 신원이 없거나, 서명이 틀리거나, 업무 역할의 연결이 아니면 거짓이다.
+-- 역할 제한 정책(orbital_role)이 이것으로 모든 행을 막는다. 그래서 앱이 연결을 잘못 골라도 다른 역할의 행이 나오지 않는다.
+CREATE OR REPLACE FUNCTION orbital.granted() RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = orbital, pg_catalog AS $$
+    SELECT coalesce((orbital.claims() -> 'roles') ? orbital.role(), false)
+$$;
+
+-- 로그인한 사람. 행 단위 규칙은 이것만 읽는다. 지금 연결의 업무 역할이 신원에 있을 때만 사람을 돌려준다.
+-- 사람 없이 업무 역할만 실은 신원(스케줄)에는 사람이 없다.
+CREATE OR REPLACE FUNCTION orbital.subject() RETURNS text
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = orbital, pg_catalog AS $$
+    SELECT CASE WHEN orbital.granted() THEN orbital.claims() ->> 'sub' END
+$$;
+
+-- MCP 로 들어온 요청이면 그 클라이언트. 브라우저의 세션이면 NULL 이다. 앱의 정책이 MCP 의 요청에 더 좁은 권한을 줄 때 읽는다.
+CREATE OR REPLACE FUNCTION orbital.client() RETURNS text
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = orbital, pg_catalog AS $$
+    SELECT CASE WHEN orbital.granted() THEN orbital.claims() ->> 'cid' END
 $$;
 
 -- 이미 돈 마이그레이션의 이름. 소유자는 적기만 하고 고치거나 지우지 못한다.
@@ -158,19 +209,25 @@ mod tests {
     #[test]
     fn 서명은_세_조각이고_같은_입력이면_같은_서명이_나온다() {
         let claims = Claims {
-            subject: "emp_1".to_owned(),
+            subject: Some("emp_1".to_owned()),
+            roles: vec!["employee".to_owned()],
+            session: Some("s_1".to_owned()),
+            client: None,
             expires_at: 2_000_000_000,
         };
         let token = sign(b"key", &names(), &claims);
         assert_eq!(token.split('.').count(), 3);
-        assert!(token.starts_with("v1."));
+        assert!(token.starts_with("v2."));
         assert_eq!(token, sign(b"key", &names(), &claims));
     }
 
     #[test]
     fn 열쇠나_사람이나_인스턴스가_다르면_서명이_다르다() {
         let claims = Claims {
-            subject: "emp_1".to_owned(),
+            subject: Some("emp_1".to_owned()),
+            roles: vec!["employee".to_owned()],
+            session: Some("s_1".to_owned()),
+            client: None,
             expires_at: 2_000_000_000,
         };
         let token = sign(b"key", &names(), &claims);
@@ -181,7 +238,7 @@ mod tests {
                 b"key",
                 &names(),
                 &Claims {
-                    subject: "emp_2".to_owned(),
+                    subject: Some("emp_2".to_owned()),
                     ..claims.clone()
                 }
             )
@@ -193,7 +250,10 @@ mod tests {
     #[test]
     fn 따옴표가_든_식별자도_json_을_깨지_않는다() {
         let claims = Claims {
-            subject: "a\"b\\c".to_owned(),
+            subject: Some("a\"b\\c".to_owned()),
+            roles: Vec::new(),
+            session: None,
+            client: None,
             expires_at: 1,
         };
         let token = sign(b"key", &names(), &claims);
@@ -204,5 +264,42 @@ mod tests {
             .collect();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["sub"], "a\"b\\c");
+    }
+
+    fn body(token: &str) -> serde_json::Value {
+        let hex = token.split('.').nth(1).unwrap();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+            .collect();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn 사람의_신원에는_사람과_세션과_업무_역할이_실리고_역할만의_신원에는_사람도_세션도_없다() {
+        let person = sign(
+            b"key",
+            &names(),
+            &Claims {
+                subject: Some("u_1".to_owned()),
+                roles: vec!["employee".to_owned(), "manager".to_owned()],
+                session: Some("s_1".to_owned()),
+                client: None,
+                expires_at: 7,
+            },
+        );
+        assert_eq!(
+            body(&person),
+            serde_json::json!({ "iid": "k3f9x2ab", "sub": "u_1", "sid": "s_1", "roles": ["employee", "manager"], "exp": 7 })
+        );
+        let job = sign(
+            b"key",
+            &names(),
+            &Claims::for_role(&Ident::parse("payroll_admin").unwrap(), 7),
+        );
+        assert_eq!(
+            body(&job),
+            serde_json::json!({ "iid": "k3f9x2ab", "roles": ["payroll_admin"], "exp": 7 })
+        );
     }
 }

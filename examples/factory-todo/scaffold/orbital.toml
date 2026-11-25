@@ -1,0 +1,23 @@
+# 팩토리 「할 일 카드」의 스캐폴드. 의존성 없이 뜨는 Node 서버 하나다
+
+[[service]]
+name = "web"
+kind = "server"
+build = "node --check server.js"
+start = "node server.js"
+path = "/"
+roles = ["member"]
+
+[database]
+schemas = ["todo"]
+migrations = "db/migrations"
+roles = ["member"]
+seed = "db/seed"
+
+[secrets]
+generated = ["SESSION_KEY"]
+
+# 로그인은 레이어가 맡는다. 서비스는 로그인 없이도 열리고(auth 의 기본은 optional), 로그인했으면 router 가 신원을 싣는다
+[auth]
+methods = ["email_link"]
+login_path = "/login"

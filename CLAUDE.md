@@ -35,7 +35,7 @@
 ## 구조 규약
 
 ```
-도메인(orbital-core) ← 어댑터(orbital-pg · orbital-proxy · orbital-source · orbital-run) ← 앱(orbital-server · orbital-cli)
+도메인(orbital-core) ← 어댑터(orbital-pg · orbital-proxy · orbital-router · orbital-source · orbital-run) ← 앱(orbital-server · orbital-cli)
 ```
 
 - 의존은 한 방향입니다. 층은 `scripts/check-layers.mjs` 의 `LAYER` 표가 정하고, **새 crate 는 그 표에 줄을 더하는 것이 첫 작업입니다.**
@@ -46,6 +46,10 @@
 - ⚠ **값은 레이어 밖으로 나가지 않습니다.** 비밀번호 · 키 · 운영 데이터의 행은 API 응답, 로그, 오류 문구에 싣지 않습니다. 이름과 숫자만 나갑니다.
 - ⚠ **에이전트가 쓴 것은 관리 권한으로 돌리지 않습니다.** 마이그레이션은 마이그레이션 역할로 따로 접속해 돌리고, 빌드와 서버는 환경을 비운 실행기에서 돌립니다.
   관리 연결에서 역할만 바꿔 돌리면 `RESET ROLE` 한 줄로 관리 권한을 되찾습니다.
+- ⚠ **신원이 앱에 닿는 길은 router 하나입니다.** router 는 밖에서 온 `x-orbital-` 머리말을 언제나 지우고, 세션을 확인했을 때만 신원을 붙입니다.
+  서명된 신원이나 세션 토큰을 레이어 밖으로 내주는 길(API · SDK · 로그)을 만들지 않습니다.
+  `[auth]` 를 선언한 인스턴스에서는 신원에 없는 업무 역할의 연결이 어떤 행도 읽지 못합니다(역할 제한 정책 `orbital_role`). 앱의 마이그레이션은 이 이름을 쓰지 않습니다.
+  MCP 주소는 쿠키를 보지 않고 Bearer 토큰만 보며, 받은 토큰(`Authorization`)은 앱에 넘기지 않습니다. 인가 요청의 판정은 core 의 `oauth` 가 합니다.
 - `sdk/typescript` 의 타입은 관리 서버가 주고받는 JSON 의 모양을 옮긴 것입니다. serde 모양이나 HTTP 의 길을 바꾸면 같은 PR 에서 함께 고칩니다.
 - ⚠ **SQL 에 들어가는 이름은 검증된 타입(`Ident`)에서만 옵니다.** 글자열을 이어 붙여 SQL 을 만들 때 선언에서 읽은 날것을 넣지 않습니다.
 
@@ -78,7 +82,7 @@ npm run pr:check                       # fmt · clippy · test · 층 검사 · 
 ## 커밋
 
 한 커밋은 한 가지 책임만 바꾸고 각 커밋이 `pr:check` 를 통과합니다. 형식은 `<타입>(<스코프>): <한 줄>` 입니다.
-타입은 feat · fix · refactor · test · chore · docs, 스코프는 crate 이름에서 `orbital-` 을 뺀 것(`core` · `pg` · `proxy` · `source` · `run` · `server` · `cli`)이나 `sdk` · `repo` 입니다.
+타입은 feat · fix · refactor · test · chore · docs, 스코프는 crate 이름에서 `orbital-` 을 뺀 것(`core` · `pg` · `proxy` · `router` · `source` · `run` · `server` · `cli`)이나 `sdk` · `repo` 입니다.
 
 ## 찾아볼 자리
 
