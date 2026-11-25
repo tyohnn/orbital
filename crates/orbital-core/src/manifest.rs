@@ -21,6 +21,9 @@ pub struct Manifest {
     pub database: Database,
     #[serde(default)]
     pub secrets: Secrets,
+    /// 레이어가 운영하는 로그인(Orbital Auth). 없으면 레이어는 로그인에 관여하지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<Auth>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +50,64 @@ pub struct Service {
     /// 이 서비스가 쓸 수 있는 업무 역할. 여기에 없는 역할로는 DB 에 들어가지 못한다.
     #[serde(default)]
     pub roles: Vec<Ident>,
+    /// 로그인한 사람만 들어오는가. 기본은 누구나 들어오고, 로그인했다면 신원이 함께 넘어간다.
+    #[serde(default, skip_serializing_if = "ServiceAuth::is_optional")]
+    pub auth: ServiceAuth,
 }
+
+/// 서비스가 로그인을 요구하는가.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceAuth {
+    /// 로그인한 사람만 들어온다. 아니면 `[auth].login_path` 로 보낸다.
+    Required,
+    /// 누구나 들어온다.
+    #[default]
+    Optional,
+}
+
+impl ServiceAuth {
+    pub fn is_optional(&self) -> bool {
+        *self == Self::Optional
+    }
+}
+
+/// 레이어가 운영하는 로그인의 선언. 화면은 앱이 그리고, 레이어는 뒤쪽(사용자 · 초대 · 링크 · 세션)만 맡는다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Auth {
+    /// 로그인 방법. 지금은 `email_link` 만 받는다. 모르는 값은 [`Manifest::check`] 가 고칠 것으로 돌려준다.
+    pub methods: Vec<String>,
+    /// 앱의 로그인 화면. 어느 서비스의 `path` 아래여야 한다.
+    pub login_path: String,
+    #[serde(default)]
+    pub signup: Signup,
+    /// 초대 없이 들어온 사람이 처음 갖는 업무 역할. `signup = "open"` 일 때만 적는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_roles: Vec<Ident>,
+    /// 다른 사용자의 이름과 이메일(`orbital.users`)을 읽는 업무 역할.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directory: Vec<Ident>,
+}
+
+impl Auth {
+    /// 레이어가 아는 로그인 방법.
+    pub const METHODS: [&'static str; 1] = ["email_link"];
+}
+
+/// 누가 들어올 수 있는가.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Signup {
+    /// 초대받은 이메일만.
+    #[default]
+    Invite,
+    /// 누구나. 처음 들어오면 `default_roles` 를 갖는다.
+    Open,
+}
+
+/// 레이어가 쓰는 경로의 머리. 서비스와 로그인 화면은 이 아래에 둘 수 없다.
+pub const LAYER_PATH: &str = "/_orbital";
 
 impl Service {
     /// 서비스 이름의 길이. 서비스마다의 로그인 이름이 Postgres 의 63바이트 한도 안에 들어야 한다.
@@ -109,6 +169,15 @@ pub enum ManifestProblem {
     SchedulePathOutsideService { service: Ident, path: String },
     ScheduleBadCron { cron: String },
     DuplicateSecret { secret: SecretName },
+    AuthRequiredWithoutAuth { service: Ident },
+    AuthNoMethod,
+    AuthUnknownMethod { method: String },
+    LoginPathOutsideServices { path: String },
+    LayerPath { path: String },
+    DirectoryUndeclaredRole { role: Ident },
+    DefaultRoleUndeclared { role: Ident },
+    OpenSignupWithoutDefaultRoles,
+    DefaultRolesWithoutOpenSignup,
 }
 
 impl fmt::Display for ManifestProblem {
@@ -185,6 +254,43 @@ impl fmt::Display for ManifestProblem {
                 "비밀 `{secret}` 이 두 번 적혀 있습니다",
                 secret = secret.as_str()
             ),
+            Self::AuthRequiredWithoutAuth { service } => write!(
+                f,
+                "서비스 `{service}` 가 로그인을 요구하지만 `[auth]` 가 없습니다. `[auth]` 를 적거나 `auth = \"optional\"` 로 바꿔 주세요"
+            ),
+            Self::AuthNoMethod => write!(
+                f,
+                "`[auth].methods` 가 비어 있습니다. `methods = [\"email_link\"]` 처럼 하나 이상 적어 주세요"
+            ),
+            Self::AuthUnknownMethod { method } => write!(
+                f,
+                "로그인 방법 `{method}` 은 모르는 값입니다. 받는 값은 {} 입니다",
+                Auth::METHODS.join(", ")
+            ),
+            Self::LoginPathOutsideServices { path } => write!(
+                f,
+                "로그인 화면 `{path}` 가 어느 서비스의 경로 아래도 아닙니다. 로그인 화면을 그리는 서비스의 `path` 아래로 적어 주세요"
+            ),
+            Self::LayerPath { path } => write!(
+                f,
+                "경로 `{path}` 는 `{LAYER_PATH}` 로 시작합니다. 레이어가 쓰는 경로이니 다른 경로로 바꿔 주세요"
+            ),
+            Self::DirectoryUndeclaredRole { role } => write!(
+                f,
+                "`[auth].directory` 의 역할 `{role}` 이 `[database].roles` 에 없습니다. 선언한 업무 역할만 적어 주세요"
+            ),
+            Self::DefaultRoleUndeclared { role } => write!(
+                f,
+                "`[auth].default_roles` 의 역할 `{role}` 이 `[database].roles` 에 없습니다. 선언한 업무 역할만 적어 주세요"
+            ),
+            Self::OpenSignupWithoutDefaultRoles => write!(
+                f,
+                "`signup = \"open\"` 이면 처음 들어온 사람이 가질 역할이 있어야 합니다. `[auth].default_roles` 를 적어 주세요"
+            ),
+            Self::DefaultRolesWithoutOpenSignup => write!(
+                f,
+                "`[auth].default_roles` 는 `signup = \"open\"` 일 때만 씁니다. 초대받은 사람은 초대의 역할을 갖습니다. `default_roles` 를 지우거나 `signup = \"open\"` 으로 바꿔 주세요"
+            ),
         }
     }
 }
@@ -246,6 +352,16 @@ impl Manifest {
             }
             if service.name.as_str().len() > Service::NAME_MAX {
                 problems.push(ManifestProblem::ServiceNameTooLong {
+                    service: service.name.clone(),
+                });
+            }
+            if is_layer_path(&service.path) {
+                problems.push(ManifestProblem::LayerPath {
+                    path: service.path.clone(),
+                });
+            }
+            if service.auth == ServiceAuth::Required && self.auth.is_none() {
+                problems.push(ManifestProblem::AuthRequiredWithoutAuth {
                     service: service.name.clone(),
                 });
             }
@@ -328,6 +444,51 @@ impl Manifest {
             }
         }
 
+        if let Some(auth) = &self.auth {
+            if auth.methods.is_empty() {
+                problems.push(ManifestProblem::AuthNoMethod);
+            }
+            for method in &auth.methods {
+                if !Auth::METHODS.contains(&method.as_str()) {
+                    problems.push(ManifestProblem::AuthUnknownMethod {
+                        method: method.clone(),
+                    });
+                }
+            }
+            if is_layer_path(&auth.login_path) {
+                problems.push(ManifestProblem::LayerPath {
+                    path: auth.login_path.clone(),
+                });
+            } else if !self
+                .services
+                .iter()
+                .any(|service| under(&auth.login_path, &service.path))
+            {
+                problems.push(ManifestProblem::LoginPathOutsideServices {
+                    path: auth.login_path.clone(),
+                });
+            }
+            for role in &auth.directory {
+                if !roles.contains(role) {
+                    problems.push(ManifestProblem::DirectoryUndeclaredRole { role: role.clone() });
+                }
+            }
+            for role in &auth.default_roles {
+                if !roles.contains(role) {
+                    problems.push(ManifestProblem::DefaultRoleUndeclared { role: role.clone() });
+                }
+            }
+            match auth.signup {
+                Signup::Open if auth.default_roles.is_empty() => {
+                    problems.push(ManifestProblem::OpenSignupWithoutDefaultRoles);
+                }
+                Signup::Invite if !auth.default_roles.is_empty() => {
+                    problems.push(ManifestProblem::DefaultRolesWithoutOpenSignup);
+                }
+                _ => {}
+            }
+        }
+
         if problems.is_empty() {
             Ok(ValidManifest(self))
         } else {
@@ -336,13 +497,18 @@ impl Manifest {
     }
 }
 
-fn trim_path(path: &str) -> &str {
+/// 레이어가 쓰는 경로인가. 조각의 경계를 따지지 않고 글자로 본다(`/_orbitalx` 도 받지 않는다). 넓게 막는 편이 안전하다.
+fn is_layer_path(path: &str) -> bool {
+    path.starts_with(LAYER_PATH)
+}
+
+pub(crate) fn trim_path(path: &str) -> &str {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() { "/" } else { trimmed }
 }
 
 /// `path` 가 `base` 와 같거나 그 아래인가. 조각의 경계로 본다(`/api` 는 `/apiary` 의 위가 아니다).
-fn under(path: &str, base: &str) -> bool {
+pub(crate) fn under(path: &str, base: &str) -> bool {
     let base = trim_path(base);
     if base == "/" {
         return path.starts_with('/');
@@ -584,6 +750,194 @@ path = "/"
             "external = { BANK_API_KEY = \"sk-live-123\" }",
         );
         assert!(toml::from_str::<Manifest>(&text).is_err());
+    }
+
+    /// 로그인을 레이어에 맡긴 선언. web 이 로그인 화면을 그린다.
+    pub(crate) const WITH_AUTH: &str = r#"
+[[service]]
+name = "api"
+kind = "server"
+build = "npm run build -w api"
+start = "npm run start -w api"
+path = "/api"
+roles = ["member", "manager"]
+auth = "required"
+
+[[service]]
+name = "web"
+kind = "static"
+build = "npm run build -w web"
+output = "web/dist"
+path = "/"
+
+[database]
+schemas = ["app"]
+roles = ["member", "manager"]
+
+[auth]
+methods = ["email_link"]
+login_path = "/login"
+directory = ["manager"]
+"#;
+
+    #[test]
+    fn 로그인을_레이어에_맡긴_선언을_받는다() {
+        let manifest = parse(WITH_AUTH).check().expect("받아야 합니다");
+        let auth = manifest.get().auth.as_ref().unwrap();
+        assert_eq!(auth.signup, Signup::Invite);
+        assert_eq!(manifest.get().services[0].auth, ServiceAuth::Required);
+        assert_eq!(manifest.get().services[1].auth, ServiceAuth::Optional);
+    }
+
+    #[test]
+    fn auth_를_적지_않은_선언의_json_모양은_그대로다() {
+        let manifest = parse(NEST_VITE).check().unwrap();
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(!json.contains("auth"), "{json}");
+    }
+
+    #[test]
+    fn 로그인이_필요한_서비스가_있는데_auth_가_없으면_고칠_것으로_돌려준다() {
+        let text = WITH_AUTH.split("[auth]").next().unwrap();
+        assert_eq!(
+            problems(text),
+            vec![ManifestProblem::AuthRequiredWithoutAuth {
+                service: ident("api")
+            }]
+        );
+        // 로그인을 요구하지 않으면 [auth] 가 없어도 된다
+        assert!(
+            parse(&text.replace("auth = \"required\"\n", ""))
+                .check()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn login_path_가_어느_서비스의_path_아래도_아니면_고칠_것으로_돌려준다() {
+        // web 을 /app 으로 옮기면 /login 은 어느 서비스의 아래도 아니다
+        let moved = WITH_AUTH.replace("path = \"/\"\n", "path = \"/app\"\n");
+        assert_eq!(
+            problems(&moved),
+            vec![ManifestProblem::LoginPathOutsideServices {
+                path: "/login".to_owned()
+            }]
+        );
+        // 조각의 경계로 본다. /apix 는 /api 의 아래가 아니다
+        let edge = moved.replace("login_path = \"/login\"", "login_path = \"/apix/login\"");
+        assert_eq!(
+            problems(&edge),
+            vec![ManifestProblem::LoginPathOutsideServices {
+                path: "/apix/login".to_owned()
+            }]
+        );
+        let inside = moved.replace("login_path = \"/login\"", "login_path = \"/app/login\"");
+        assert!(parse(&inside).check().is_ok());
+        let exact = moved.replace("login_path = \"/login\"", "login_path = \"/app\"");
+        assert!(parse(&exact).check().is_ok());
+    }
+
+    #[test]
+    fn directory_와_default_roles_에_선언에_없는_업무_역할을_적으면_고칠_것으로_돌려준다() {
+        let text = WITH_AUTH
+            .replace("directory = [\"manager\"]", "directory = [\"auditor\"]")
+            .replace(
+                "login_path = \"/login\"",
+                "login_path = \"/login\"\nsignup = \"open\"\ndefault_roles = [\"guest\", \"member\"]",
+            );
+        assert_eq!(
+            problems(&text),
+            vec![
+                ManifestProblem::DirectoryUndeclaredRole {
+                    role: ident("auditor")
+                },
+                ManifestProblem::DefaultRoleUndeclared {
+                    role: ident("guest")
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn 로그인_방법은_비어_있지_않고_아는_값이어야_한다() {
+        let empty = WITH_AUTH.replace("methods = [\"email_link\"]", "methods = []");
+        assert_eq!(problems(&empty), vec![ManifestProblem::AuthNoMethod]);
+        let unknown = WITH_AUTH.replace(
+            "methods = [\"email_link\"]",
+            "methods = [\"email_link\", \"password\"]",
+        );
+        assert_eq!(
+            problems(&unknown),
+            vec![ManifestProblem::AuthUnknownMethod {
+                method: "password".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn 누구나_가입하면_기본_역할이_있어야_하고_초대로만_들어오면_기본_역할을_적지_못한다() {
+        let open = WITH_AUTH.replace(
+            "login_path = \"/login\"",
+            "login_path = \"/login\"\nsignup = \"open\"",
+        );
+        assert_eq!(
+            problems(&open),
+            vec![ManifestProblem::OpenSignupWithoutDefaultRoles]
+        );
+        let fixed = open.replace(
+            "signup = \"open\"",
+            "signup = \"open\"\ndefault_roles = [\"member\"]",
+        );
+        assert!(parse(&fixed).check().is_ok());
+        let invite = WITH_AUTH.replace(
+            "login_path = \"/login\"",
+            "login_path = \"/login\"\ndefault_roles = [\"member\"]",
+        );
+        assert_eq!(
+            problems(&invite),
+            vec![ManifestProblem::DefaultRolesWithoutOpenSignup]
+        );
+        let bad = WITH_AUTH.replace(
+            "login_path = \"/login\"",
+            "login_path = \"/login\"\nsignup = \"anyone\"",
+        );
+        assert!(toml::from_str::<Manifest>(&bad).is_err());
+    }
+
+    #[test]
+    fn orbital_auth_와_orbital_은_선언에_적지_못한다() {
+        // 스키마 · 역할 이름으로 orbital_auth 를 적으면 읽지 않는다
+        let schema = WITH_AUTH.replace("schemas = [\"app\"]", "schemas = [\"orbital_auth\"]");
+        assert!(toml::from_str::<Manifest>(&schema).is_err());
+        let role = WITH_AUTH.replace(
+            "roles = [\"member\", \"manager\"]\n\n[auth]",
+            "roles = [\"member\", \"manager\", \"orbital_auth\"]\n\n[auth]",
+        );
+        assert!(toml::from_str::<Manifest>(&role).is_err());
+        // 서비스의 경로와 로그인 화면은 /_orbital 로 시작하지 못한다
+        let service = WITH_AUTH.replace("path = \"/api\"", "path = \"/_orbital/api\"");
+        assert_eq!(
+            problems(&service),
+            vec![ManifestProblem::LayerPath {
+                path: "/_orbital/api".to_owned()
+            }]
+        );
+        for path in ["/_orbital", "/_orbital/login", "/_orbitalx"] {
+            let login = WITH_AUTH.replace(
+                "login_path = \"/login\"",
+                &format!("login_path = \"{path}\""),
+            );
+            assert_eq!(
+                problems(&login),
+                vec![ManifestProblem::LayerPath {
+                    path: path.to_owned()
+                }],
+                "{path}"
+            );
+        }
+        // 비슷하지만 다른 경로는 받는다
+        let near = WITH_AUTH.replace("login_path = \"/login\"", "login_path = \"/orbital/login\"");
+        assert!(parse(&near).check().is_ok());
     }
 
     #[test]

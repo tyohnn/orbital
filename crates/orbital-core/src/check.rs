@@ -192,6 +192,9 @@ impl fmt::Display for Finding {
 /// 레이어와 Postgres 가 두는 스키마. 선언에 없어도 된다.
 const LAYER_SCHEMAS: [&str; 2] = ["public", "orbital"];
 
+/// Orbital Auth 의 스키마. `[auth]` 를 선언한 인스턴스에만 있어야 한다.
+pub const AUTH_SCHEMA: &str = "orbital_auth";
+
 /// 실제 DB 가 선언과 권한 표에 맞는지 본다. 빈 목록이 통과다.
 pub fn judge(
     names: &Names,
@@ -206,12 +209,14 @@ pub fn judge(
         findings.push(Finding::PublicCanConnect);
     }
 
+    let auth = manifest.get().auth.is_some();
     for schema in &snapshot.schemas {
         let declared = database
             .schemas
             .iter()
             .any(|candidate| candidate.as_str() == schema);
-        if !declared && !LAYER_SCHEMAS.contains(&schema.as_str()) {
+        let layer = LAYER_SCHEMAS.contains(&schema.as_str()) || (auth && schema == AUTH_SCHEMA);
+        if !declared && !layer {
             findings.push(Finding::SchemaNotDeclared {
                 schema: schema.clone(),
             });
@@ -304,6 +309,9 @@ pub fn judge(
     let mut wanted_roles: BTreeMap<String, bool> = BTreeMap::new();
     wanted_roles.insert(owner.clone(), false);
     wanted_roles.insert(names.migrator(), true);
+    if auth {
+        wanted_roles.insert(names.auth(), true);
+    }
     wanted_roles.extend(groups.keys().map(|group| (group.clone(), false)));
     wanted_roles.extend(logins.iter().map(|login| (login.name.clone(), true)));
 
@@ -690,6 +698,58 @@ pub(crate) mod tests {
                 },
                 Finding::RoleMissing {
                     role: "i_k3f9x2ab_migrator".to_owned()
+                },
+            ]
+        );
+    }
+
+    /// 계획대로 세운 DB 에 Orbital Auth 의 스키마와 인증 역할을 더한다.
+    fn with_auth_installed() -> Snapshot {
+        let mut snapshot = standard();
+        snapshot.schemas.push(AUTH_SCHEMA.to_owned());
+        snapshot.roles.push(RoleState {
+            name: names().auth(),
+            login: true,
+            superuser: false,
+            create_db: false,
+            create_role: false,
+            replication: false,
+            bypass_rls: false,
+        });
+        snapshot
+    }
+
+    #[test]
+    fn auth_를_선언한_db_는_orbital_auth_와_인증_역할이_있어도_통과한다() {
+        let manifest = crate::plan::tests::with_auth();
+        let access = Access::parse(
+            &toml::from_str::<crate::access::RawAccess>(ACCESS).unwrap(),
+            &manifest,
+        )
+        .unwrap();
+        assert_eq!(
+            judge(&names(), &manifest, &access, &with_auth_installed()),
+            vec![]
+        );
+        // 인증 역할이 없으면 모자란 것이다
+        assert_eq!(
+            judge(&names(), &manifest, &access, &standard()),
+            vec![Finding::RoleMissing {
+                role: names().auth()
+            }]
+        );
+    }
+
+    #[test]
+    fn auth_를_선언하지_않은_db_에_orbital_auth_나_인증_역할이_있으면_실패한다() {
+        assert_eq!(
+            run(&with_auth_installed()),
+            vec![
+                Finding::SchemaNotDeclared {
+                    schema: AUTH_SCHEMA.to_owned()
+                },
+                Finding::RoleNotDeclared {
+                    role: names().auth()
                 },
             ]
         );

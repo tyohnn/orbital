@@ -8,7 +8,9 @@ use orbital_core::access::{Access, Grant, Privilege, RawAccess, Reach};
 use orbital_core::check::{
     Finding, Membership, RoleState, Snapshot, TableState, judge as judge_database,
 };
-use orbital_core::manifest::{Database, Manifest, Service, ServiceKind, ValidManifest};
+use orbital_core::manifest::{
+    Database, Manifest, Service, ServiceAuth, ServiceKind, ValidManifest,
+};
 use orbital_core::name::{Ident, InstanceId, TableRef};
 use orbital_core::plan::{Names, Step, grants, provision};
 use orbital_core::scope::{
@@ -51,6 +53,7 @@ fn manifest(api: &[bool; 3], worker: &[bool; 3]) -> ValidManifest {
         output: None,
         path: path.to_owned(),
         roles: pick(mask),
+        auth: ServiceAuth::Optional,
     };
     Manifest {
         services: vec![
@@ -351,6 +354,49 @@ proptest! {
         if judge(&token, &request) == Verdict::Allow {
             prop_assert_eq!(judge(&wider, &request), Verdict::Allow);
         }
+    }
+}
+
+/// 로그인 뒤에 돌아갈 곳의 후보. 브라우저가 주소를 다르게 읽게 만드는 글자(`/` · `\` · `:` · 제어 문자 · 공백)가 자주 나오게 좁힌다.
+fn next() -> impl Strategy<Value = String> {
+    const PIECES: [&str; 22] = [
+        "/",
+        "/",
+        "//",
+        "\\",
+        ":",
+        ".",
+        "..",
+        "@",
+        "a",
+        "evil.example",
+        "https:",
+        "javascript:",
+        "?",
+        "#",
+        "%2F",
+        "\t",
+        "\n",
+        "\r",
+        "\u{0}",
+        " ",
+        "\u{7f}",
+        "\u{3000}",
+    ];
+    proptest::collection::vec(0usize..PIECES.len(), 0..8)
+        .prop_map(|picks| picks.into_iter().map(|index| PIECES[index]).collect())
+}
+
+proptest! {
+    #[test]
+    fn 어떤_next_를_넣어도_돌아갈_곳은_이_주소_안이다(next in next()) {
+        // 오라클은 브라우저와 같은 규칙(WHATWG URL)으로 읽는 `url` 이다. 이 주소에서 돌아갈 곳을 읽었을 때 주소가 바뀌지 않아야 한다
+        let here = url::Url::parse("https://app.example/inbox/").unwrap();
+        let safe = orbital_core::auth::safe_next(&next);
+        let resolved = here.join(&safe).unwrap();
+        prop_assert_eq!(resolved.origin(), here.origin(), "{:?} → {:?}", next, safe);
+        // 바꾼다면 첫 화면으로만 바꾼다. 받은 것은 고치지 않고 그대로 돌려준다
+        prop_assert!(safe == "/" || safe == next, "{:?} → {:?}", next, safe);
     }
 }
 

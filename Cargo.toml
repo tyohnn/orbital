@@ -20,6 +20,8 @@ hmac = "0.12"
 sha2 = "0.10"
 tiny_http = "0.12"
 ureq = { version = "2", default-features = false, features = ["json"] }
+url = "2"
+getrandom = "0.4"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

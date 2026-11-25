@@ -59,6 +59,11 @@ impl Names {
         format!("{}_s_{service}_{role}", self.prefix())
     }
 
+    /// Orbital Auth 의 역할. 레이어의 로그인 뒤쪽이 이 역할로 `orbital_auth` 의 표를 읽고 쓴다. 앱의 스키마에는 닿지 못한다.
+    pub fn auth(&self) -> String {
+        format!("{}_auth", self.prefix())
+    }
+
     /// 이 이름이 이 인스턴스의 것인가. 머리말 뒤가 `_` 로 이어져야 한다(`i_abc` 는 `i_abcd_owner` 의 주인이 아니다).
     pub fn owns(&self, name: &str) -> bool {
         name.strip_prefix(&self.prefix())
@@ -272,6 +277,16 @@ pub fn logins(names: &Names, manifest: &ValidManifest) -> Vec<Login> {
     logins
 }
 
+/// 인스턴스의 database 에 접속하는 역할. 마이그레이션 역할, 인증 역할(`[auth]` 를 선언했을 때), 서비스의 로그인이다.
+pub fn connectors(names: &Names, manifest: &ValidManifest) -> Vec<String> {
+    let mut roles = vec![names.migrator()];
+    if manifest.get().auth.is_some() {
+        roles.push(names.auth());
+    }
+    roles.extend(logins(names, manifest).into_iter().map(|login| login.name));
+    roles
+}
+
 /// 인스턴스를 처음 세울 때의 단계. 역할, database, 스키마까지다. 표의 권한은 마이그레이션 뒤에 [`grants`] 가 세운다.
 ///
 /// database 의 주인은 레이어의 관리 역할이다. 인스턴스의 소유자는 선언한 스키마만 갖고, 새 스키마를 만들지 못한다.
@@ -293,6 +308,13 @@ pub fn provision(names: &Names, manifest: &ValidManifest) -> Vec<Step> {
             set: true,
         },
     ];
+    if manifest.get().auth.is_some() {
+        // 어느 묶음에도 딸리지 않는다. 권한은 `orbital_auth` 를 둘 때 그 표에만 준다
+        steps.push(Step::CreateRole {
+            name: names.auth(),
+            login: true,
+        });
+    }
     for role in &database.roles {
         steps.push(Step::CreateRole {
             name: names.group(role),
@@ -318,14 +340,10 @@ pub fn provision(names: &Names, manifest: &ValidManifest) -> Vec<Step> {
     steps.push(Step::RevokeDatabaseFromPublic {
         database: names.database(),
     });
-    steps.push(Step::GrantConnect {
-        database: names.database(),
-        role: names.migrator(),
-    });
-    for login in &logins {
+    for role in connectors(names, manifest) {
         steps.push(Step::GrantConnect {
             database: names.database(),
-            role: login.name.clone(),
+            role,
         });
     }
     steps.push(Step::RevokePublicSchemaFromPublic);
@@ -420,7 +438,8 @@ pub fn grants(
 
 /// 클러스터에 남아 있지만 선언에는 없는 이 인스턴스의 역할. 서비스나 역할을 선언에서 빼면 생긴다.
 pub fn stale_roles(names: &Names, manifest: &ValidManifest, existing: &[String]) -> Vec<String> {
-    let mut wanted: BTreeSet<String> = [names.owner(), names.migrator()].into();
+    let mut wanted: BTreeSet<String> = [names.owner()].into();
+    wanted.extend(connectors(names, manifest));
     wanted.extend(
         manifest
             .get()
@@ -429,7 +448,6 @@ pub fn stale_roles(names: &Names, manifest: &ValidManifest, existing: &[String])
             .iter()
             .map(|role| names.group(role)),
     );
-    wanted.extend(logins(names, manifest).into_iter().map(|login| login.name));
     existing
         .iter()
         .filter(|name| names.owns(name) && !wanted.contains(*name))
@@ -633,6 +651,67 @@ pub(crate) mod tests {
                 "i_k3f9x2ab_s_worker_employee".to_owned(),
                 "i_k3f9x2ab_r_auditor".to_owned()
             ]
+        );
+    }
+
+    pub(crate) fn with_auth() -> ValidManifest {
+        let text = format!(
+            "{}\n[auth]\nmethods = [\"email_link\"]\nlogin_path = \"/login\"\ndirectory = [\"manager\"]\n",
+            crate::access::tests::MANIFEST
+        );
+        toml::from_str::<crate::manifest::Manifest>(&text)
+            .unwrap()
+            .check()
+            .unwrap()
+    }
+
+    #[test]
+    fn 인증_역할의_이름은_인스턴스의_머리말에_auth_를_단다() {
+        assert_eq!(names().auth(), "i_k3f9x2ab_auth");
+        assert!(names().owns(&names().auth()));
+    }
+
+    #[test]
+    fn auth_를_선언하면_인증_역할이_로그인으로_서고_database_에만_접속하고_어느_묶음에도_딸리지_않는다()
+     {
+        let steps = provision(&names(), &with_auth());
+        assert!(steps.contains(&Step::CreateRole {
+            name: "i_k3f9x2ab_auth".to_owned(),
+            login: true
+        }));
+        assert!(steps.contains(&Step::GrantConnect {
+            database: "i_k3f9x2ab".to_owned(),
+            role: "i_k3f9x2ab_auth".to_owned()
+        }));
+        assert!(!steps.iter().any(|step| matches!(
+            step,
+            Step::GrantMembership { group, member, .. } if group == "i_k3f9x2ab_auth" || member == "i_k3f9x2ab_auth"
+        )));
+    }
+
+    #[test]
+    fn auth_를_선언하지_않은_선언의_계획에는_인증_역할이_없다() {
+        let steps = provision(&names(), &manifest());
+        let with = provision(&names(), &with_auth());
+        assert!(!format!("{steps:?}").contains("_auth"));
+        // auth 를 더해도 그 밖의 단계는 같다
+        let rest: Vec<_> = with
+            .into_iter()
+            .filter(|step| !format!("{step:?}").contains("i_k3f9x2ab_auth"))
+            .collect();
+        assert_eq!(rest, steps);
+    }
+
+    #[test]
+    fn 인증_역할은_auth_를_선언했을_때만_남은_역할이_아니다() {
+        let existing = ["i_k3f9x2ab_auth".to_owned()];
+        assert_eq!(
+            stale_roles(&names(), &with_auth(), &existing),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            stale_roles(&names(), &manifest(), &existing),
+            vec!["i_k3f9x2ab_auth".to_owned()]
         );
     }
 

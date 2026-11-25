@@ -4,6 +4,7 @@
 //! 실제 Postgres 에 닿는 일은 `orbital-pg` 가, 연결을 잇는 일은 `orbital-proxy` 가 한다.
 
 pub mod access;
+pub mod auth;
 pub mod check;
 pub mod describe;
 pub mod manifest;

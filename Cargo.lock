@@ -642,12 +642,14 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "url",
 ]
 
 [[package]]
 name = "orbital-pg"
 version = "0.0.0"
 dependencies = [
+ "getrandom",
  "hmac 0.12.1",
  "orbital-core",
  "postgres",

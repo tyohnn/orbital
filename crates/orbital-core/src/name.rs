@@ -34,8 +34,14 @@ impl Ident {
     pub const MAX: usize = 24;
 
     /// 레이어와 Postgres 가 쓰는 이름. 고객의 선언이 이 자리를 차지하지 못한다.
-    const RESERVED: [&'static str; 5] =
-        ["public", "orbital", "information_schema", "postgres", "rls"];
+    const RESERVED: [&'static str; 6] = [
+        "public",
+        "orbital",
+        "orbital_auth",
+        "information_schema",
+        "postgres",
+        "rls",
+    ];
 
     pub fn parse(text: &str) -> Result<Self, NameError> {
         if text.is_empty() {
@@ -214,6 +220,7 @@ mod tests {
         for reserved in [
             "public",
             "orbital",
+            "orbital_auth",
             "information_schema",
             "postgres",
             "rls",
