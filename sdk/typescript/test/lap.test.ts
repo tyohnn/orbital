@@ -228,6 +228,7 @@ test("팩토리의 서버가 인스턴스를 세워 토큰을 내고 에이전�
         commit: git(work, "rev-parse", "HEAD"),
         changes: ["`member` 역할이 `todo.card` 표를 자기 행을 읽을 수 있게 됩니다 그리고 자기 행을 고칠 수 있게 됩니다"],
         migrations: ["001_card.sql"],
+        newSecrets: [],
     });
 
     // 고객의 요청은 고객이 승인한다. 팩토리의 승인으로는 오르지 않고 까닭이 돌아온다

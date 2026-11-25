@@ -65,6 +65,41 @@ export interface PendingPromotion
     changes: string[];
     /** 운영에 아직 돌지 않은 마이그레이션의 이름. */
     migrations: string[];
+    /** 이번 변경으로 앱이 새로 받게 되는 밖에서 넣는 비밀의 이름. 지금의 운영과 견준다. 사람이 무엇을 승인하는지 읽는다. */
+    newSecrets: string[];
+}
+
+/**
+ * 밖에서 넣는 비밀의 단계. 값은 단계마다 따로이고 서로 넘어가지 않는다.
+ * 프리뷰의 앱은 에이전트가 쓴 코드이고 에이전트가 그 로그와 답을 읽으므로, 프리뷰의 값은 에이전트가 볼 수 있다고 본다.
+ */
+export type SecretStage = "preview" | "production";
+
+/** 단계 하나의 칸. 값은 없고 채워졌는지와 그 때(Unix 초)만 있다. */
+export interface SecretSlot
+{
+    set: boolean;
+    setAt: number | null;
+}
+
+/** 비밀 하나의 모습. 값 · 지문 · 길이는 어떤 열쇠로도 돌아오지 않는다. */
+export interface Secret
+{
+    name: string;
+    /** 이 인스턴스의 release(프리뷰로 세운 것과 운영의 것) 가운데 `[secrets] external` 에 적은 것이 있는가. */
+    declared: boolean;
+    /** 에이전트의 요청. 없으면 `null` 이다. */
+    requested: { reason: string; at: number } | null;
+    preview: SecretSlot;
+    production: SecretSlot;
+}
+
+/** 사람이 값을 넣을 입력 표. `url` 에 표가 실려 있고, 사람의 브라우저가 이 주소로 `{ value }` 를 바로 `POST` 한다. 10분 안에 한 번 쓴다. */
+export interface SecretEntry
+{
+    url: string;
+    /** 만료되는 때(Unix 초). */
+    expiresAt: number;
 }
 
 /** 관리 서버가 받지 않은 요청. `code` 로 갈라 다루고 `message` 와 `details` 는 사람과 에이전트에게 보여 준다. */
@@ -170,6 +205,21 @@ export interface Orbital
             set(input: { mail?: MailSettings | null; google?: GoogleSettings | null }): Promise<AuthSettings>;
         };
     };
+    secrets: {
+        /** 이름마다 선언됐는지 · 요청됐는지 · 단계마다 채워졌는지. 값은 돌아오지 않는다. */
+        list(instance: string): Promise<Secret[]>;
+        /** 사람에게 입력을 요청한다. `orbital.toml` 의 `[secrets] external` 에 적고 프리뷰를 세운 이름만 받는다. */
+        request(instance: string, name: string, input: { reason: string }): Promise<void>;
+        /**
+         * 값을 넣는다. 값이 팩토리의 서버를 지나는 길이라, 사람이 넣는 값은 `entry` 로 레이어에 바로 보내게 한다.
+         * 운영의 값을 바꾸면 도는 서비스가 자고, 다음 요청이 새 값으로 깬다. 봉인의 열쇠가 없는 레이어에서는 409 다.
+         */
+        set(instance: string, name: string, input: { stage: SecretStage; value: string }): Promise<void>;
+        /** 값을 지운다. 지금 운영의 release 가 쓰는 비밀의 운영 값은 409 로 거절된다. */
+        remove(instance: string, name: string, input: { stage: SecretStage }): Promise<void>;
+        /** 사람의 입력 표를 받는다. 인스턴스 · 이름 · 단계 하나에 묶인다. 카드가 이 주소로 값을 보낸다. */
+        entry(instance: string, name: string, input: { stage: SecretStage }): Promise<SecretEntry>;
+    };
     oauthClients: {
         /**
          * MCP 의 OAuth 클라이언트를 미리 등록한다(`[auth.mcp]` 를 선언한 인스턴스만). redirect 는 `https` 이거나 `localhost` 여야 한다.
@@ -220,6 +270,24 @@ function toUser(value: Record<string, unknown>): User
         roles: texts(value.roles),
         disabled: value.disabled === true,
         lastSignedInAt: typeof value.last_signed_in_at === "number" ? value.last_signed_in_at : null,
+    };
+}
+
+function toSlot(value: unknown): SecretSlot
+{
+    const record = isRecord(value) ? value : {};
+    return { set: record.set === true, setAt: typeof record.set_at === "number" ? record.set_at : null };
+}
+
+function toSecret(value: Record<string, unknown>): Secret
+{
+    const requested = isRecord(value.requested) ? value.requested : null;
+    return {
+        name: text(value.name),
+        declared: value.declared === true,
+        requested: requested === null ? null : { reason: text(requested.reason), at: typeof requested.at === "number" ? requested.at : 0 },
+        preview: toSlot(value.preview),
+        production: toSlot(value.production),
     };
 }
 
@@ -327,6 +395,7 @@ export function createOrbital(options: OrbitalOptions): Orbital
                     commit: text(reply.commit),
                     changes: texts(reply.changes),
                     migrations: texts(reply.migrations),
+                    newSecrets: texts(reply.new_secrets),
                 };
             },
             async promote({ instance, release, change, approvedBy })
@@ -387,6 +456,32 @@ export function createOrbital(options: OrbitalOptions): Orbital
                     }
                     return toAuthSettings(await call("PUT", "settings/auth", body));
                 },
+            },
+        },
+        secrets: {
+            async list(instance)
+            {
+                const reply = await call("GET", at(instance, "/secrets"));
+                const secrets = isRecord(reply) && Array.isArray(reply.secrets) ? reply.secrets.filter(isRecord) : [];
+                return secrets.map(toSecret);
+            },
+            async request(instance, name, { reason })
+            {
+                await call("POST", at(instance, `/secrets/${encodeURIComponent(name)}/request`), { reason });
+            },
+            async set(instance, name, { stage, value })
+            {
+                await call("PUT", at(instance, `/secrets/${encodeURIComponent(name)}`), { stage, value });
+            },
+            async remove(instance, name, { stage })
+            {
+                await call("DELETE", at(instance, `/secrets/${encodeURIComponent(name)}?stage=${encodeURIComponent(stage)}`));
+            },
+            async entry(instance, name, { stage })
+            {
+                const reply = await call("POST", at(instance, `/secrets/${encodeURIComponent(name)}/entries`), { stage });
+                const record = isRecord(reply) ? reply : {};
+                return { url: text(record.url), expiresAt: typeof record.expires_at === "number" ? record.expires_at : 0 };
             },
         },
         oauthClients: {
