@@ -8,6 +8,7 @@ pub mod auth;
 pub mod backup;
 pub mod check;
 pub mod describe;
+pub mod git;
 pub mod google;
 pub mod host;
 pub mod manifest;

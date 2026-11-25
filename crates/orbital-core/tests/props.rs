@@ -328,6 +328,7 @@ proptest! {
 fn capability() -> impl Strategy<Value = Capability> {
     prop_oneof![
         Just(Capability::Source),
+        Just(Capability::SourceRead),
         Just(Capability::Preview),
         Just(Capability::Rehearse),
         Just(Capability::SecretsRequest)
@@ -369,7 +370,7 @@ fn token() -> impl Strategy<Value = Token> {
     (
         organization(),
         instance(),
-        proptest::collection::btree_set(capability(), 0..=4),
+        proptest::collection::btree_set(capability(), 0..=5),
         0u64..6,
     )
         .prop_map(|(organization, instance, can, expires_at)| Token {
@@ -433,6 +434,39 @@ proptest! {
         wider.can.insert(extra);
         if judge(&token, &request) == Verdict::Allow {
             prop_assert_eq!(judge(&wider, &request), Verdict::Allow);
+        }
+    }
+}
+
+/// git 의 길 넷. 받기와 올리기마다 광고와 주고받기가 있다.
+fn git_route() -> impl Strategy<Value = (&'static str, &'static [&'static str], &'static str)> {
+    prop_oneof![
+        Just(("GET", &["info", "refs"][..], "service=git-upload-pack")),
+        Just(("GET", &["info", "refs"][..], "service=git-receive-pack")),
+        Just(("POST", &["git-upload-pack"][..], "")),
+        Just(("POST", &["git-receive-pack"][..], "")),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn 어떤_토큰도_다른_인스턴스의_git_에_닿지_못한다(
+        token in token(),
+        organization in organization(),
+        instance in instance(),
+        (method, tail, query) in git_route(),
+        at in 0u64..6,
+    ) {
+        let route = orbital_core::git::route(method, tail, query).expect("정해진 길이다");
+        let request = Request { organization: organization.clone(), instance: instance.clone(), action: route.service().action(), at };
+        let verdict = judge(&token, &request);
+        if token.instance != instance || token.organization != organization {
+            // 다른 인스턴스는 만료됐는지도, 능력이 있는지도 알려 주지 않고 없는 것으로 답한다
+            prop_assert_eq!(verdict, Verdict::Deny(DenyReason::NotFound));
+        }
+        // 올리기는 받기만 하는 능력으로 열리지 않는다
+        if method == "POST" && tail == ["git-receive-pack"] && !token.can.contains(&Capability::Source) {
+            prop_assert_ne!(verdict, Verdict::Allow);
         }
     }
 }
@@ -1039,6 +1073,7 @@ mod rollout {
     fn capability() -> impl Strategy<Value = Capability> {
         prop_oneof![
             Just(Capability::Source),
+            Just(Capability::SourceRead),
             Just(Capability::Preview),
             Just(Capability::Rehearse),
             Just(Capability::SecretsRequest)
@@ -1227,6 +1262,7 @@ mod backup {
     fn capability() -> impl Strategy<Value = Capability> {
         prop_oneof![
             Just(Capability::Source),
+            Just(Capability::SourceRead),
             Just(Capability::Preview),
             Just(Capability::Rehearse),
             Just(Capability::SecretsRequest)

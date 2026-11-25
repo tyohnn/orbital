@@ -21,6 +21,8 @@ pub struct OrganizationId(pub String);
 pub enum Capability {
     /// 코드를 받고 올린다.
     Source,
+    /// 코드를 받기만 한다. 올리지 못한다.
+    SourceRead,
     /// 프리뷰를 세우고, 그 로그와 DB(씨앗 데이터)를 본다. 승격을 요청한다.
     Preview,
     /// 운영 사본에 마이그레이션을 리허설한다. 숫자만 돌아온다.
@@ -60,17 +62,18 @@ pub enum Action {
 }
 
 impl Action {
-    /// 이 일에 필요한 능력. `None` 이면 토큰으로는 할 수 없는 일이다.
-    pub fn needs(&self) -> Option<Capability> {
+    /// 이 일을 허락하는 능력. 그 가운데 하나만 있으면 된다. `None` 이면 토큰으로는 할 수 없는 일이다.
+    pub fn needs(&self) -> Option<&'static [Capability]> {
         match self {
+            Self::SourceRead => Some(&[Capability::Source, Capability::SourceRead]),
             // 업데이트를 받아 합치는 것이 코드의 일이다
-            Self::SourceRead | Self::SourceWrite | Self::RolloutView => Some(Capability::Source),
+            Self::SourceWrite | Self::RolloutView => Some(&[Capability::Source]),
             Self::PreviewDeploy
             | Self::PreviewLogs
             | Self::PreviewDatabase
-            | Self::RequestPromotion => Some(Capability::Preview),
-            Self::Rehearse => Some(Capability::Rehearse),
-            Self::SecretsRequest | Self::SecretsList => Some(Capability::SecretsRequest),
+            | Self::RequestPromotion => Some(&[Capability::Preview]),
+            Self::Rehearse => Some(&[Capability::Rehearse]),
+            Self::SecretsRequest | Self::SecretsList => Some(&[Capability::SecretsRequest]),
             Self::Promote
             | Self::ProductionLogs
             | Self::ProductionDatabase
@@ -131,7 +134,7 @@ pub fn judge(token: &Token, request: &Request) -> Verdict {
     }
     match request.action.needs() {
         None => Verdict::Deny(DenyReason::ServiceKeyOnly),
-        Some(capability) if token.can.contains(&capability) => Verdict::Allow,
+        Some(any) if any.iter().any(|capability| token.can.contains(capability)) => Verdict::Allow,
         Some(_) => Verdict::Deny(DenyReason::NotGranted),
     }
 }
@@ -158,8 +161,9 @@ mod tests {
         }
     }
 
-    const ALL: [Capability; 4] = [
+    const ALL: [Capability; 5] = [
         Capability::Source,
+        Capability::SourceRead,
         Capability::Preview,
         Capability::Rehearse,
         Capability::SecretsRequest,
@@ -176,6 +180,24 @@ mod tests {
         assert_eq!(
             judge(&token, &request(Action::RequestPromotion)),
             Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn 받기만_하는_토큰은_코드를_받고_올리지는_못한다() {
+        let token = token(&[Capability::SourceRead]);
+        assert_eq!(judge(&token, &request(Action::SourceRead)), Verdict::Allow);
+        assert_eq!(
+            judge(&token, &request(Action::SourceWrite)),
+            Verdict::Deny(DenyReason::NotGranted)
+        );
+        assert_eq!(
+            judge(&token, &request(Action::RolloutView)),
+            Verdict::Deny(DenyReason::NotGranted)
+        );
+        assert_eq!(
+            serde_json::to_string(&Capability::SourceRead).unwrap(),
+            r#""source_read""#
         );
     }
 
