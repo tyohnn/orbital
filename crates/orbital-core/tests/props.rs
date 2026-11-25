@@ -174,7 +174,7 @@ fn words() -> impl Strategy<Value = [[usize; 3]; 4]> {
 }
 
 fn privilege() -> impl Strategy<Value = Privilege> {
-    (0usize..7).prop_map(|index| Privilege::ALL[index])
+    (0usize..8).prop_map(|index| Privilege::ALL[index])
 }
 
 proptest! {

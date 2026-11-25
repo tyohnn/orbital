@@ -86,10 +86,12 @@ pub enum Privilege {
     Truncate,
     References,
     Trigger,
+    /// PostgreSQL 17 부터 있다(VACUUM · ANALYZE · REINDEX 같은 관리).
+    Maintain,
 }
 
 impl Privilege {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Select,
         Self::Insert,
         Self::Update,
@@ -97,7 +99,15 @@ impl Privilege {
         Self::Truncate,
         Self::References,
         Self::Trigger,
+        Self::Maintain,
     ];
+
+    /// Postgres 가 권한을 부르는 이름에서 읽는다.
+    pub fn from_sql(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|privilege| privilege.sql() == text)
+    }
 
     pub fn sql(&self) -> &'static str {
         match self {
@@ -108,6 +118,7 @@ impl Privilege {
             Self::Truncate => "TRUNCATE",
             Self::References => "REFERENCES",
             Self::Trigger => "TRIGGER",
+            Self::Maintain => "MAINTAIN",
         }
     }
 }
