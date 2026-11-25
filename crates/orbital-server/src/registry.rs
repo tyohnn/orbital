@@ -37,6 +37,9 @@ pub struct ProductionRecord {
     /// 레이어가 만든 비밀. 승격해도 바뀌지 않아야 로그인이 풀리지 않는다.
     #[serde(default)]
     pub generated: BTreeMap<String, String>,
+    /// 하위 도메인을 쓰지 않는 레이어에서 운영의 router 가 듣던 포트. 다시 뜰 때 먼저 잡아 주소가 바뀌지 않게 한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -53,6 +56,33 @@ pub struct InstanceRecord {
     /// 프리뷰가 쓰는 database 의 식별자. 관리 서버가 다시 뜨면 프리뷰는 되살리지 않고 이것으로 남은 database 를 걷는다.
     #[serde(default)]
     pub preview: Option<String>,
+    /// 운영의 일정마다(`Schedule::key`) 다음 때와 마지막 실행. 같은 때를 두 번 부르지 않게 부르기 전에 적는다.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub schedules: BTreeMap<String, ScheduleRecord>,
+}
+
+/// 일정 하나의 기록.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleRecord {
+    /// 다음에 부를 때(유닉스 초).
+    pub next_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<ScheduleRun>,
+}
+
+/// 일정을 한 번 부른 것. 숫자와 갈래만 있다(앱의 답의 본문은 적지 않는다).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleRun {
+    /// 이번에 맞춘 때. 레이어가 내려가 있어 놓쳤으면 놓친 때 가운데 마지막 것이다.
+    pub due_at: u64,
+    /// 실제로 부른 때.
+    pub started_at: u64,
+    /// `running` · `ok`(2xx) · `failed`(그 밖의 답) · `unreachable`(깨우지 못함 · 닿지 못함) · `timed_out`.
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub millis: Option<u64>,
 }
 
 /// rollout 하나. 어느 팩토리의 것인지와 core 가 판정하는 진행.

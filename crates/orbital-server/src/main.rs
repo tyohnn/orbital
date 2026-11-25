@@ -31,6 +31,9 @@
 //!   빌드는 에이전트가 쓴 코드를 돌리므로 여기에 적은 값은 그 코드가 읽는다. `ORBITAL_` · `PG` 로 시작하는 이름과 `PATH` · `HOME` 은 받지 않는다.
 //!   서버를 띄울 때와 적합성 테스트에는 건네지 않는다
 //!
+//! - `ORBITAL_SCHEDULE_TIMEOUT`: 선언의 일정(`[[schedule]]`)으로 부른 요청에 앱이 답하기를 기다리는 초(기본 600). 넘으면 시간 초과로 적고
+//!   다시 부르지 않는다. 일정은 1분마다 보고, 운영의 인스턴스만 그 시각(UTC)에 부른다
+//!
 //! `orbitald drill` 은 복구 훈련을 한 번만 돌리고 끝난다. 관리 서버가 떠 있어도 함께 돌 수 있다(`ORBITAL_HOME` · `ORBITAL_PG` ·
 //! `ORBITAL_BACKUP_DIR` 만 읽는다). 훈련이 실패하면 0 이 아닌 코드로 끝나고, 기록 한 줄(이름과 숫자만)을 찍는다.
 //!
@@ -179,6 +182,7 @@ fn start() -> Result<(), String> {
     };
     let backup = backup_options()?;
     let backup_every = seconds("ORBITAL_BACKUP_EVERY", 24 * 60 * 60)?;
+    let schedule_timeout = seconds("ORBITAL_SCHEDULE_TIMEOUT", 10 * 60)?;
     let drill_every = seconds("ORBITAL_DRILL_EVERY", 7 * 24 * 60 * 60)?;
     let build_env = orbital_run::build_env(
         &std::env::var("ORBITAL_BUILD_ENV").unwrap_or_default(),
@@ -193,6 +197,7 @@ fn start() -> Result<(), String> {
         dev_mailbox,
         sleep_after,
         hosting,
+        schedule_timeout,
         ..Options::new(
             setting("ORBITAL_HOME")?.into(),
             setting("ORBITAL_PG")?,
@@ -225,6 +230,17 @@ fn start() -> Result<(), String> {
             }
         });
     }
+    // 일정: 분이 바뀔 때마다 때가 된 것을 부른다. 부르는 일은 따로 된 스레드에서 돌아 이 고리를 막지 않는다
+    let scheduled = Arc::clone(&layer);
+    std::thread::spawn(move || {
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            std::thread::sleep(Duration::from_secs(60 - now % 60));
+            drop(scheduled.call_schedules());
+        }
+    });
     serve(layer, server);
     Ok(())
 }

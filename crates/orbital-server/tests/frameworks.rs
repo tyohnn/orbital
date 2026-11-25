@@ -9,7 +9,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use orbital_router::Outbox;
@@ -106,8 +107,9 @@ fn kib(folder: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// 이 테스트가 운영자로서 여는 레이어. 빌드에는 [`OPERATOR_ENV`] 의 것만 건넨다.
-fn open_layer(home: &Path, pg_url: &str, sleep_after: Duration) -> Layer {
+/// 이 테스트가 운영자로서 여는 레이어. 빌드에는 [`OPERATOR_ENV`] 의 것만 건넨다. `clock` 이 0 이면 실제 시각을 읽는다.
+fn open_layer(home: &Path, pg_url: &str, sleep_after: Duration, clock: &Arc<AtomicU64>) -> Layer {
+    let clock = Arc::clone(clock);
     let runner = LocalRunner {
         build_env: build_env(OPERATOR_ENV, |name| std::env::var(name).ok()).unwrap(),
         ..LocalRunner::default()
@@ -117,6 +119,12 @@ fn open_layer(home: &Path, pg_url: &str, sleep_after: Duration) -> Layer {
         // 밖에서 넣는 비밀을 넣으려면 봉인의 열쇠가 있어야 한다. 테스트의 열쇠다
         seal_key: SealKey::from_hex(&"5e".repeat(32)),
         sleep_after,
+        clock: Arc::new(move || match clock.load(Ordering::SeqCst) {
+            0 => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
+            at => at,
+        }),
         ..Options::new(
             home.to_path_buf(),
             pg_url.to_owned(),
@@ -134,6 +142,8 @@ struct Bench {
     layer: Option<Layer>,
     pg_url: String,
     sleep_after: Duration,
+    /// 레이어가 읽는 시각. 0 이면 실제 시각이다. 일정의 때를 테스트가 만든다.
+    clock: Arc<AtomicU64>,
     app: &'static str,
     instances: Vec<String>,
 }
@@ -143,7 +153,8 @@ impl Bench {
         let on = std::env::var("ORBITAL_FRAMEWORKS").is_ok_and(|on| on == "1");
         let pg_url = std::env::var("ORBITAL_PG").ok().filter(|_| on)?;
         let scratch = Scratch::new();
-        let layer = open_layer(&scratch.path("home"), &pg_url, sleep_after);
+        let clock = Arc::new(AtomicU64::new(0));
+        let layer = open_layer(&scratch.path("home"), &pg_url, sleep_after, &clock);
         let scaffold = scratch.path("scaffold");
         copy_tree(source, &scaffold);
         git(&scaffold, &["init", "--quiet", "--initial-branch", "main"]);
@@ -166,6 +177,7 @@ impl Bench {
             layer: Some(layer),
             pg_url,
             sleep_after,
+            clock,
             app,
             instances: Vec::new(),
         };
@@ -187,7 +199,12 @@ impl Bench {
     fn restart(&mut self) -> Duration {
         drop(self.layer.take());
         let started = Instant::now();
-        self.layer = Some(open_layer(&self.home(), &self.pg_url, self.sleep_after));
+        self.layer = Some(open_layer(
+            &self.home(),
+            &self.pg_url,
+            self.sleep_after,
+            &self.clock,
+        ));
         started.elapsed()
     }
 
@@ -398,6 +415,76 @@ fn processes_in(folder: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// 이 빌드 폴더에서(작업 폴더로) 도는 프로세스가 TCP 로 듣는 주소. `/proc/<pid>/fd` 의 소켓과 `/proc/net/tcp(6)` 의 LISTEN 줄을 맞춘다.
+fn listening_in(folder: &Path) -> Vec<std::net::IpAddr> {
+    let Ok(folder) = fs::canonicalize(folder) else {
+        return Vec::new();
+    };
+    let mut sockets = std::collections::BTreeSet::new();
+    for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
+        if !fs::read_link(entry.path().join("cwd")).is_ok_and(|cwd| cwd.starts_with(&folder)) {
+            continue;
+        }
+        for fd in fs::read_dir(entry.path().join("fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if let Ok(target) = fs::read_link(fd.path()) {
+                let target = target.to_string_lossy().to_string();
+                if let Some(inode) = target
+                    .strip_prefix("socket:[")
+                    .and_then(|rest| rest.strip_suffix(']'))
+                {
+                    sockets.insert(inode.to_owned());
+                }
+            }
+        }
+    }
+    let mut addresses = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        for line in fs::read_to_string(table)
+            .unwrap_or_default()
+            .lines()
+            .skip(1)
+        {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 10 || fields[3] != "0A" || !sockets.contains(fields[9]) {
+                continue;
+            }
+            let hex = fields[1].split(':').next().unwrap_or_default();
+            let words: Vec<u32> = (0..hex.len() / 8)
+                .map(|at| {
+                    u32::from_str_radix(&hex[at * 8..at * 8 + 8], 16)
+                        .unwrap_or(0)
+                        .swap_bytes()
+                })
+                .collect();
+            let address = if words.len() == 1 {
+                std::net::IpAddr::from(words[0].to_be_bytes())
+            } else {
+                let mut bytes = [0u8; 16];
+                for (at, word) in words.iter().enumerate() {
+                    bytes[at * 4..at * 4 + 4].copy_from_slice(&word.to_be_bytes());
+                }
+                std::net::IpAddr::from(bytes)
+            };
+            addresses.push(address);
+        }
+    }
+    addresses
+}
+
+/// 앱의 서버가 이 기계 안(loopback)에서만 듣는가. 모든 주소(`0.0.0.0` · `::`)에서 들으면 router 를 거치지 않고 닿는다.
+fn assert_loopback_only(folder: &Path) {
+    let addresses = listening_in(folder);
+    assert!(!addresses.is_empty(), "듣는 소켓을 찾지 못했습니다");
+    assert!(
+        addresses.iter().all(std::net::IpAddr::is_loopback),
+        "앱이 loopback 밖에서도 듣습니다: {addresses:?}"
+    );
+}
+
 /// 운영의 사람이 하듯이 들어온다. 로그인 링크를 요청하고 메일함에서 링크를 꺼내 같은 브라우저로 연다. 세션 쿠키를 돌려준다.
 fn sign_in(bench: &Bench, origin: &str, email: &str) -> String {
     let outbox = bench.home().join(OUTBOX);
@@ -460,9 +547,12 @@ fn nextjs_앱이_레이어에서_빌드되어_프리뷰가_서고_씨앗_사용�
     );
     let url = service_url(&preview, "web");
 
-    // 로그인하지 않았으면 앱이 로그인 화면으로 보낸다. 로그인 화면과 그 스크립트는 로그인 없이 열린다
+    // 앱의 서버는 이 기계 안에서만 듣는다(`next start -H 127.0.0.1`. next start 는 HOSTNAME 을 읽지 않는다)
+    assert_loopback_only(&built);
+
+    // 로그인하지 않았으면 레이어가 로그인 화면으로 보낸다(auth = "required"). 로그인 화면과 그 스크립트(공개 경로)는 로그인 없이 열린다
     let (status, location, _) = app("GET", &format!("{url}/"), None, None);
-    assert_eq!((status, location.as_str()), (307, "/login?next=/"));
+    assert_eq!((status, location.as_str()), (302, "/login?next=/"));
     let (status, _, login) = app("GET", &format!("{url}/login"), None, None);
     assert_eq!(status, 200);
     assert!(login.contains("로그인 링크 받기"), "{login}");
@@ -473,7 +563,20 @@ fn nextjs_앱이_레이어에서_빌드되어_프리뷰가_서고_씨앗_사용�
         .find(|src| src.starts_with("/_next/static/"))
         .expect("로그인 화면에 스크립트가 없습니다");
     assert_eq!(app("GET", &format!("{url}{script}"), None, None).0, 200);
-    assert_eq!(app("GET", &format!("{url}/api/todos"), None, None).0, 401);
+    // 세션이 없으면 앱에 닿지 않는다(이 helper 는 화면도 받는다고 보내므로 로그인 화면으로 간다)
+    assert_eq!(
+        app("GET", &format!("{url}/api/todos"), None, None),
+        (302, "/login?next=/api/todos".to_owned(), String::new())
+    );
+    // 공개 경로를 핑계로 앱의 다른 길에 닿지 못한다. 공개가 아니므로 로그인 화면으로 간다
+    let (status, location, _) = app(
+        "GET",
+        &format!("{url}/_next/static/..%2f..%2fapi/todos"),
+        None,
+        None,
+    );
+    assert_eq!(status, 302);
+    assert!(location.starts_with("/login?next="), "{location}");
 
     // 씨앗 사용자로 들어가면 자기 할 일만 보인다. 화면(서버에서 그린 HTML)도 JSON 도 같다
     let u1 = bench.seed_cookie(&instance, &token, "u1");
@@ -654,10 +757,8 @@ fn 관리_서버가_다시_뜨면_운영의_nextjs_앱이_자는_채로_서고_�
     // 빌드 폴더가 남아 있으면 다시 빌드하지 않고 자는 채로 선다. 세션과 데이터는 그대로다
     let took = bench.restart();
     assert_eq!(processes_in(&built), 0, "다시 뜬 운영이 깨어 있습니다");
-    // 하위 도메인을 쓰지 않는 레이어는 인스턴스마다 포트를 새로 잡아 주소가 바뀐다. 운영의 주소를 다시 읽는다
-    let moved = bench.production_url(&instance);
-    assert_ne!(moved, live, "포트가 그대로라면 이 줄을 지웁니다");
-    let live = moved;
+    // 하위 도메인을 쓰지 않는 레이어도 운영의 포트를 기록해 두고 다시 잡는다. 주소가 그대로다
+    assert_eq!(bench.production_url(&instance), live);
     let started = Instant::now();
     let (status, _, body) = app("GET", &format!("{live}/api/todos"), Some(&u9), None);
     let woke = started.elapsed();
@@ -669,15 +770,32 @@ fn 관리_서버가_다시_뜨면_운영의_nextjs_앱이_자는_채로_서고_�
         woke.as_secs_f64()
     );
 
-    // 빌드 폴더가 없으면(디스크를 비웠거나 기계를 옮겼다) 다시 뜰 때 그 commit 에서 다시 빌드한다. 인스턴스의 캐시는 남아 있다
+    // 빌드 폴더가 없으면(디스크를 비웠거나 기계를 옮겼다) 다시 뜰 때 그 commit 에서 다시 빌드한다. 인스턴스의 캐시는 남아 있다.
+    // 레이어는 그 빌드를 기다리지 않고 뜨고, 그동안 이 인스턴스는 503 과 Retry-After 로 답한다
     fs::remove_dir_all(&built).unwrap();
     let took = bench.restart();
-    let live = bench.production_url(&instance);
-    let (status, _, body) = app("GET", &format!("{live}/api/todos"), Some(&u9), None);
-    assert_eq!(status, 200, "{body}");
+    assert!(took < Duration::from_secs(3), "다시 뜨는 데 {took:?}");
+    assert_eq!(bench.production_url(&instance), live);
+    let (status, _, _) = app("GET", &format!("{live}/api/todos"), Some(&u9), None);
+    assert_eq!(status, 503);
+    let started = Instant::now();
+    loop {
+        let (status, _, body) = app("GET", &format!("{live}/api/todos"), Some(&u9), None);
+        if status == 200 {
+            assert_eq!(titles(&body), vec!["다시 떠도 남는 일"]);
+            break;
+        }
+        assert_eq!(status, 503, "{body}");
+        assert!(
+            started.elapsed() < Duration::from_secs(180),
+            "빌드가 끝나지 않았습니다"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
     eprintln!(
-        "잰 것: 관리 서버를 다시 띄우기(빌드 폴더가 없어 npm ci + next build 를 다시 한다, 캐시는 있다) {:.1}초",
-        took.as_secs_f64()
+        "잰 것: 관리 서버를 다시 띄우기(빌드 폴더가 없다) {:.2}초, 그 뒤 npm ci + next build 를 뒤에서 하고 첫 200 까지 {:.1}초",
+        took.as_secs_f64(),
+        started.elapsed().as_secs_f64()
     );
 }
 
@@ -701,6 +819,26 @@ fn nestjs_와_vite_앱이_한_저장소에서_빌드되어_api_는_api_에서_�
     );
     let origin = service_url(&preview, "web");
     assert_eq!(service_url(&preview, "api"), format!("{origin}/api"));
+    // NestJS 는 레이어가 건넨 HOST 를 읽어 이 기계 안에서만 듣는다
+    assert_loopback_only(&built);
+    // 의존성은 저장소의 빌드(`[build]` 의 npm ci)에서 한 번 받았다. 서비스의 빌드는 그것을 쓴다
+    let (status, logs) = bench.call(
+        "GET",
+        &format!("/v1/instances/{instance}/previews/logs"),
+        Some(&token),
+        &[],
+    );
+    assert_eq!(status, 200, "{logs}");
+    let names: Vec<&str> = logs["logs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|log| log["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["build", "build-api", "preview-api", "build-web"]
+    );
 
     // 화면은 정적 서비스가 내주고, 화면이 부르는 스크립트도 같은 자리에서 나온다
     let (status, _, page) = app("GET", &format!("{origin}/"), None, None);
@@ -720,9 +858,12 @@ fn nestjs_와_vite_앱이_한_저장소에서_빌드되어_api_는_api_에서_�
         app("GET", &format!("{origin}/api/payslips"), None, None).0,
         401
     );
-    // 정적 서비스는 없는 경로를 index.html 로 되돌리지 않는다(화면 안의 경로를 쓰는 앱은 막힌다. 문서의 구멍)
+    // 화면 안의 경로는 새로 고쳐도 화면이 뜬다(`fallback = "index.html"`). 파일처럼 생긴 경로의 404 는 그대로다
+    let (status, _, inside) = app("GET", &format!("{origin}/payslips/2026-11"), None, None);
+    assert_eq!(status, 200, "{inside}");
+    assert_eq!(inside, page);
     assert_eq!(
-        app("GET", &format!("{origin}/payslips/2026-11"), None, None).0,
+        app("GET", &format!("{origin}/assets/missing.js"), None, None).0,
         404
     );
 
@@ -736,11 +877,73 @@ fn nestjs_와_vite_앱이_한_저장소에서_빌드되어_api_는_api_에서_�
             .any(|blocker| blocker.as_str().unwrap().contains("BANK_API_KEY")),
         "{preview}"
     );
-    let (status, _, body) = app("POST", &format!("{origin}/api/jobs/payroll"), None, None);
+    // 일정의 경로는 밖에서 부르지 못한다. 레이어만 부른다
     assert_eq!(
-        (status, json_of(&body)),
-        (200, json!({ "ran": true, "bank": "missing" }))
+        app("POST", &format!("{origin}/api/jobs/payroll"), None, None).0,
+        404
     );
+}
+
+#[test]
+fn nestjs_의_급여_일정은_운영에서_그_시각에_레이어가_부르고_앱은_그_머리말로_레이어가_부른_것을_안다()
+ {
+    let mut bench = bench!("hr", example("hr-nest-vite"));
+    let instance = bench.instance();
+    let token = bench.token(&instance);
+    let (preview, _) = bench.preview(&instance, &token);
+    let release = preview["release"].as_str().unwrap().to_owned();
+    let (status, body) = bench.call(
+        "PUT",
+        &format!("/v1/instances/{instance}/secrets/BANK_API_KEY"),
+        Some(FACTORY),
+        json!({ "stage": "production", "value": "bank-운영-값" })
+            .to_string()
+            .as_bytes(),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (production, _) = bench.promote(&instance, &token, &release);
+    let origin = service_url(&production, "web");
+    // 2026-11-25 08:59:30 UTC: 다음 때는 09:00 이다
+    let before = 1_795_597_170;
+    let tick = |bench: &Bench, at: u64| {
+        bench.clock.store(at, Ordering::SeqCst);
+        for call in bench.layer.as_ref().unwrap().call_schedules() {
+            call.join().unwrap();
+        }
+    };
+    tick(&bench, before);
+    let started = Instant::now();
+    tick(&bench, before + 40);
+    eprintln!(
+        "잰 것: NestJS 의 일정 한 번(자는 API 를 깨워 부르기까지) {:.2}초",
+        started.elapsed().as_secs_f64()
+    );
+    let (status, report) = bench.call(
+        "GET",
+        &format!("/v1/instances/{instance}/production"),
+        Some(FACTORY),
+        &[],
+    );
+    assert_eq!(status, 200, "{report}");
+    let payroll = &report["schedules"][0];
+    assert_eq!(payroll["path"], json!("/api/jobs/payroll"));
+    // 앱은 x-orbital-schedule 이 없으면 403 이다. 200 이면 레이어가 그 머리말을 실어 불렀다
+    assert_eq!(payroll["last_run"]["outcome"], json!("ok"), "{report}");
+    assert_eq!(payroll["last_run"]["status"], json!(200));
+    assert_eq!(payroll["last_run"]["due_at"], json!(1_795_597_200u64));
+    // 다음은 12월 25일 09:00 이다
+    assert_eq!(payroll["next_at"], json!(1_798_189_200u64));
+    // 밖에서는 그 머리말을 실어도 닿지 못한다
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let outside = agent
+        .post(&format!("{origin}/api/jobs/payroll"))
+        .set("x-orbital-schedule", "api 0 9 25 * * /api/jobs/payroll")
+        .call();
+    let status = match outside {
+        Ok(response) | Err(ureq::Error::Status(_, response)) => response.status(),
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!(status, 404);
 }
 
 #[test]
@@ -933,4 +1136,172 @@ fn 인스턴스마다_빌드의_캐시와_빌드_폴더를_따로_둔다() {
         assert!(!one.starts_with(other) && !other.starts_with(one));
     }
     assert!(!a_cache.starts_with(&a_built) && !b_cache.starts_with(&b_built));
+}
+
+// ---- 실제 브라우저 ----
+
+/// Playwright 와 그 Chromium 이 이 기계에 있는가. 없으면 브라우저의 테스트는 건너뛰었다고 찍는다.
+fn browser_ready() -> bool {
+    Command::new("node")
+        .args([
+            "-e",
+            "process.exit(require('fs').existsSync(require('playwright').chromium.executablePath()) ? 0 : 1)",
+        ])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// `tests/browser/<script>` 를 실제 브라우저로 돌리고 찍은 JSON 을 돌려준다.
+fn browse(script: &str, args: &[&str]) -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/browser")
+        .join(script);
+    let started = Instant::now();
+    let output = Command::new("node")
+        .arg(&path)
+        .args(args)
+        .output()
+        .expect("node 를 부르지 못했습니다");
+    assert!(
+        output.status.success(),
+        "{script}: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let seen = json_of(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .last()
+            .unwrap_or_default(),
+    );
+    eprintln!(
+        "잰 것: 브라우저({}) {script} {:.1}초",
+        seen["browser"].as_str().unwrap_or("?"),
+        started.elapsed().as_secs_f64()
+    );
+    seen
+}
+
+/// 브라우저가 없으면 건너뛴다. CI(환경 변수 `CI`)에서는 건너뛰지 않고 실패한다(워크플로가 브라우저를 받는다).
+macro_rules! browser {
+    () => {
+        if !browser_ready() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI 에서는 브라우저가 있어야 합니다. 워크플로의 Playwright 를 받는 걸음을 확인해 주세요"
+            );
+            eprintln!("Playwright 의 Chromium 이 없어 브라우저의 테스트를 건너뜁니다(require('playwright') 와 그 브라우저가 있어야 돕니다)");
+            return;
+        }
+    };
+}
+
+/// 쿠키 머리말의 값(`이름=값`)에서 값만.
+fn cookie_value(pair: &str) -> String {
+    pair.split_once('=')
+        .map(|(_, value)| value.to_owned())
+        .unwrap_or_default()
+}
+
+#[test]
+fn 실제_브라우저에서_nextjs_의_로그인_화면이_동작하고_운영의_세션_쿠키를_받아_싣고_다른_주소의_화면이_보낸_로그아웃은_막힌다()
+ {
+    let mut bench = bench!("todo", example("todo-next"));
+    browser!();
+    let instance = bench.instance();
+    let token = bench.token(&instance);
+    let (preview, _) = bench.preview(&instance, &token);
+    let url = service_url(&preview, "web");
+
+    // 프리뷰: 로그인하지 않은 브라우저는 로그인 화면으로 가고, hydrate 된 단추가 링크를 요청한다(프리뷰는 메일을 보내지 않는다)
+    let u1 = bench.seed_cookie(&instance, &token, "u1");
+    let seen = browse("todo-next.cjs", &["preview", &url, &cookie_value(&u1)]);
+    assert_eq!(seen["landed"], json!("/login?next=/"), "{seen}");
+    assert_eq!(seen["asked"]["status"], json!(202), "{seen}");
+    // 폼이 JS 없이 나갔다면 주소에 이메일이 붙는다
+    assert!(
+        !seen["asked"]["url"].as_str().unwrap().contains("email="),
+        "{seen}"
+    );
+    assert_eq!(seen["before"], json!(["장보기", "세탁소 들르기"]), "{seen}");
+    assert_eq!(
+        seen["after"],
+        json!(["장보기", "세탁소 들르기", "브라우저에서 더한 일"]),
+        "{seen}"
+    );
+
+    // 운영: 초대한 사람이 화면에서 링크를 요청하고, 메일의 링크를 같은 브라우저로 열어 들어온다
+    let release = preview["release"].as_str().unwrap().to_owned();
+    let (production, _) = bench.promote(&instance, &token, &release);
+    let live = service_url(&production, "web");
+    let (status, body) = bench.post(
+        &format!("/v1/instances/{instance}/users"),
+        FACTORY,
+        json!({ "email": "u9@example.test", "roles": ["member"] }),
+    );
+    assert_eq!(status, 200, "{body}");
+    let outbox = bench.home().join(OUTBOX);
+    let seen = browse(
+        "todo-next.cjs",
+        &[
+            "production",
+            &live,
+            outbox.to_str().unwrap(),
+            "u9@example.test",
+        ],
+    );
+    assert_eq!(seen["asked"]["status"], json!(202), "{seen}");
+    assert_eq!(seen["landed"], json!("/"), "{seen}");
+    // Chromium 은 http://127.0.0.1 에서도 `__Host-` · `Secure` 쿠키를 받는다(127.0.0.1 을 믿을 만한 자리로 본다). 다음 요청에 실려 할 일이 보인다
+    let session = seen["cookies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|cookie| cookie["name"] == "__Host-orbital-session")
+        .unwrap_or_else(|| panic!("브라우저가 세션 쿠키를 받지 않았습니다: {seen}"))
+        .clone();
+    assert_eq!(
+        session,
+        json!({ "name": "__Host-orbital-session", "secure": true, "httpOnly": true, "sameSite": "Lax", "path": "/" })
+    );
+    assert_eq!(seen["before"], json!([]), "{seen}");
+    assert_eq!(
+        seen["after"],
+        json!(["운영의 브라우저에서 더한 일"]),
+        "{seen}"
+    );
+    // 다른 주소(같은 127.0.0.1 의 다른 포트, 같은 사이트)의 화면이 보낸 로그아웃 · 링크 요청은 Origin 으로 막힌다. 세션은 그대로다
+    assert_eq!(seen["otherOrigin"], json!(true), "{seen}");
+    assert_eq!(seen["crossLogout"], json!(403), "{seen}");
+    assert_eq!(seen["crossLink"], json!(403), "{seen}");
+    assert_eq!(seen["stillIn"], json!(true), "{seen}");
+    // 같은 주소의 화면에서는 나가고, 다음 요청은 로그인 화면으로 간다
+    assert_eq!(seen["logout"], json!(204), "{seen}");
+    assert_eq!(seen["afterLogout"], json!("/login"), "{seen}");
+}
+
+#[test]
+fn 실제_브라우저에서_hr_의_화면_안의_경로를_바로_열거나_새로_고쳐도_화면이_뜬다() {
+    let mut bench = bench!("hr", example("hr-nest-vite"));
+    browser!();
+    let instance = bench.instance();
+    let token = bench.token(&instance);
+    let (preview, _) = bench.preview(&instance, &token);
+    let origin = service_url(&preview, "web");
+    let e1 = bench.seed_cookie(&instance, &token, "e1");
+    let seen = browse("hr-nest-vite.cjs", &[&origin, &cookie_value(&e1)]);
+    assert_eq!(seen["strangerStatus"], json!(200), "{seen}");
+    assert_eq!(seen["strangerLogin"], json!(true), "{seen}");
+    assert_eq!(seen["root"]["month"], Value::Null, "{seen}");
+    assert_eq!(seen["root"]["rows"].as_array().unwrap().len(), 2, "{seen}");
+    for step in ["clicked", "reloaded"] {
+        assert_eq!(seen[step]["path"], json!("/payslips/2026-10"), "{seen}");
+        assert_eq!(seen[step]["month"], json!("2026-10 의 명세"), "{seen}");
+        assert_eq!(
+            seen[step]["rows"],
+            json!([["e1", "2026-10", "3,100,000"]]),
+            "{seen}"
+        );
+    }
+    assert_eq!(seen["reloadStatus"], json!(200), "{seen}");
 }

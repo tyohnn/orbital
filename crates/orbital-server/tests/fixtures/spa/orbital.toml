@@ -1,0 +1,52 @@
+# 공개 경로 · 정적 서비스의 되돌림 · 저장소에서 한 번 도는 빌드 · 일정을 재는 스캐폴드.
+# 앱(server.js · db/)은 `fixtures/todo` 의 것을 그대로 쓰고 이 파일과 `site/` 만 덮는다
+
+# 서비스의 빌드보다 먼저 한 번 돈다. 서비스의 빌드는 이 파일이 있어야 지난다
+[build]
+command = "node -e \"require('fs').writeFileSync('repo-build.txt', 'x'); require('fs').appendFileSync('repo-build-runs.txt', 'x')\""
+
+[[service]]
+name = "web"
+kind = "server"
+build = "test -f repo-build.txt && node --check server.js"
+start = "node server.js"
+path = "/"
+roles = ["member"]
+auth = "required"
+public = ["/assets"]          # 로그인 없이 내준다. 신원은 싣지 않는다
+
+[[service]]
+name = "site"
+kind = "static"
+build = "test -f repo-build.txt"
+output = "site"
+path = "/app"
+fallback = "index.html"       # 화면 안의 경로(/app/payslips/2026-11)를 새로 고쳐도 화면이 뜬다
+
+[[schedule]]                  # 매분. 레이어가 부르고, 밖에서는 부르지 못한다
+service = "web"
+cron = "* * * * *"
+path = "/jobs/tick"
+
+[[schedule]]                  # 5분마다. 앱이 500 으로 답한다
+service = "web"
+cron = "*/5 * * * *"
+path = "/jobs/fail"
+
+[[schedule]]                  # 2분마다. 앱이 3초 뒤에 답한다(테스트의 레이어는 1초만 기다린다)
+service = "web"
+cron = "*/2 * * * *"
+path = "/jobs/slow"
+
+[database]
+schemas = ["todo"]
+migrations = "db/migrations"
+roles = ["member"]
+seed = "db/seed"
+
+[secrets]
+generated = ["SESSION_KEY"]
+
+[auth]
+methods = ["email_link"]
+login_path = "/login"

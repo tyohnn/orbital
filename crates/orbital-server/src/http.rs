@@ -116,7 +116,11 @@ fn failure(failure: Failure) -> Reply {
         Failure::BuildFailed { service, log } => problem(
             422,
             "build_failed",
-            &format!("서비스 `{service}` 의 빌드가 실패했습니다. 로그의 끝을 함께 보냅니다"),
+            &if service == crate::layer::REPOSITORY_BUILD {
+                "저장소의 빌드(`[build]`)가 실패했습니다. 서비스의 빌드는 돌지 않았습니다. 로그의 끝을 함께 보냅니다".to_owned()
+            } else {
+                format!("서비스 `{service}` 의 빌드가 실패했습니다. 로그의 끝을 함께 보냅니다")
+            },
             vec![log],
         ),
         Failure::StartFailed { service, log } => problem(

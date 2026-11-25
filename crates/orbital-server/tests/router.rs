@@ -9,7 +9,7 @@ use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
@@ -330,6 +330,8 @@ struct Bench {
     pg_url: String,
     hosts: bool,
     probe: Arc<Probe>,
+    /// 레이어가 읽는 시각(유닉스 초). 0 이면 실제 시각이다. 일정의 때를 테스트가 만든다.
+    clock: Arc<AtomicU64>,
     layer: Option<Layer>,
     instances: Vec<String>,
 }
@@ -350,6 +352,7 @@ impl Bench {
             pg_url,
             hosts,
             probe: Arc::new(Probe::default()),
+            clock: Arc::new(AtomicU64::new(0)),
             layer: None,
             instances: Vec::new(),
         };
@@ -377,10 +380,18 @@ impl Bench {
             base: BaseDomain::parse(BASE).unwrap(),
             scheme: Scheme::Http,
         });
+        let clock = Arc::clone(&self.clock);
         let layer = Layer::open(Options {
             dev_mailbox: true,
+            clock: Arc::new(move || match clock.load(Ordering::SeqCst) {
+                0 => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_secs()),
+                at => at,
+            }),
             sleep_after: SLEEP_AFTER,
             wake_timeout: Duration::from_secs(5),
+            schedule_timeout: Duration::from_secs(1),
             hosting,
             ..Options::new(
                 self.home.clone(),
@@ -1066,4 +1077,402 @@ fn 기준_도메인을_주지_않은_레이어는_전처럼_포트마다_주소�
     bench.invite(&ours, "kim@example.com");
     let (_, link) = bench.sign_in(&ours_live, "kim@example.com");
     assert!(link.starts_with(&format!("{ours_live}/_orbital/auth/callback")));
+}
+
+// ---- 공개 경로 · 정적 서비스의 되돌림 · 저장소의 빌드 ----
+
+/// `fixtures/spa` 를 덮은 스캐폴드를 올린다.
+fn upload_spa(bench: &Bench) {
+    bench.upload("spa", &|folder: &Path| {
+        copy_tree(&fixture("todo"), folder);
+        copy_tree(&fixture("spa"), folder);
+    });
+}
+
+#[test]
+fn 로그인이_필요한_서비스의_공개_경로는_세션_없이_열리고_세션이_있어도_신원을_싣지_않는다() {
+    let mut bench = bench!(false);
+    upload_spa(&bench);
+    let (instance, live) = bench.ship("spa");
+    bench.invite(&instance, "kim@example.com");
+    let (kim, _) = bench.sign_in(&live, "kim@example.com");
+
+    // 세션 없이도 열린다. 밖에서 실어 보낸 신원 머리말은 지운다
+    let open = bench.http(
+        "GET",
+        &live,
+        "/assets/app.js",
+        &[JSON, ("x-orbital-identity", "v2.forged")],
+        "",
+    );
+    assert_eq!(open.status, 200, "{}", open.everything());
+    assert_eq!(open.json()["public"], json!(true));
+    assert_eq!(open.json()["headers"]["x-orbital-identity"], Value::Null);
+    // 세션이 있어도 공개 경로에는 신원을 싣지 않는다. 세션 쿠키도 넘기지 않는다
+    let signed = bench.http(
+        "GET",
+        &live,
+        "/assets/app.js",
+        &[("Cookie", &kim), JSON],
+        "",
+    );
+    assert_eq!(signed.status, 200, "{}", signed.everything());
+    assert_eq!(signed.json()["headers"]["x-orbital-identity"], Value::Null);
+    assert!(!signed.body.contains("orbital-session"), "{}", signed.body);
+    // 같은 세션으로 공개 경로 밖은 신원을 싣는다
+    let echo = bench.http("GET", &live, "/echo", &[("Cookie", &kim), JSON], "");
+    assert!(
+        echo.json()["headers"]["x-orbital-identity"].is_string(),
+        "{}",
+        echo.everything()
+    );
+
+    // 공개 경로 밖과, 앱이 공개 경로 밖으로 읽을 수 있는 경로는 앞처럼 로그인이 필요하다
+    for closed in [
+        "/cards",
+        "/assetsx/a.js",
+        "/assets/../cards",
+        "/assets/%2e%2e/cards",
+        "/assets//a.js",
+        "/assets/a%2f..%2f..%2fcards",
+    ] {
+        let reply = bench.http("GET", &live, closed, &[JSON], "");
+        assert_eq!(reply.status, 401, "{closed}: {}", reply.everything());
+    }
+}
+
+#[test]
+fn 정적_서비스는_화면을_원하는_요청에만_화면_안의_경로를_fallback_으로_되돌린다() {
+    let mut bench = bench!(false);
+    upload_spa(&bench);
+    let (_, live) = bench.ship("spa");
+    let page = ("Accept", "text/html,application/xhtml+xml");
+    let index = bench.http("GET", &live, "/app/", &[page], "");
+    assert_eq!(index.status, 200);
+    for inside in ["/app/payslips/2026-11", "/app/a/b", "/app"] {
+        let reply = bench.http("GET", &live, inside, &[page], "");
+        assert_eq!(reply.status, 200, "{inside}: {}", reply.everything());
+        assert_eq!(reply.body, index.body, "{inside}");
+        assert!(
+            reply
+                .header("content-type")
+                .unwrap()
+                .starts_with("text/html")
+        );
+    }
+    // 파일처럼 생긴 경로, 화면이 아닌 요청, 폴더 밖은 되돌리지 않는다
+    for (path, accept) in [
+        ("/app/missing.js", "text/html"),
+        ("/app/logo.png", "text/html"),
+        ("/app/payslips/2026-11", "application/json"),
+        ("/app/../cards", "text/html"),
+        ("/app/%2e%2e/cards", "text/html"),
+    ] {
+        let reply = bench.http("GET", &live, path, &[("Accept", accept)], "");
+        assert_eq!(reply.status, 404, "{path} {accept}: {}", reply.everything());
+    }
+    // 있는 파일은 그대로 나온다
+    let script = bench.http("GET", &live, "/app/app.js", &[page], "");
+    assert_eq!(script.status, 200);
+    assert!(script.body.contains("dataset.path"));
+}
+
+#[test]
+fn 저장소의_빌드는_서비스의_빌드보다_먼저_한_번만_돌고_그_로그가_프리뷰의_로그에_있다() {
+    let mut bench = bench!(false);
+    upload_spa(&bench);
+    let instance = bench.instance("spa");
+    let token = bench.token(&instance);
+    let (_, release) = bench.preview(&instance, &token);
+    let built = bench.home.join("builds").join(&instance).join(&release);
+    // 서비스 둘의 빌드가 모두 그 파일을 보고 지났고, 저장소의 빌드는 한 번 돌았다
+    assert_eq!(
+        fs::read_to_string(built.join("repo-build-runs.txt")).unwrap(),
+        "x"
+    );
+    let (status, logs) = bench.call(
+        "GET",
+        &format!("/v1/instances/{instance}/previews/logs"),
+        &token,
+        &[],
+    );
+    assert_eq!(status, 200, "{logs}");
+    let names: Vec<&str> = logs["logs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|log| log["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["build", "build-web", "preview-web", "build-site"]
+    );
+}
+
+#[test]
+fn 저장소의_빌드가_실패하면_서비스의_빌드는_돌지_않고_그_로그를_돌려준다() {
+    let mut bench = bench!(false);
+    bench.upload("broken", &|folder: &Path| {
+        copy_tree(&fixture("todo"), folder);
+        copy_tree(&fixture("spa"), folder);
+        let manifest = fs::read_to_string(folder.join("orbital.toml"))
+            .unwrap()
+            .replace(
+                "command = \"node -e",
+                "command = \"echo 저장소의-빌드가-깨졌다 && false && node -e",
+            );
+        fs::write(folder.join("orbital.toml"), manifest).unwrap();
+    });
+    let instance = bench.instance("broken");
+    let token = bench.token(&instance);
+    let (status, body) = bench.call(
+        "POST",
+        &format!("/v1/instances/{instance}/previews"),
+        &token,
+        &[],
+    );
+    assert_eq!(status, 422, "{body}");
+    let text = body.to_string();
+    assert!(text.contains("저장소의-빌드가-깨졌다"), "{text}");
+    assert!(text.contains("[build]"), "{text}");
+}
+
+// ---- 일정 ----
+
+/// 앱이 남긴 일정의 기록(`jobs.jsonl`). 운영의 빌드 폴더에 있다.
+fn jobs(bench: &Bench, instance: &str) -> Vec<Value> {
+    let builds = bench.home.join("builds").join(instance);
+    let mut lines = Vec::new();
+    for entry in fs::read_dir(builds).into_iter().flatten().flatten() {
+        if let Ok(text) = fs::read_to_string(entry.path().join("jobs.jsonl")) {
+            lines.extend(text.lines().map(|line| serde_json::from_str(line).unwrap()));
+        }
+    }
+    lines
+}
+
+/// 일정을 지금 시각으로 부르고, 부른 것이 끝날 때까지 기다린다.
+fn tick(bench: &Bench, at: u64) {
+    bench.clock.store(at, Ordering::SeqCst);
+    for call in bench.layer().call_schedules() {
+        call.join().unwrap();
+    }
+}
+
+/// 2026-11-25 00:00:30 UTC. 분의 중간이다.
+const NOON: u64 = 1_795_564_830;
+
+#[test]
+fn 운영의_일정은_그_때에_한_번_불리고_레이어만_붙이는_머리말을_싣고_사람의_신원은_싣지_않는다() {
+    let mut bench = bench!(false);
+    upload_spa(&bench);
+    bench.clock.store(NOON, Ordering::SeqCst);
+    let (instance, _) = bench.ship("spa");
+
+    // 처음 본 일정은 지난 때를 부르지 않고 다음 때를 기다린다
+    tick(&bench, NOON);
+    assert_eq!(jobs(&bench, &instance), Vec::<Value>::new());
+    // 다음 분이 되면 한 번 부른다. 같은 분에 다시 돌아도 다시 부르지 않는다
+    tick(&bench, NOON + 30);
+    tick(&bench, NOON + 45);
+    let ran = jobs(&bench, &instance);
+    assert_eq!(ran.len(), 1, "{ran:?}");
+    assert_eq!(ran[0]["path"], json!("/jobs/tick"));
+    assert_eq!(ran[0]["method"], json!("POST"));
+    assert_eq!(
+        ran[0]["headers"]["x-orbital-schedule"],
+        json!("web * * * * * /jobs/tick")
+    );
+    assert_eq!(ran[0]["headers"]["x-orbital-identity"], Value::Null);
+    assert_eq!(ran[0]["headers"]["cookie"], Value::Null);
+
+    // 레이어가 내려가 있던 동안 놓친 때(9분)는 몰아서 부르지 않고 한 번만 부른다
+    tick(&bench, NOON + 30 + 9 * 60);
+    let ticks = |bench: &Bench| {
+        jobs(bench, &instance)
+            .iter()
+            .filter(|job| job["path"] == "/jobs/tick")
+            .count()
+    };
+    assert_eq!(ticks(&bench), 2);
+    // 다시 뜬 레이어도 이미 부른 때를 다시 부르지 않는다
+    bench.restart();
+    bench.clock.store(NOON + 30 + 9 * 60, Ordering::SeqCst);
+    tick(&bench, NOON + 30 + 9 * 60);
+    assert_eq!(ticks(&bench), 2);
+    tick(&bench, NOON + 30 + 10 * 60);
+    assert_eq!(ticks(&bench), 3);
+}
+
+#[test]
+fn 일정의_실패는_기록에_남고_팩토리는_마지막_실행의_때와_결과를_본다() {
+    let mut bench = bench!(false);
+    upload_spa(&bench);
+    bench.clock.store(NOON, Ordering::SeqCst);
+    let (instance, _) = bench.ship("spa");
+    tick(&bench, NOON);
+    // 00:05 에 두 일정이 함께 온다. 실패하는 일은 다시 부르지 않는다
+    tick(&bench, NOON + 5 * 60);
+    let failed: Vec<Value> = jobs(&bench, &instance)
+        .into_iter()
+        .filter(|job| job["path"] == "/jobs/fail")
+        .collect();
+    assert_eq!(failed.len(), 1);
+    let (status, production) = bench.call(
+        "GET",
+        &format!("/v1/instances/{instance}/production"),
+        FACTORY,
+        &[],
+    );
+    assert_eq!(status, 200, "{production}");
+    let schedules = production["schedules"].as_array().unwrap();
+    let of = |path: &str| {
+        schedules
+            .iter()
+            .find(|schedule| schedule["path"] == path)
+            .unwrap_or_else(|| panic!("{path}: {production}"))
+            .clone()
+    };
+    let tick_schedule = of("/jobs/tick");
+    assert_eq!(tick_schedule["service"], json!("web"));
+    assert_eq!(tick_schedule["cron"], json!("* * * * *"));
+    assert_eq!(tick_schedule["next_at"], json!(1_795_565_160u64));
+    assert_eq!(tick_schedule["last_run"]["due_at"], json!(1_795_565_100u64));
+    assert_eq!(tick_schedule["last_run"]["outcome"], json!("ok"));
+    assert_eq!(tick_schedule["last_run"]["status"], json!(200));
+    let fail = of("/jobs/fail");
+    assert_eq!(fail["last_run"]["outcome"], json!("failed"));
+    assert_eq!(fail["last_run"]["status"], json!(500));
+    assert_eq!(fail["next_at"], json!(1_795_565_400u64));
+    // 정한 시간 안에 답하지 않은 일은 시간 초과로 적는다. 놓친 00:02 와 00:04 가운데 00:04 에 맞춰 한 번 불렀다
+    let slow = of("/jobs/slow");
+    assert_eq!(slow["last_run"]["outcome"], json!("timed_out"));
+    assert_eq!(slow["last_run"]["due_at"], json!(1_795_565_040u64));
+    assert_eq!(slow["last_run"]["status"], Value::Null);
+    // 레이어의 기록에는 이름과 숫자만 남는다
+    assert!(
+        bench.logs().contains("SCHEDULE web /jobs/fail failed 500"),
+        "{}",
+        bench.logs()
+    );
+}
+
+#[test]
+fn 일정의_경로는_밖에서_부르지_못하고_프리뷰의_일정은_부르지_않는다() {
+    let mut bench = bench!(false);
+    upload_spa(&bench);
+    bench.clock.store(NOON, Ordering::SeqCst);
+    let (instance, preview, live) = bench.ship_with_preview("spa");
+    bench.invite(&instance, "kim@example.com");
+    let (kim, _) = bench.sign_in(&live, "kim@example.com");
+    for origin in [&live, &preview] {
+        for path in [
+            "/jobs/tick",
+            "/jobs/tick/",
+            "/JOBS/Tick",
+            "/jobs//tick",
+            "/x/../jobs/tick",
+            "/jobs/%74ick",
+            "/jobs/tick;x",
+        ] {
+            let reply = bench.http(
+                "POST",
+                origin,
+                path,
+                &[
+                    ("Cookie", &kim),
+                    ("x-orbital-schedule", "web * * * * * /jobs/tick"),
+                    JSON,
+                ],
+                "",
+            );
+            assert_eq!(reply.status, 404, "{origin}{path}: {}", reply.everything());
+        }
+    }
+    assert_eq!(jobs(&bench, &instance), Vec::<Value>::new());
+    // 다른 경로는 앞처럼 간다
+    let other = bench.http("POST", &live, "/jobs/other", &[("Cookie", &kim), JSON], "");
+    assert_eq!(other.status, 200, "{}", other.everything());
+    // 프리뷰는 때가 되어도 부르지 않는다. 운영의 것만 부른다
+    tick(&bench, NOON);
+    tick(&bench, NOON + 60);
+    let ran: Vec<Value> = jobs(&bench, &instance)
+        .into_iter()
+        .filter(|job| job["path"] == "/jobs/tick")
+        .collect();
+    assert_eq!(ran.len(), 1);
+}
+
+// ---- 다시 뜨기 ----
+
+#[test]
+fn 하위_도메인을_쓰지_않는_레이어가_다시_떠도_운영의_포트는_그대로다() {
+    let mut bench = bench!(false);
+    let (instance, live) = bench.ship("cards");
+    bench.restart();
+    assert_eq!(bench.production_url(&instance), live);
+    assert_eq!(bench.http("GET", &live, "/login", &[], "").status, 200);
+    // 그 포트를 누가 쥐고 있으면 새 포트를 잡고 기록을 고친다
+    let port: u16 = live.rsplit(':').next().unwrap().parse().unwrap();
+    drop(bench.layer.take());
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    bench.open();
+    let moved = bench.production_url(&instance);
+    assert_ne!(moved, live);
+    assert_eq!(bench.http("GET", &moved, "/login", &[], "").status, 200);
+    drop(squatter);
+    bench.restart();
+    assert_eq!(bench.production_url(&instance), moved);
+}
+
+#[test]
+fn 빌드_폴더가_없는_운영은_레이어를_막지_않고_빌드하는_동안_503_과_retry_after_로_답한다() {
+    let mut bench = bench!(false);
+    bench.upload("slow", &|folder: &Path| {
+        copy_tree(&fixture("todo"), folder);
+        copy_tree(&fixture("slow"), folder);
+    });
+    let (instance, live) = bench.ship("slow");
+    let (other, other_live) = bench.ship("cards");
+    fs::remove_dir_all(bench.home.join("builds").join(&instance)).unwrap();
+
+    // 다시 뜨는 것은 빌드(3초)를 기다리지 않는다
+    let started = Instant::now();
+    bench.restart();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    // 그동안 그 인스턴스는 503 과 Retry-After 로 답하고, 다른 인스턴스와 API 는 기다리지 않는다
+    let waiting = bench.http("GET", &live, "/health", &[JSON], "");
+    assert_eq!(waiting.status, 503, "{}", waiting.everything());
+    assert!(waiting.header("retry-after").is_some());
+    let started = Instant::now();
+    assert_eq!(bench.production_url(&other), other_live);
+    assert_eq!(
+        bench.http("GET", &other_live, "/login", &[], "").status,
+        200
+    );
+    let (status, _) = bench.call(
+        "GET",
+        &format!("/v1/instances/{instance}/production"),
+        FACTORY,
+        &[],
+    );
+    assert_eq!(status, 200);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    // 빌드가 끝나면 같은 주소에서 선다
+    assert!(
+        eventually(Duration::from_secs(30), || bench
+            .http("GET", &live, "/health", &[JSON], "")
+            .status
+            == 200),
+        "빌드가 끝났는데 서지 않았습니다"
+    );
+    assert_eq!(bench.production_url(&instance), live);
 }

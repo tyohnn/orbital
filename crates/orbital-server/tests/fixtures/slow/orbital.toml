@@ -1,0 +1,26 @@
+# 빌드가 몇 초 걸리는 스캐폴드. 관리 서버가 빌드 폴더 없이 다시 뜰 때 레이어가 그 빌드를 기다리지 않는지 잰다.
+# 앱(server.js · db/)은 `fixtures/todo` 의 것을 그대로 쓰고 이 파일만 덮는다
+
+[build]
+command = "sleep 3"
+
+[[service]]
+name = "web"
+kind = "server"
+build = "node --check server.js"
+start = "node server.js"
+path = "/"
+roles = ["member"]
+
+[database]
+schemas = ["todo"]
+migrations = "db/migrations"
+roles = ["member"]
+seed = "db/seed"
+
+[secrets]
+generated = ["SESSION_KEY"]
+
+[auth]
+methods = ["email_link"]
+login_path = "/login"

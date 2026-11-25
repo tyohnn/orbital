@@ -9,12 +9,13 @@ use std::io::Read as _;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orbital_core::access::Access;
 use orbital_core::auth::query_value;
 use orbital_core::check::{judge as judge_access, unguarded};
+use orbital_core::cron::Cron;
 use orbital_core::describe::changes;
 use orbital_core::git::Service as GitService;
 use orbital_core::google::{IdTokenRefusal, callback_url, judge_id_token, judge_state};
@@ -40,9 +41,9 @@ use orbital_pg::auth::AuthStore;
 use orbital_pg::rehearsal::RestorePoint;
 use orbital_proxy::{Route, serve};
 use orbital_router::{
-    AppServer, Config as RouterConfig, Connect, DocumentFetcher, GoogleDoor, Hosts, HttpsFetcher,
-    Outbox, Resend, Router, SESSION_COOKIE, Stage as RouterStage, Starter, Target as RouterTarget,
-    WakeFailure, serve as serve_router, serve_hosts,
+    AppServer, Called, Config as RouterConfig, Connect, DocumentFetcher, GoogleDoor, Hosts,
+    HttpsFetcher, Outbox, Resend, Router, SESSION_COOKIE, Stage as RouterStage, Starter,
+    Target as RouterTarget, WakeFailure, serve_hosts, serve_slot,
 };
 use orbital_run::{Job, Runner, Running, free_port, wait_for_port};
 use orbital_source::assemble::{AssembleError, Assembled, assemble};
@@ -55,7 +56,9 @@ use tokio::task::JoinHandle;
 
 use crate::backup::BackupOptions;
 use crate::login::{Endpoints, FactoryGoogleDoor, FactoryMailer, exchange, sha256_hex};
-use crate::registry::{InstanceRecord, ProductionRecord, Registry, ReleaseRecord};
+use crate::registry::{
+    InstanceRecord, ProductionRecord, Registry, ReleaseRecord, ScheduleRecord, ScheduleRun,
+};
 use crate::seal::SealKey;
 use crate::settings::{Settings, SettingsError};
 use crate::token;
@@ -188,7 +191,11 @@ struct LiveService {
 /// 떠 있는 router. 내리면 요청을 받지 않는다.
 enum Front {
     /// 인스턴스마다 포트 하나를 듣는다. 내리면 듣기를 멈추고 붙어 있던 연결도 함께 내린다.
-    Port(JoinHandle<std::io::Result<()>>),
+    /// 자리(`slot`)의 router 만 바꿔 넣으면 듣기를 멈추지 않고 다음 요청부터 새 router 가 답한다.
+    Port {
+        task: JoinHandle<std::io::Result<()>>,
+        slot: Arc<RwLock<Router>>,
+    },
     /// 레이어의 주소 하나에서 하위 도메인으로 가른다. 내리면 그 하위 도메인을 표에서 걷는다.
     Host {
         hosts: Arc<Hosts>,
@@ -200,7 +207,7 @@ enum Front {
 impl Drop for Front {
     fn drop(&mut self) {
         match self {
-            Self::Port(task) => task.abort(),
+            Self::Port { task, .. } => task.abort(),
             Self::Host {
                 hosts,
                 target,
@@ -214,8 +221,23 @@ impl Drop for Front {
 struct Launched {
     services: Vec<LiveService>,
     router: Front,
+    /// 그 router. 레이어가 일정을 부를 때 쓴다.
+    handle: Router,
     /// router 의 바깥 주소.
     origin: String,
+    /// 포트마다 주소를 내는 레이어에서 router 가 듣는 포트. 하위 도메인을 쓰면 없다.
+    port: Option<u16>,
+}
+
+/// 서버 서비스를 어떻게 세우나.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// 지금 띄워 실제로 뜨는지 본다(프리뷰와 승격).
+    Awake,
+    /// 자는 채로 세워 첫 요청에 깨운다(관리 서버가 다시 떴을 때).
+    Asleep,
+    /// 아직 빌드하는 중이다. 서비스로 가는 요청에 503 과 `Retry-After` 로 답한다. 레이어의 길(`/_orbital/`)은 연다.
+    Building,
 }
 
 /// 하위 도메인을 쓰는 레이어의 자리. 주소 하나를 듣고 `Host` 로 인스턴스를 가른다.
@@ -312,6 +334,8 @@ struct Stand<'a> {
     organization: &'a str,
     /// 인스턴스가 속한 앱의 이름. 메일의 글에 쓴다.
     app: &'a str,
+    /// 포트마다 주소를 내는 레이어에서 먼저 잡아 볼 포트. 운영은 앞에 듣던 포트를 다시 잡아 주소가 바뀌지 않게 한다.
+    port: Option<u16>,
 }
 
 impl Drop for LiveService {
@@ -335,6 +359,10 @@ struct Live {
     /// 프리뷰의 씨앗 사용자. 운영에는 없다.
     seed_users: Vec<String>,
     services: Vec<LiveService>,
+    /// 일정을 부를 때 쓰는 router.
+    router: Router,
+    /// 빌드가 끝나기를 기다리며 503 으로 답하는 중인가(관리 서버가 빌드 폴더 없이 다시 떴을 때).
+    building: bool,
     _router: Front,
 }
 
@@ -348,6 +376,8 @@ struct Target<'a> {
     identity_key: &'a [u8],
     organization: &'a str,
     app: &'a str,
+    /// 앞의 운영이 듣던 포트.
+    port: Option<u16>,
 }
 
 /// 승격이 깨지기 앞의 운영.
@@ -425,6 +455,20 @@ pub struct PromotionReport {
     pub release: String,
     pub services: Vec<ServiceReport>,
     pub migrations: Vec<String>,
+    /// 선언의 일정마다 다음 때와 마지막 실행(숫자와 갈래만).
+    pub schedules: Vec<ScheduleReport>,
+}
+
+/// 운영의 일정 하나. 레이어가 그 때에 부른다(UTC).
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduleReport {
+    pub service: String,
+    pub path: String,
+    pub cron: String,
+    /// 다음에 부를 때(유닉스 초).
+    pub next_at: Option<u64>,
+    /// 마지막으로 부른 것. 한 번도 부르지 않았으면 `null` 이다.
+    pub last_run: Option<ScheduleRun>,
 }
 
 /// 사람의 승인을 기다리는 승격 요청. 팩토리의 승인 화면이 이것을 세운다.
@@ -509,6 +553,8 @@ pub struct Options {
     pub token_clock: Clock,
     /// 요청 본문의 상한(기본 64MiB). 묶음과 git 으로 올리는 것이 모두 이 안이어야 한다. 넘으면 413 으로 답하고 읽지 않는다.
     pub upload_limit: usize,
+    /// 일정으로 부른 요청에 앱이 답하기를 기다리는 시간(기본 10분, `ORBITAL_SCHEDULE_TIMEOUT`). 넘으면 `timed_out` 으로 적는다.
+    pub schedule_timeout: Duration,
 }
 
 /// 하위 도메인으로 인스턴스를 가르는 레이어의 설정.
@@ -546,11 +592,24 @@ impl Options {
             backup: None,
             token_clock: Arc::new(now),
             upload_limit: 64 * 1024 * 1024,
+            schedule_timeout: Duration::from_secs(10 * 60),
         }
     }
 }
 
-pub struct Layer {
+/// 레이어. 속은 [`LayerCore`] 하나를 나눠 쥐는 손잡이다. 뒤에서 도는 일(다시 뜰 때의 빌드, 일정)이 같은 레이어를 쥔다.
+pub struct Layer(Arc<LayerCore>);
+
+impl std::ops::Deref for Layer {
+    type Target = LayerCore;
+
+    fn deref(&self) -> &LayerCore {
+        &self.0
+    }
+}
+
+/// 레이어의 속. 밖에서는 필드를 보지 못한다.
+pub struct LayerCore {
     home: PathBuf,
     /// DB 의 관리 주소. router 가 인증 역할로 붙을 때 사용자와 database 만 바꿔 쓴다.
     pg_url: String,
@@ -561,12 +620,13 @@ pub struct Layer {
     clock: Clock,
     token_clock: Clock,
     upload_limit: usize,
+    schedule_timeout: Duration,
     /// 개발용 메일함. 명시해 켰을 때만 있다.
     outbox: Option<Arc<Outbox>>,
     public_url: String,
     endpoints: Endpoints,
     /// Client ID Metadata Documents 를 받아 오는 것. 갈아 끼운다(테스트는 가짜를 쓴다).
-    documents: Arc<dyn DocumentFetcher>,
+    documents: Mutex<Arc<dyn DocumentFetcher>>,
     upstream: String,
     sources: SourceStore,
     runner: Arc<dyn Runner>,
@@ -688,8 +748,11 @@ pub fn key_text(key: FactoryKey) -> String {
 impl Layer {
     /// metadata 문서를 받아 오는 것을 갈아 끼운다. 테스트가 실제 네트워크에 나가지 않으려고 쓴다.
     #[must_use]
-    pub fn with_document_fetcher(mut self, documents: Arc<dyn DocumentFetcher>) -> Self {
-        self.documents = documents;
+    pub fn with_document_fetcher(self, documents: Arc<dyn DocumentFetcher>) -> Self {
+        *self
+            .documents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = documents;
         self
     }
 
@@ -771,7 +834,7 @@ impl Layer {
                 })
             }
         };
-        let layer = Self {
+        let layer = Self(Arc::new(LayerCore {
             backup,
             sources: SourceStore::new(options.home.join("sources")),
             settings: Arc::new(settings),
@@ -779,12 +842,13 @@ impl Layer {
             clock: options.clock,
             token_clock: options.token_clock,
             upload_limit: options.upload_limit,
+            schedule_timeout: options.schedule_timeout,
             outbox: options
                 .dev_mailbox
                 .then(|| Arc::new(Outbox::new(options.home.join(OUTBOX)))),
             public_url: options.public_url.trim_end_matches('/').to_owned(),
             endpoints: options.endpoints,
-            documents: Arc::new(HttpsFetcher),
+            documents: Mutex::new(Arc::new(HttpsFetcher)),
             pg_url: options.pg_url,
             upstream,
             runner: Arc::from(options.runner),
@@ -806,7 +870,7 @@ impl Layer {
                 live: BTreeMap::new(),
             }),
             home: options.home,
-        };
+        }));
         layer.restore();
         Ok(layer)
     }
@@ -818,9 +882,10 @@ impl Layer {
 
     /// 관리 서버가 다시 떴을 때 기록에서 운영 중인 인스턴스의 router 를 「자는」 상태로 다시 세운다. 첫 요청에 깬다.
     ///
-    /// 기록(`registry.json`)의 운영 release · 서명의 열쇠 · 레이어가 만든 비밀과, 레이어가 빌드한 폴더를 믿는다.
-    /// 빌드한 폴더가 없으면 그 commit 에서 다시 빌드한다. 프리뷰는 되살리지 않는다(다시 세우면 된다).
-    /// 되살리지 못한 인스턴스는 건너뛰고 식별자와 갈래만 알린다.
+    /// 기록(`registry.json`)의 운영 release · 서명의 열쇠 · 레이어가 만든 비밀 · 듣던 포트와, 레이어가 빌드한 폴더를 믿는다.
+    /// 빌드한 폴더가 없으면 router 만 먼저 세워 서비스로 가는 요청에 503 과 `Retry-After` 로 답하게 하고, 그 commit 에서의 빌드는
+    /// 레이어의 자물쇠 밖(뒤의 스레드)에서 한다. 빌드가 끝나면 같은 주소에서 선다. 다른 인스턴스와 API 는 그 빌드를 기다리지 않는다.
+    /// 프리뷰는 되살리지 않는다(다시 세우면 된다). 되살리지 못한 인스턴스는 건너뛰고 식별자와 갈래만 알린다.
     fn restore(&self) {
         let mut inner = self.lock();
         let records: Vec<(String, InstanceRecord)> = inner
@@ -852,31 +917,61 @@ impl Layer {
                 Err(_) => eprintln!("orbitald: {id} 의 앞 프리뷰 database 를 걷지 못했습니다"),
             }
         }
-        if inner.registry.save().is_err() {
-            eprintln!("orbitald: 레이어의 기록을 적지 못했습니다");
-        }
+        let mut building = Vec::new();
         for (id, record) in records {
             let Ok(instance) = InstanceId::parse(&id) else {
                 continue;
             };
             match self.revive(&instance, &record) {
-                Ok(live) => {
+                Ok((live, port)) => {
+                    if live.building {
+                        building.push(instance);
+                    }
+                    // 앞의 포트를 잡지 못해 새 포트를 잡았으면 기록을 고친다
+                    if let Some(production) = inner
+                        .registry
+                        .state
+                        .instances
+                        .get_mut(&id)
+                        .and_then(|record| record.production.as_mut())
+                    {
+                        production.port = port;
+                    }
                     inner.live.insert((id, Stage::Production), live);
                 }
                 Err(failure) => {
-                    let kind = match failure {
-                        Failure::BuildFailed { .. } => "build_failed",
-                        Failure::StartFailed { .. } => "start_failed",
-                        Failure::Denied(_) => "secret_missing",
-                        _ => "internal",
-                    };
-                    eprintln!("orbitald: 운영 {id} 를 되살리지 못했습니다({kind})");
+                    eprintln!(
+                        "orbitald: 운영 {id} 를 되살리지 못했습니다({})",
+                        failure_kind(&failure)
+                    );
                 }
             }
         }
+        if inner.registry.save().is_err() {
+            eprintln!("orbitald: 레이어의 기록을 적지 못했습니다");
+        }
+        drop(inner);
+        if !building.is_empty() {
+            // 뒤의 스레드는 레이어를 약하게 쥔다. 레이어가 내려가면 남은 빌드를 하지 않는다
+            let weak = Arc::downgrade(&self.0);
+            std::thread::spawn(move || {
+                for instance in building {
+                    let Some(core) = weak.upgrade() else {
+                        return;
+                    };
+                    Layer(core).finish_revive(&instance);
+                }
+            });
+        }
     }
 
-    fn revive(&self, instance: &InstanceId, record: &InstanceRecord) -> Outcome<Live> {
+    /// 기록의 운영을 다시 세운다. 빌드 폴더가 있으면 자는 채로, 없으면 빌드를 기다리며 503 으로 답하는 채로 선다.
+    /// 세운 것과, 포트마다 주소를 내는 레이어에서 router 가 듣는 포트를 돌려준다.
+    fn revive(
+        &self,
+        instance: &InstanceId,
+        record: &InstanceRecord,
+    ) -> Outcome<(Live, Option<u16>)> {
         let production = record
             .production
             .as_ref()
@@ -897,7 +992,8 @@ impl Layer {
                     .collect(),
             }));
         }
-        let folder = self.build(instance, &assembled)?;
+        let folder = self.builds_folder(instance).join(&assembled.release.0);
+        let built = folder.join(BUILT_MARKER).is_file();
         let names = Names::new(instance.clone());
         let identity_key = token::unhex(&production.identity_key)
             .ok_or_else(|| internal("서명의 열쇠를 읽지 못했습니다"))?;
@@ -908,19 +1004,143 @@ impl Layer {
             stage: Stage::Production,
             organization: &record.organization,
             app: &record.app,
+            port: production.port,
         };
-        let launched = self.launch(instance, &assembled, &folder, &stand, false)?;
-        Ok(Live {
-            release: production.release.clone(),
-            origin: launched.origin,
-            names,
-            manifest: assembled.manifest.clone(),
-            seed_users: Vec::new(),
-            services: launched.services,
-            _router: launched.router,
-        })
+        let mode = if built { Mode::Asleep } else { Mode::Building };
+        let launched = self.launch(instance, &assembled, &folder, &stand, mode, None)?;
+        let port = launched.port;
+        Ok((
+            Live {
+                release: production.release.clone(),
+                origin: launched.origin,
+                names,
+                manifest: assembled.manifest.clone(),
+                seed_users: Vec::new(),
+                services: launched.services,
+                router: launched.handle,
+                building: !built,
+                _router: launched.router,
+            },
+            port,
+        ))
+    }
+
+    /// 빌드를 기다리던 운영을 레이어의 자물쇠 밖에서 빌드하고, 끝나면 같은 자리(포트 · 하위 도메인)에 자는 채로 세운다.
+    /// 그동안 운영이 바뀌었으면(승격 · 되살리기 · 지우기) 아무것도 하지 않는다. 빌드가 실패하면 503 으로 답하던 것을 걷는다.
+    fn finish_revive(&self, instance: &InstanceId) {
+        let key = (instance.as_str().to_owned(), Stage::Production);
+        let Some(record) = self
+            .lock()
+            .registry
+            .state
+            .instances
+            .get(instance.as_str())
+            .cloned()
+        else {
+            return;
+        };
+        let Some(production) = record.production.clone() else {
+            return;
+        };
+        let still_waiting = |inner: &Inner| {
+            inner
+                .live
+                .get(&key)
+                .is_some_and(|live| live.building && live.release == production.release)
+        };
+        let built = record
+            .releases
+            .get(&production.release)
+            .and_then(|release| Commit::parse(&release.commit))
+            .ok_or_else(|| internal("운영의 release 를 찾지 못했습니다"))
+            .and_then(|commit| self.assembled(instance, &commit))
+            .and_then(|assembled| {
+                let folder = self.build(instance, &assembled)?;
+                Ok((assembled, folder))
+            });
+        let mut inner = self.lock();
+        if !still_waiting(&inner) {
+            return;
+        }
+        let (assembled, folder) = match built {
+            Ok(built) => built,
+            Err(failure) => {
+                eprintln!(
+                    "orbitald: 운영 {} 를 되살리지 못했습니다({})",
+                    instance.as_str(),
+                    failure_kind(&failure)
+                );
+                inner.live.remove(&key);
+                return;
+            }
+        };
+        let Some(old) = inner.live.remove(&key) else {
+            return;
+        };
+        let Live {
+            origin, _router, ..
+        } = old;
+        let names = Names::new(instance.clone());
+        let Some(identity_key) = token::unhex(&production.identity_key) else {
+            return;
+        };
+        let stand = Stand {
+            names: &names,
+            generated: &production.generated,
+            identity_key: &identity_key,
+            stage: Stage::Production,
+            organization: &record.organization,
+            app: &record.app,
+            port: production.port,
+        };
+        match self.launch(
+            instance,
+            &assembled,
+            &folder,
+            &stand,
+            Mode::Asleep,
+            Some((_router, origin)),
+        ) {
+            Ok(launched) => {
+                inner.live.insert(
+                    key,
+                    Live {
+                        release: production.release.clone(),
+                        origin: launched.origin,
+                        names,
+                        manifest: assembled.manifest.clone(),
+                        seed_users: Vec::new(),
+                        services: launched.services,
+                        router: launched.handle,
+                        building: false,
+                        _router: launched.router,
+                    },
+                );
+            }
+            Err(failure) => eprintln!(
+                "orbitald: 운영 {} 를 되살리지 못했습니다({})",
+                instance.as_str(),
+                failure_kind(&failure)
+            ),
+        }
     }
 }
+
+/// 되살리지 못한 까닭의 갈래. 기록에는 이것만 남긴다.
+fn failure_kind(failure: &Failure) -> &'static str {
+    match failure {
+        Failure::BuildFailed { .. } => "build_failed",
+        Failure::StartFailed { .. } => "start_failed",
+        Failure::Denied(_) => "secret_missing",
+        _ => "internal",
+    }
+}
+
+/// 저장소에서 한 번 도는 빌드(`[build]`)가 실패했을 때 `BuildFailed` 의 서비스 자리에 적는 이름.
+pub const REPOSITORY_BUILD: &str = "[build]";
+
+/// 빌드가 끝났다는 표시. 빌드 폴더 안에 둔다.
+const BUILT_MARKER: &str = ".orbital-built";
 
 // ---- 누구인가 ----
 
@@ -1177,6 +1397,11 @@ impl Layer {
         };
         let id = ReleaseId(release.clone());
         let mut logs = Vec::new();
+        if manifest.get().build.is_some() {
+            let name = "build".to_owned();
+            let text = tail(&self.log(instance, &id, &name), &self.home, 200);
+            logs.push(LogReport { name, text });
+        }
         for service in &manifest.get().services {
             let mut names = vec![format!("build-{}", service.name)];
             if service.kind == ServiceKind::Server {
@@ -1268,7 +1493,7 @@ impl Layer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let folder = self.builds_folder(instance).join(&assembled.release.0);
-        let marker = folder.join(".orbital-built");
+        let marker = folder.join(BUILT_MARKER);
         if marker.is_file() {
             return Ok(folder);
         }
@@ -1277,6 +1502,21 @@ impl Layer {
             .export(instance, &assembled.commit, &folder)
             .map_err(internal)?;
         let cache = self.cache_folder(instance);
+        // 저장소에서 한 번 도는 빌드(`[build]`)가 서비스의 빌드보다 먼저 돈다. 같은 실행기 · 같은 환경 · 같은 폴더다
+        if let Some(repository) = &assembled.manifest.get().build {
+            let log = self.log(instance, &assembled.release, "build");
+            let job = Job {
+                folder: &folder,
+                command: &repository.command,
+                env: &[],
+                log: &log,
+                home: Some(&cache),
+            };
+            self.runner.build(&job).map_err(|_| Failure::BuildFailed {
+                service: REPOSITORY_BUILD.to_owned(),
+                log: tail(&log, &self.home, 40),
+            })?;
+        }
         for service in &assembled.manifest.get().services {
             let log = self.log(
                 instance,
@@ -1304,43 +1544,59 @@ impl Layer {
     /// 빌드한 것을 띄운다. 서버 서비스마다 proxy 를 하나 세우고, 앱에는 그 주소와 레이어가 만든 비밀만 건넨다.
     /// 서비스들 앞에 router 를 세운다. 밖에서는 router 의 주소로만 닿는다.
     ///
-    /// `wake` 면 서버 서비스를 지금 띄워 실제로 뜨는지 확인한다(프리뷰와 승격). 아니면 자는 채로 세워 첫 요청에 깨운다
-    /// (관리 서버가 다시 떴을 때). 어느 쪽이든 요청이 없으면 정한 시간 뒤에 잔다.
+    /// `mode` 가 서버 서비스를 지금 띄울지([`Mode::Awake`]), 자는 채로 세울지, 빌드가 끝날 때까지 503 으로 답할지를 정한다.
+    /// 어느 쪽이든 요청이 없으면 정한 시간 뒤에 잔다. `reuse` 를 주면 그 자리(포트)에서 듣기를 멈추지 않고 router 만 바꿔 넣는다.
     fn launch(
         &self,
         instance: &InstanceId,
         assembled: &Assembled,
         folder: &Path,
         stand: &Stand<'_>,
-        wake: bool,
+        mode: Mode,
+        reuse: Option<(Front, String)>,
     ) -> Outcome<Launched> {
         let (names, generated, stage) = (stand.names, stand.generated, stand.stage);
         // 하위 도메인을 쓰면 레이어의 주소 하나가 받고, 아니면 인스턴스마다 포트 하나를 듣는다
-        let (listener, origin, host) = match &self.hosted {
-            Some(hosted) => {
+        let (listener, origin, host, reused) = match (&self.hosted, reuse) {
+            // 앞의 것(빌드를 기다리던 router)은 새 router 를 하위 도메인의 표에 넣은 뒤에 내려간다. 그 사이에 404 가 없다
+            (Some(hosted), old) => {
                 let target = match stage {
                     Stage::Preview => HostTarget::Preview(instance.clone()),
                     Stage::Production => HostTarget::Production(instance.clone()),
                 };
                 let origin = host_origin(hosted.scheme, &hosted.base, &target);
-                (None, origin, Some(target))
+                (None, origin, Some(target), old.map(|(front, _)| front))
             }
-            None => {
-                let listener = self
-                    .runtime
-                    .block_on(TcpListener::bind("127.0.0.1:0"))
-                    .map_err(internal)?;
+            (None, Some((front, origin))) => (None, origin, None, Some(front)),
+            (None, None) => {
+                let listener = self.listen(stand.port)?;
                 let origin = format!(
                     "http://127.0.0.1:{}",
                     listener.local_addr().map_err(internal)?.port()
                 );
-                (Some(listener), origin, None)
+                (Some(listener), origin, None, None)
             }
         };
+        let port = self
+            .hosted
+            .is_none()
+            .then(|| origin.rsplit(':').next().and_then(|port| port.parse().ok()))
+            .flatten();
         let url = |path: &str| format!("{origin}{}", path.trim_end_matches('/'));
         let mut services = Vec::new();
         let mut targets = BTreeMap::new();
         for service in &assembled.manifest.get().services {
+            if mode == Mode::Building {
+                targets.insert(service.name.to_string(), RouterTarget::Pending);
+                services.push(LiveService {
+                    name: service.name.to_string(),
+                    kind: service.kind,
+                    url: url(&service.path),
+                    server: None,
+                    proxy: None,
+                });
+                continue;
+            }
             if service.kind == ServiceKind::Static {
                 let output = folder.join(service.output.as_deref().unwrap_or_default());
                 if !output.is_dir() {
@@ -1364,8 +1620,10 @@ impl Layer {
             }
 
             // 포트(`PORT`)는 띄울 때마다 새로 받는다. 자고 깨면 바뀐다
+            // 듣는 주소. 프레임워크마다 읽는 이름이 달라 둘 다 건넨다(`next start` 는 `HOSTNAME` 을 읽는다)
             let mut env = vec![
                 ("HOST".to_owned(), "127.0.0.1".to_owned()),
+                ("HOSTNAME".to_owned(), "127.0.0.1".to_owned()),
                 // 프리뷰에서 메일을 보내지 않는 것처럼, 앱이 어디에 섰는지에 따라 달리 굴 일이 있다
                 (
                     "ORBITAL_STAGE".to_owned(),
@@ -1378,10 +1636,7 @@ impl Layer {
             ];
             let mut proxy = None;
             if !service.roles.is_empty() {
-                let listener = self
-                    .runtime
-                    .block_on(TcpListener::bind("127.0.0.1:0"))
-                    .map_err(internal)?;
+                let listener = self.unclaimed_listener()?;
                 let proxy_port = listener.local_addr().map_err(internal)?.port();
                 let route = Route::for_service(names, &assembled.manifest, &service.name);
                 proxy = Some(
@@ -1444,7 +1699,7 @@ impl Layer {
                 server: Some(Arc::clone(&server)),
                 proxy,
             };
-            if wake {
+            if mode == Mode::Awake {
                 let port = free_port().ok_or_else(|| internal("빈 포트를 찾지 못했습니다"))?;
                 let process = starter.start(port).map_err(|_| Failure::StartFailed {
                     service: service.name.to_string(),
@@ -1512,28 +1767,84 @@ impl Layer {
             },
             seed_users: Self::seed_ids(assembled, stage),
             log: Some(log),
-            documents: Arc::clone(&self.documents),
+            documents: Arc::clone(
+                &self
+                    .documents
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
         };
-        let router = match (listener, host, &self.hosted) {
-            (Some(listener), _, _) => {
-                Front::Port(self.runtime.spawn(serve_router(listener, config)))
+        let handle = Router::new(config);
+        let router = match (listener, host, &self.hosted, reused) {
+            (Some(listener), _, _, _) => {
+                let slot = Arc::new(RwLock::new(handle.clone()));
+                Front::Port {
+                    task: self.runtime.spawn(serve_slot(listener, Arc::clone(&slot))),
+                    slot,
+                }
             }
-            (None, Some(target), Some(hosted)) => {
-                let router = Router::new(config);
-                hosted.hosts.insert(target.clone(), &router);
+            (None, Some(target), Some(hosted), _) => {
+                hosted.hosts.insert(target.clone(), &handle);
                 Front::Host {
                     hosts: Arc::clone(&hosted.hosts),
                     target,
-                    router,
+                    router: handle.clone(),
                 }
+            }
+            (None, None, None, Some(front @ Front::Port { .. })) => {
+                if let Front::Port { slot, .. } = &front {
+                    *slot
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = handle.clone();
+                }
+                front
             }
             _ => return Err(internal("router 를 세울 자리가 없습니다")),
         };
         Ok(Launched {
             services,
             router,
+            handle,
             origin,
+            port,
         })
+    }
+
+    /// router 가 들을 포트를 잡는다. `preferred` 를 먼저 잡아 보고(앞의 router 가 막 내려가는 중이면 잠깐 되풀이한다),
+    /// 잡지 못하면 빈 포트를 잡는다.
+    fn listen(&self, preferred: Option<u16>) -> Outcome<TcpListener> {
+        // 방금 앱에 내준 포트(아직 듣지 않아 비어 보인다)는 잡지 않는다
+        if let Some(port) = preferred.filter(|port| !orbital_run::handed(*port)) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if let Ok(listener) = self
+                    .runtime
+                    .block_on(TcpListener::bind(("127.0.0.1", port)))
+                {
+                    return Ok(listener);
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        self.unclaimed_listener()
+    }
+
+    /// 운영체제가 준 빈 포트에서 듣는다. 방금 앱에 내준 포트가 오면 놓고 다시 받는다.
+    fn unclaimed_listener(&self) -> Outcome<TcpListener> {
+        for _ in 0..64 {
+            let listener = self
+                .runtime
+                .block_on(TcpListener::bind("127.0.0.1:0"))
+                .map_err(internal)?;
+            let port = listener.local_addr().map_err(internal)?.port();
+            if !orbital_run::handed(port) {
+                return Ok(listener);
+            }
+        }
+        Err(internal("빈 포트를 찾지 못했습니다"))
     }
 
     /// 씨앗 사용자의 식별자. 프리뷰에만 있다.
@@ -1664,8 +1975,9 @@ impl Layer {
             stage: Stage::Preview,
             organization: &record.organization,
             app: &record.app,
+            port: None,
         };
-        let launched = match self.launch(instance, &assembled, &folder, &stand, true) {
+        let launched = match self.launch(instance, &assembled, &folder, &stand, Mode::Awake, None) {
             Ok(launched) => launched,
             Err(failure) => {
                 let _ = inner.admin.destroy(&names);
@@ -1797,6 +2109,8 @@ impl Layer {
                 seed_users: Self::seed_ids(&assembled, Stage::Preview),
                 manifest: assembled.manifest.clone(),
                 services: launched.services,
+                router: launched.handle,
+                building: false,
                 _router: launched.router,
             },
         );
@@ -2051,6 +2365,19 @@ impl Layer {
         change: Change,
         approved_by: Approver,
     ) -> Outcome<PromotionReport> {
+        // 빌드 폴더가 없으면(걷었거나 기계를 옮겼다) 레이어의 자물쇠 밖에서 먼저 빌드한다. 판정은 자물쇠를 쥔 뒤에 한다
+        let commit = {
+            let mut inner = self.lock();
+            let record = Self::owned(&mut inner, organization, instance)?;
+            record
+                .releases
+                .get(release)
+                .and_then(|known| Commit::parse(&known.commit))
+        };
+        if let Some(commit) = commit {
+            let assembled = self.assembled(instance, &commit)?;
+            self.build(instance, &assembled)?;
+        }
         let mut inner = self.lock();
         let record = Self::owned(&mut inner, organization, instance)?.clone();
         let known = record.releases.get(release).ok_or(Failure::NotFound)?;
@@ -2144,6 +2471,10 @@ impl Layer {
             identity_key: &identity_key,
             organization: &record.organization,
             app: &record.app,
+            port: record
+                .production
+                .as_ref()
+                .and_then(|production| production.port),
         };
         let outcome = self.promote_onto(&mut inner, &target, &scripts);
         let (launched, ran) = match outcome {
@@ -2187,6 +2518,7 @@ impl Layer {
             release: release.to_owned(),
             services: Self::report(&launched.services),
             migrations: ran,
+            schedules: Self::schedule_report(&assembled.manifest, &BTreeMap::new(), (self.clock)()),
         };
         let stored = inner
             .registry
@@ -2203,6 +2535,7 @@ impl Layer {
             restore_point: point.as_ref().map(|point| point.database().to_owned()),
             identity_key: token::hex(&identity_key),
             generated,
+            port: launched.port,
         });
         stored.promotion_requested = None;
         inner.registry.save().map_err(Failure::Internal)?;
@@ -2225,6 +2558,8 @@ impl Layer {
                 manifest: assembled.manifest.clone(),
                 seed_users: Vec::new(),
                 services: launched.services,
+                router: launched.handle,
+                building: false,
                 _router: launched.router,
             },
         );
@@ -2280,9 +2615,17 @@ impl Layer {
             stage: Stage::Production,
             organization: target.organization,
             app: target.app,
+            port: target.port,
         };
         let launched = self
-            .launch(target.instance, assembled, target.folder, &stand, true)
+            .launch(
+                target.instance,
+                assembled,
+                target.folder,
+                &stand,
+                Mode::Awake,
+                None,
+            )
             .map_err(|failure| (failure, migrated))?;
         Ok((launched, ran))
     }
@@ -2378,8 +2721,16 @@ impl Layer {
             stage: Stage::Production,
             organization: &prior.record.organization,
             app: &prior.record.app,
+            port: production.port,
         };
-        if let Ok(launched) = self.launch(prior.instance, &assembled, &folder, &stand, true) {
+        if let Ok(launched) = self.launch(
+            prior.instance,
+            &assembled,
+            &folder,
+            &stand,
+            Mode::Awake,
+            None,
+        ) {
             inner.live.insert(
                 (prior.instance.as_str().to_owned(), Stage::Production),
                 Live {
@@ -2389,6 +2740,8 @@ impl Layer {
                     manifest: assembled.manifest.clone(),
                     seed_users: Vec::new(),
                     services: launched.services,
+                    router: launched.handle,
+                    building: false,
                     _router: launched.router,
                 },
             );
@@ -2451,7 +2804,10 @@ impl Layer {
         instance: &InstanceId,
     ) -> Outcome<Option<PromotionReport>> {
         let mut inner = self.lock();
-        Self::owned(&mut inner, organization, instance)?;
+        let records = Self::owned(&mut inner, organization, instance)?
+            .schedules
+            .clone();
+        let now = (self.clock)();
         Ok(inner
             .live
             .get(&(instance.as_str().to_owned(), Stage::Production))
@@ -2459,7 +2815,34 @@ impl Layer {
                 release: live.release.clone(),
                 services: Self::report(&live.services),
                 migrations: Vec::new(),
+                schedules: Self::schedule_report(&live.manifest, &records, now),
             }))
+    }
+
+    fn schedule_report(
+        manifest: &ValidManifest,
+        records: &BTreeMap<String, ScheduleRecord>,
+        now: u64,
+    ) -> Vec<ScheduleReport> {
+        manifest
+            .get()
+            .schedules
+            .iter()
+            .map(|schedule| {
+                let record = records.get(&schedule.key());
+                ScheduleReport {
+                    service: schedule.service.to_string(),
+                    path: schedule.path.clone(),
+                    cron: schedule.cron.clone(),
+                    next_at: record.map(|record| record.next_at).or_else(|| {
+                        Cron::parse(&schedule.cron)
+                            .ok()
+                            .and_then(|cron| cron.next_after(now))
+                    }),
+                    last_run: record.and_then(|record| record.last_run.clone()),
+                }
+            })
+            .collect()
     }
 
     /// 운영의 사용자 저장소(인증 역할로 붙은 연결). 운영이 서 있고 `[auth]` 를 선언했을 때만 있다.
@@ -3230,6 +3613,128 @@ impl Layer {
 
     /// 정한 주기가 됐으면 기반 백업을 뜨고 복구 훈련을 돌린다. 관리 서버가 1분마다 부른다.
     /// 훈련이 실패했으면 주기를 기다리지 않고 한 시간 뒤에 다시 돌린다.
+    /// 운영의 인스턴스 가운데 때가 된 일정을 부른다. `orbitald` 가 1분마다 부르고, 테스트는 시계를 갈아 끼워 때를 만든다.
+    ///
+    /// 처음 보는 일정은 지난 때를 부르지 않고 다음 때를 적는다. 레이어가 내려가 있어 여러 때를 놓쳤으면 몰아서 부르지 않고 한 번만 부른다.
+    /// 부르기 **전에** 다음 때를 기록에 적어, 부르는 도중에 레이어가 내려가도 같은 때를 두 번 부르지 않는다. 실패해도 다시 부르지 않는다.
+    /// 프리뷰와 빌드를 기다리는 운영은 부르지 않는다. 부르는 일은 따로 된 스레드에서 돌고, 그 스레드들을 돌려준다(테스트가 기다린다).
+    pub fn call_schedules(&self) -> Vec<std::thread::JoinHandle<()>> {
+        let now = (self.clock)();
+        let mut due = Vec::new();
+        {
+            let mut inner = self.lock();
+            let Inner { live, registry, .. } = &mut *inner;
+            let mut changed = false;
+            for ((id, stage), live) in live.iter() {
+                if *stage != Stage::Production || live.building {
+                    continue;
+                }
+                let Some(record) = registry.state.instances.get_mut(id) else {
+                    continue;
+                };
+                let schedules = &live.manifest.get().schedules;
+                let keys: BTreeSet<String> =
+                    schedules.iter().map(|schedule| schedule.key()).collect();
+                let before = record.schedules.len();
+                record.schedules.retain(|key, _| keys.contains(key));
+                changed |= record.schedules.len() != before;
+                for schedule in schedules {
+                    let Ok(cron) = Cron::parse(&schedule.cron) else {
+                        continue;
+                    };
+                    let key = schedule.key();
+                    let Some(entry) = record.schedules.get_mut(&key) else {
+                        if let Some(next_at) = cron.next_after(now) {
+                            record.schedules.insert(
+                                key,
+                                ScheduleRecord {
+                                    next_at,
+                                    last_run: None,
+                                },
+                            );
+                            changed = true;
+                        }
+                        continue;
+                    };
+                    if now < entry.next_at {
+                        continue;
+                    }
+                    // 놓친 때 가운데 마지막 것에 맞춘다
+                    let mut due_at = entry.next_at;
+                    while let Some(later) = cron.next_after(due_at)
+                        && later <= now
+                    {
+                        due_at = later;
+                    }
+                    entry.next_at = cron.next_after(now).unwrap_or(u64::MAX);
+                    entry.last_run = Some(ScheduleRun {
+                        due_at,
+                        started_at: now,
+                        outcome: "running".to_owned(),
+                        status: None,
+                        millis: None,
+                    });
+                    changed = true;
+                    due.push((
+                        id.clone(),
+                        key,
+                        schedule.service.to_string(),
+                        schedule.path.clone(),
+                        live.router.clone(),
+                        due_at,
+                    ));
+                }
+            }
+            if changed && registry.save().is_err() {
+                eprintln!("orbitald: 일정의 기록을 적지 못했습니다. 이번 때는 부르지 않습니다");
+                return Vec::new();
+            }
+        }
+        due.into_iter()
+            .map(|(id, key, service, path, router, due_at)| {
+                let runtime = self.runtime.handle().clone();
+                let limit = self.schedule_timeout;
+                let weak = Arc::downgrade(&self.0);
+                std::thread::spawn(move || {
+                    let started = Instant::now();
+                    let called =
+                        runtime.block_on(router.call_schedule(&service, &path, &key, limit));
+                    let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let (outcome, status) = match called {
+                        Called::Answered(status) if (200..300).contains(&status) => {
+                            ("ok", Some(status))
+                        }
+                        Called::Answered(status) => ("failed", Some(status)),
+                        Called::Unreachable => ("unreachable", None),
+                        Called::TimedOut => ("timed_out", None),
+                    };
+                    let Some(core) = weak.upgrade() else {
+                        return;
+                    };
+                    let layer = Layer(core);
+                    let mut inner = layer.lock();
+                    let Some(run) = inner
+                        .registry
+                        .state
+                        .instances
+                        .get_mut(&id)
+                        .and_then(|record| record.schedules.get_mut(&key))
+                        .and_then(|entry| entry.last_run.as_mut())
+                        .filter(|run| run.due_at == due_at)
+                    else {
+                        return;
+                    };
+                    run.outcome = outcome.to_owned();
+                    run.status = status;
+                    run.millis = Some(millis);
+                    if inner.registry.save().is_err() {
+                        eprintln!("orbitald: 일정의 결과를 적지 못했습니다");
+                    }
+                })
+            })
+            .collect()
+    }
+
     pub fn tend(&self, backup_every: Duration, drill_every: Duration) {
         let Some(backup) = &self.backup else {
             return;

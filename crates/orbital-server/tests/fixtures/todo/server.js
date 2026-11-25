@@ -114,6 +114,15 @@ http.createServer(async (request, response) => {
             return setTimeout(() => response.end("끝"), ms);
         }
         if (request.url === "/env") return send(200, { names: Object.keys(process.env).sort() });
+        // 공개 경로의 자리. 앱에 닿은 머리말을 그대로 돌려준다
+        if (request.url.startsWith("/assets/")) return send(200, { public: true, headers: request.headers });
+        // 일정이 부르는 자리. 불린 때와 받은 머리말을 작업 폴더의 파일에 남긴다(재워도 남는다)
+        if (request.url.startsWith("/jobs/")) {
+            require("node:fs").appendFileSync("jobs.jsonl", `${JSON.stringify({ path: request.url, method: request.method, headers: request.headers })}\n`);
+            if (request.url === "/jobs/fail") return send(500, { error: "실패하는 일" });
+            if (request.url === "/jobs/slow") return setTimeout(() => send(200, { ran: true }), 3000);
+            return send(200, { ran: true });
+        }
         if (request.url === "/cards" && request.method === "GET") {
             const sets = await query("member", withIdentity(request, "SELECT to_jsonb(c) - 'owner' FROM todo.card c ORDER BY id"));
             return send(200, sets[1].map((row) => JSON.parse(row[0])));
