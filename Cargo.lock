@@ -855,6 +855,7 @@ dependencies = [
  "hyper-util",
  "orbital-core",
  "orbital-pg",
+ "orbital-run",
  "serde_json",
  "tokio",
  "ureq",
