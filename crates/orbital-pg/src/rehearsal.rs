@@ -9,7 +9,7 @@
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use orbital_core::manifest::ValidManifest;
-use orbital_core::plan::{Names, Step, logins};
+use orbital_core::plan::{Names, Step, connectors};
 
 use crate::{Admin, Error, is_busy, pg, quote};
 
@@ -268,18 +268,12 @@ impl Admin {
             .batch_execute(&rename(&point.database, &live))
             .map_err(pg("되돌릴 지점을 운영 자리에 놓"))?;
 
-        let mut steps = vec![Step::GrantConnect {
-            database: live.clone(),
-            role: names.migrator(),
-        }];
-        steps.extend(
-            logins(names, manifest)
-                .into_iter()
-                .map(|login| Step::GrantConnect {
-                    database: live.clone(),
-                    role: login.name,
-                }),
-        );
+        let steps = connectors(names, manifest)
+            .into_iter()
+            .map(|role| Step::GrantConnect {
+                database: live.clone(),
+                role,
+            });
         for step in steps {
             self.cluster
                 .batch_execute(&step.sql())

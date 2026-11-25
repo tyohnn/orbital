@@ -16,6 +16,7 @@ use orbital_core::plan::{Names, Place, Step, grants, provision};
 use postgres::error::SqlState;
 use postgres::{Client, Config, NoTls};
 
+pub mod auth;
 pub mod identity;
 pub mod migrations;
 pub mod rehearsal;
