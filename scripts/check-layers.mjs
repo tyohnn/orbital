@@ -11,6 +11,9 @@ const LAYER = {
     "orbital-core": "domain",
     "orbital-pg": "adapter",
     "orbital-proxy": "adapter",
+    "orbital-source": "adapter",
+    "orbital-run": "adapter",
+    "orbital-server": "app",
     "orbital-cli": "app",
 };
 

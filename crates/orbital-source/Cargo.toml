@@ -1,0 +1,16 @@
+[package]
+name = "orbital-source"
+description = "Orbital 의 코드 저장소. 인스턴스마다 레이어 안에 git 이력을 두고, commit 하나에서 선언 · 권한 표 · 마이그레이션을 읽는다"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+orbital-core = { path = "../orbital-core" }
+sha2.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true
