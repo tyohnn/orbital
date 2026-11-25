@@ -63,6 +63,8 @@ struct State {
     /// 요청이 들어올 때마다 는다. 재우는 타이머는 자기가 선 뒤로 요청이 없었을 때만 재운다.
     generation: u64,
     closed: bool,
+    /// 처리 중인 요청이 끝나면 곧바로 재운다. 앱에 건넬 값(비밀)이 바뀌었을 때 선다.
+    refresh: bool,
 }
 
 /// 서버 서비스 하나.
@@ -146,6 +148,31 @@ impl AppServer {
             let mut state = self.lock();
             state.closed = true;
             state.awake.take()
+        };
+        if let Some(mut awake) = awake {
+            awake.process.stop();
+        }
+    }
+
+    /// 떠 있는 프로세스를 곧바로 재운다. 다음 요청은 새로 깨운 프로세스가 받는다. 앱에 건넬 값(비밀)이 바뀌었을 때 레이어가 부른다(동기).
+    ///
+    /// 처리 중인 요청이 있으면 그 요청이 끝난 뒤에 재운다. 깨우는 중이던 프로세스는 바뀌기 전의 값을 읽었을 수 있어, 그 첫 요청이 끝나면 재운다.
+    pub fn refresh(&self) {
+        let awake = {
+            let mut state = self.lock();
+            if state.in_flight > 0 {
+                state.refresh = true;
+                None
+            } else if state.awake.is_some() {
+                state.generation += 1;
+                state.awake.take()
+            } else {
+                // 자고 있으면 할 것이 없다. 깨우는 문이 잠겨 있으면 지금 깨우는 중이다
+                if self.gate.try_lock().is_err() {
+                    state.refresh = true;
+                }
+                None
+            }
         };
         if let Some(mut awake) = awake {
             awake.process.stop();
@@ -259,6 +286,16 @@ impl AppServer {
             let mut state = self.lock();
             state.in_flight = state.in_flight.saturating_sub(1);
             if state.in_flight > 0 {
+                return;
+            }
+            if state.refresh {
+                state.refresh = false;
+                state.generation += 1;
+                let awake = state.awake.take();
+                drop(state);
+                if let Some(mut awake) = awake {
+                    self.runtime.spawn_blocking(move || awake.process.stop());
+                }
                 return;
             }
             state.generation
