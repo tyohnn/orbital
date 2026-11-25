@@ -59,6 +59,8 @@ fn manifest_with(api: &[bool; 3], worker: &[bool; 3], auth: bool) -> ValidManife
         path: path.to_owned(),
         roles: pick(mask),
         auth: ServiceAuth::Optional,
+        public: Vec::new(),
+        fallback: None,
     };
     Manifest {
         services: vec![
@@ -792,6 +794,8 @@ mod secrets {
                     path: "/".to_owned(),
                     roles: Vec::new(),
                     auth: ServiceAuth::Optional,
+                    public: Vec::new(),
+                    fallback: None,
                 }],
                 secrets: Secrets {
                     generated: Vec::new(),
@@ -1326,6 +1330,129 @@ mod backup {
                     at: 0,
                 };
                 prop_assert_eq!(judge(&parsed, &request), Verdict::Deny(DenyReason::ServiceKeyOnly));
+            }
+        }
+    }
+}
+
+// ---- 일정의 cron 식 ----
+
+mod cron {
+    use orbital_core::cron::Cron;
+    use proptest::prelude::*;
+
+    /// 칸 하나: 식에 적을 글과, 생성기가 아는 맞는 값의 집합(구현을 부르지 않고 만든다).
+    fn field(low: u32, high: u32) -> impl Strategy<Value = (String, Vec<u32>)> {
+        prop_oneof![
+            Just(("*".to_owned(), (low..=high).collect())),
+            (low..=high).prop_map(|value| (value.to_string(), vec![value])),
+            (low..=high, low..=high).prop_map(|(a, b)| {
+                let (from, to) = (a.min(b), a.max(b));
+                (format!("{from}-{to}"), (from..=to).collect())
+            }),
+            (1u32..=7).prop_map(move |step| (
+                format!("*/{step}"),
+                (low..=high).step_by(step as usize).collect()
+            )),
+            proptest::collection::btree_set(low..=high, 1..4).prop_map(|values| (
+                values
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                values.into_iter().collect()
+            )),
+        ]
+    }
+
+    /// 유닉스 초를 (월, 일, 시, 분, 요일)로. 구현과 다른 길로 센다: 해와 달을 앞에서부터 빼 나간다.
+    fn calendar(at: u64) -> (u32, u32, u32, u32, u32) {
+        let mut days = at / 86_400;
+        let weekday = ((days + 4) % 7) as u32;
+        let leap = |year: u64| {
+            (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+        };
+        let mut year = 1970;
+        loop {
+            let length = if leap(year) { 366 } else { 365 };
+            if days < length {
+                break;
+            }
+            days -= length;
+            year += 1;
+        }
+        let lengths = [
+            31,
+            if leap(year) { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        let mut month = 0;
+        while days >= lengths[month] {
+            days -= lengths[month];
+            month += 1;
+        }
+        let minute_of_day = (at % 86_400) / 60;
+        (
+            month as u32 + 1,
+            days as u32 + 1,
+            (minute_of_day / 60) as u32,
+            (minute_of_day % 60) as u32,
+            weekday,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(300))]
+
+        #[test]
+        fn 다음_때는_언제나_지금보다_뒤이고_식에_맞으며_그_사이에_맞는_분이_없다(
+            minute in field(0, 59),
+            hour in field(0, 23),
+            day in field(1, 31),
+            month in field(1, 12),
+            weekday in field(0, 6),
+            // 2020 년부터 2040 년 사이의 아무 초
+            now in 1_577_836_800u64..2_208_988_800u64,
+        ) {
+            let text = format!("{} {} {} {} {}", minute.0, hour.0, day.0, month.0, weekday.0);
+            let either = !day.0.starts_with('*') && !weekday.0.starts_with('*');
+            let fits = |at: u64| {
+                let (m, d, h, min, w) = calendar(at);
+                let on_day = if either {
+                    day.1.contains(&d) || weekday.1.contains(&w)
+                } else {
+                    day.1.contains(&d) && weekday.1.contains(&w)
+                };
+                month.1.contains(&m) && on_day && hour.1.contains(&h) && minute.1.contains(&min)
+            };
+            match Cron::parse(&text) {
+                // 오지 않는 식(2월 30일)만 받지 않는다. 그 식은 400년 안에 맞는 날이 정말로 없다
+                Err(_) => {
+                    let months_with_day = |d: u32| match d { 31 => vec![1, 3, 5, 7, 8, 10, 12], 30 => vec![1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], _ => (1..=12).collect() };
+                    prop_assert!(!either && !day.1.iter().any(|d| months_with_day(*d).iter().any(|m| month.1.contains(m))), "{text}");
+                }
+                Ok(cron) => {
+                    let next = cron.next_after(now).expect("받은 식은 언젠가 온다");
+                    prop_assert!(next > now, "{text}: {next} <= {now}");
+                    prop_assert_eq!(next % 60, 0);
+                    prop_assert!(fits(next), "{}: {} 은 식에 맞지 않습니다 {:?}", text, next, calendar(next));
+                    prop_assert!(cron.matches(next));
+                    // 사이의 분은 맞지 않는다. 사흘까지 분마다 본다
+                    let mut at = (now / 60 + 1) * 60;
+                    while at < next && at < now + 3 * 86_400 {
+                        prop_assert!(!fits(at), "{}: 사이의 {} 이 맞습니다", text, at);
+                        at += 60;
+                    }
+                }
             }
         }
     }

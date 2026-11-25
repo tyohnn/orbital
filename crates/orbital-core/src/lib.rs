@@ -7,6 +7,7 @@ pub mod access;
 pub mod auth;
 pub mod backup;
 pub mod check;
+pub mod cron;
 pub mod describe;
 pub mod git;
 pub mod google;

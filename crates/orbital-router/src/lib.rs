@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -31,8 +31,8 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use orbital_core::auth::{
-    Admission, InvitationRefusal, LinkRefusal, SESSION_TTL, admit, route, safe_next, same_origin,
-    static_file, wants_page,
+    Admission, InvitationRefusal, LinkRefusal, SESSION_TTL, admit, fallback_file, is_public, route,
+    safe_next, same_origin, schedule_path, static_file, wants_page,
 };
 use orbital_core::host::{BaseDomain, HostTarget, judge_host};
 use orbital_core::manifest::{Auth, ValidManifest};
@@ -51,6 +51,8 @@ pub const SESSION_COOKIE: &str = "__Host-orbital-session";
 pub const BROWSER_COOKIE: &str = "__Host-orbital-browser";
 /// 앱에 신원을 싣는 머리말. router 만 붙인다.
 pub const IDENTITY_HEADER: &str = "x-orbital-identity";
+/// 레이어가 일정으로 부른 요청에 싣는 머리말. 값은 그 일정을 가리킨다(`Schedule::key`). 밖에서 온 것은 언제나 지우므로 router 만 붙인다.
+pub const SCHEDULE_HEADER: &str = "x-orbital-schedule";
 const LAYER_COOKIE_PREFIX: &str = "__Host-orbital-";
 const LAYER_HEADER_PREFIX: &str = "x-orbital-";
 /// 앱에 싣는 신원이 읽히는 시간. 요청 하나를 처리하는 동안만 쓰면 된다.
@@ -326,6 +328,19 @@ pub enum Target {
     Static {
         folder: PathBuf,
     },
+    /// 아직 빌드하는 중이다. 503 과 `Retry-After` 로 답한다(관리 서버가 빌드 폴더 없이 다시 떴을 때).
+    Pending,
+}
+
+/// 일정으로 부른 결과. 숫자와 갈래만 있다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Called {
+    /// 앱이 답했다. 상태 코드다.
+    Answered(u16),
+    /// 서비스를 깨우지 못했거나 앱에 닿지 못했다.
+    Unreachable,
+    /// 정한 시간 안에 답하지 않았다.
+    TimedOut,
 }
 
 /// 인증 역할의 연결을 새로 여는 것.
@@ -689,6 +704,29 @@ impl Router {
     fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
     }
+
+    /// 선언의 일정 하나를 부른다. 그 서비스가 자고 있으면 깨워 `POST` 로 보내고, [`SCHEDULE_HEADER`] 에 `key` 를 싣는다.
+    /// 사람의 신원과 쿠키는 싣지 않는다. 밖에서 온 요청이 아니라 레이어가 부른 것이라 일정의 경로를 막지 않는다.
+    /// 다시 부르지 않는다. 결과는 router 의 기록에 `SCHEDULE <서비스> <경로> <갈래> <상태>` 로만 남긴다.
+    pub async fn call_schedule(
+        &self,
+        service: &str,
+        path: &str,
+        key: &str,
+        limit: Duration,
+    ) -> Called {
+        let called = self.state.call_schedule(service, path, key, limit).await;
+        let (outcome, status) = match called {
+            Called::Answered(status) if (200..300).contains(&status) => ("ok", status.to_string()),
+            Called::Answered(status) => ("failed", status.to_string()),
+            Called::Unreachable => ("unreachable", "-".to_owned()),
+            Called::TimedOut => ("timed_out", "-".to_owned()),
+        };
+        self.state
+            .note()
+            .line(&format!("SCHEDULE {service} {path} {outcome} {status}"));
+        called
+    }
 }
 
 /// 받은 연결마다 요청을 듣는다. 요청마다 어느 router 가 답할지 `pick` 이 고른다. 이 future 를 내리면(abort) 붙어 있던 연결도 모두 내린다.
@@ -720,10 +758,15 @@ where
 
 /// 인스턴스 하나의 router 가 포트 하나를 듣는다(기준 도메인을 주지 않은 레이어).
 pub async fn serve(listener: TcpListener, config: Config) -> std::io::Result<()> {
-    let router = Router::new(config);
+    serve_slot(listener, Arc::new(RwLock::new(Router::new(config)))).await
+}
+
+/// 자리(`slot`)에 든 router 가 포트 하나를 듣는다. 레이어는 듣기를 멈추지 않고 자리의 router 만 바꿔 넣는다
+/// (빌드하는 동안 503 으로 답하던 router 를 빌드가 끝난 router 로). 요청마다 그때 든 router 가 답한다.
+pub async fn serve_slot(listener: TcpListener, slot: Arc<RwLock<Router>>) -> std::io::Result<()> {
     accept(
         listener,
-        Arc::new(move |_: &Request<Incoming>| Some(router.clone())),
+        Arc::new(move |_: &Request<Incoming>| slot.read().ok().map(|router| router.clone())),
     )
     .await
 }
@@ -886,21 +929,37 @@ impl State {
             return self.layer(request).await;
         }
         let manifest = &self.config.manifest;
+        // 선언에 적은 일정의 경로는 레이어만 부른다. 밖에서 온 요청은 없는 것과 같이 답한다
+        if schedule_path(manifest, &path) {
+            return error(StatusCode::NOT_FOUND, "not_found");
+        }
         let Some(service) = route(manifest, &path) else {
             return error(StatusCode::NOT_FOUND, "not_found");
         };
         let Some(target) = self.config.targets.get(service.name.as_str()) else {
             return error(StatusCode::NOT_FOUND, "not_found");
         };
+        if let Target::Pending = target {
+            let mut response = error(StatusCode::SERVICE_UNAVAILABLE, "building");
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            return response;
+        }
         // MCP 의 주소는 쿠키를 보지 않고 Bearer 토큰만 본다. 다른 사이트가 사용자의 쿠키로 MCP 를 부르지 못하게 한다
         if is_mcp_path(manifest, &path)
             && let Target::Server(server) = target
         {
             return self.mcp_request(request, server).await;
         }
-        let user = match self.signed_in(request.headers()).await {
-            Ok(user) => user,
-            Err(Unavailable) => return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        // 공개 경로는 세션을 보지 않는다. 신원을 싣지 않으니 읽을 까닭이 없다
+        let user = if is_public(service, &path) {
+            None
+        } else {
+            match self.signed_in(request.headers()).await {
+                Ok(user) => user,
+                Err(Unavailable) => return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+            }
         };
         let path_and_query = request
             .uri()
@@ -913,14 +972,25 @@ impl State {
         let page = wants_page(request.method().as_str(), accept);
         match admit(manifest, service, &path_and_query, user.is_some(), page) {
             Admission::Pass => {}
+            // 공개 경로에는 세션이 있어도 신원을 싣지 않는다
+            Admission::Public => {
+                return match target {
+                    Target::Static { folder } => {
+                        Self::file(folder, &path, service, request.method(), page).await
+                    }
+                    Target::Server(server) => self.forward(request, server, None).await,
+                    Target::Pending => error(StatusCode::SERVICE_UNAVAILABLE, "building"),
+                };
+            }
             Admission::ToLogin { location } => return redirect(&location),
             Admission::Unauthorized => return error(StatusCode::UNAUTHORIZED, "unauthorized"),
         }
         match target {
             Target::Static { folder } => {
-                Self::file(folder, &path, &service.path, request.method()).await
+                Self::file(folder, &path, service, request.method(), page).await
             }
             Target::Server(server) => self.forward(request, server, user.as_ref()).await,
+            Target::Pending => error(StatusCode::SERVICE_UNAVAILABLE, "building"),
         }
     }
 
@@ -945,28 +1015,37 @@ impl State {
         }
     }
 
+    /// 폴더 안의 파일 하나. 조각은 core 가 걸렀다. 심볼릭 링크가 폴더 밖을 가리킬 수 있으니 실제 경로가 폴더 안인지 다시 본다.
+    fn inside(folder: &Path, parts: &[String]) -> Option<PathBuf> {
+        let candidate = parts
+            .iter()
+            .fold(folder.to_path_buf(), |at, part| at.join(part));
+        let (Ok(root), Ok(real)) = (fs::canonicalize(folder), fs::canonicalize(&candidate)) else {
+            return None;
+        };
+        (real.starts_with(&root) && real.is_file()).then_some(real)
+    }
+
+    /// 정적 서비스의 파일을 내준다. 없고 화면을 원하는 요청이면 선언의 `fallback` 을 내준다(core 의 `fallback_file`).
     async fn file(
         folder: &Path,
         path: &str,
-        service_path: &str,
+        service: &orbital_core::manifest::Service,
         method: &Method,
+        page: bool,
     ) -> Response<Body> {
         if method != Method::GET && method != Method::HEAD {
             return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
         }
-        let Some(parts) = static_file(path, service_path) else {
+        let Some(parts) = static_file(path, &service.path) else {
             return error(StatusCode::NOT_FOUND, "not_found");
         };
-        let candidate = parts
-            .iter()
-            .fold(folder.to_path_buf(), |at, part| at.join(part));
-        // 조각은 core 가 걸렀다. 심볼릭 링크가 폴더 밖을 가리킬 수 있으니 실제 경로가 폴더 안인지 다시 본다
-        let (Ok(root), Ok(real)) = (fs::canonicalize(folder), fs::canonicalize(&candidate)) else {
+        let found = Self::inside(folder, &parts).or_else(|| {
+            fallback_file(service, path, page).and_then(|fallback| Self::inside(folder, &fallback))
+        });
+        let Some(real) = found else {
             return error(StatusCode::NOT_FOUND, "not_found");
         };
-        if !real.starts_with(&root) || !real.is_file() {
-            return error(StatusCode::NOT_FOUND, "not_found");
-        }
         let Ok(bytes) = tokio::fs::read(&real).await else {
             return error(StatusCode::NOT_FOUND, "not_found");
         };
@@ -1052,6 +1131,42 @@ impl State {
             }
             Err(_) => error(StatusCode::BAD_GATEWAY, "bad_gateway"),
         }
+    }
+
+    /// [`Router::call_schedule`] 의 몸. 기록은 부른 쪽이 남긴다.
+    async fn call_schedule(&self, service: &str, path: &str, key: &str, limit: Duration) -> Called {
+        let Some(Target::Server(server)) = self.config.targets.get(service) else {
+            return Called::Unreachable;
+        };
+        let call = async {
+            let Ok(visit) = server.enter().await else {
+                return Called::Unreachable;
+            };
+            let (Ok(uri), Ok(value)) = (
+                format!("http://127.0.0.1:{}{path}", visit.port).parse::<hyper::Uri>(),
+                HeaderValue::from_str(key),
+            ) else {
+                return Called::Unreachable;
+            };
+            let mut request = Request::new(empty());
+            *request.method_mut() = Method::POST;
+            *request.uri_mut() = uri;
+            let headers = request.headers_mut();
+            headers.insert(SCHEDULE_HEADER, value);
+            headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+            match visit.client.clone().request(request).await {
+                Ok(answer) => {
+                    let status = answer.status().as_u16();
+                    // 본문은 읽어 버린다. 다 읽어야 연결과 처리 중의 수가 풀린다
+                    let _ = answer.into_body().collect().await;
+                    Called::Answered(status)
+                }
+                Err(_) => Called::Unreachable,
+            }
+        };
+        tokio::time::timeout(limit, call)
+            .await
+            .unwrap_or(Called::TimedOut)
     }
 
     // ---- /_orbital/ ----

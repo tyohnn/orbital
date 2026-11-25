@@ -28,6 +28,16 @@ pub struct Manifest {
     /// 레이어는 포크의 것이 아니라 위쪽(앱의 commit)의 이 칸과 폴더로 돌린다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conformance: Option<Conformance>,
+    /// 서비스의 빌드보다 먼저 저장소에서 한 번 도는 빌드(`npm ci` 같은 것). 없으면 서비스의 빌드만 돈다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<Build>,
+}
+
+/// 저장소에서 한 번 도는 빌드. 서비스의 빌드와 같은 실행기 · 같은 환경 · 같은 폴더에서, 그보다 먼저 돈다.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Build {
+    pub command: String,
 }
 
 /// 적합성 테스트의 선언. 둘 다 있어야 한다.
@@ -93,6 +103,14 @@ pub struct Service {
     /// 로그인한 사람만 들어오는가. 기본은 누구나 들어오고, 로그인했다면 신원이 함께 넘어간다.
     #[serde(default, skip_serializing_if = "ServiceAuth::is_optional")]
     pub auth: ServiceAuth,
+    /// 로그인 없이 내주는 경로의 머리(`/_next/static`). 이 아래의 요청에는 세션이 있어도 신원을 싣지 않는다.
+    /// 서비스의 `path` 아래여야 하고, 레이어의 경로와 MCP 의 경로는 적지 못한다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public: Vec<String>,
+    /// 정적 서비스만: 화면을 원하는 요청(`GET` + `Accept: text/html`)의 파일이 없을 때 대신 내줄 파일(`index.html`).
+    /// 빌드 결과의 폴더 안의 상대 경로다. 확장자가 있는 경로(스크립트 · 그림)는 되돌리지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
 }
 
 /// 서비스가 로그인을 요구하는가.
@@ -188,13 +206,28 @@ impl Service {
     pub const NAME_MAX: usize = 16;
 }
 
-/// 서버가 자는 동안에도 레이어가 정한 시각에 깨워 부르는 일.
+/// 서버가 자는 동안에도 레이어가 정한 시각(UTC 의 cron 식)에 깨워 부르는 일.
+///
+/// 레이어가 router 를 거쳐 그 경로에 `POST` 로 보내고 `x-orbital-schedule` 에 [`Schedule::key`] 를 싣는다. 사람의 신원은 싣지 않는다.
+/// 이 경로는 밖에서 부르지 못한다(router 가 거절한다).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Schedule {
     pub service: Ident,
     pub cron: String,
     pub path: String,
+}
+
+impl Schedule {
+    /// 일정 하나를 가리키는 값. 앱이 받는 `x-orbital-schedule` 의 값이고, 레이어가 부른 때를 적는 열쇠다.
+    pub fn key(&self) -> String {
+        format!(
+            "{} {} {}",
+            self.service,
+            self.cron.split_whitespace().collect::<Vec<_>>().join(" "),
+            self.path
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -271,6 +304,40 @@ pub enum ManifestProblem {
     },
     ScheduleBadCron {
         cron: String,
+    },
+    /// 맞는 때가 한 번도 오지 않는 cron 식이다.
+    ScheduleNeverRuns {
+        cron: String,
+    },
+    /// 같은 서비스 · 경로 · 식의 일정이 두 번 적혀 있다.
+    DuplicateSchedule {
+        path: String,
+    },
+    /// `[build].command` 가 비었다.
+    BuildCommandEmpty,
+    /// 공개 경로가 서비스의 `path` 아래가 아니다.
+    PublicPathOutsideService {
+        service: Ident,
+        path: String,
+    },
+    /// 공개 경로에 `..` · `%` · `\\` · `//` · `;` 같은 속일 수 있는 글자가 있다.
+    PublicPathNotPlain {
+        service: Ident,
+        path: String,
+    },
+    /// 공개 경로가 MCP 의 경로와 겹친다.
+    PublicPathMcp {
+        service: Ident,
+        path: String,
+    },
+    /// 정적 서비스가 아닌데 `fallback` 을 적었다.
+    FallbackNotStatic {
+        service: Ident,
+    },
+    /// `fallback` 이 빌드 결과의 폴더 안의 파일이 아니다.
+    FallbackOutside {
+        service: Ident,
+        fallback: String,
     },
     DuplicateSecret {
         secret: SecretName,
@@ -382,9 +449,48 @@ impl fmt::Display for ManifestProblem {
                     "일정의 경로 `{path}` 가 서비스 `{service}` 의 경로 아래가 아닙니다"
                 )
             }
-            Self::ScheduleBadCron { cron } => {
-                write!(f, "일정 `{cron}` 은 다섯 칸의 cron 식이어야 합니다")
-            }
+            Self::ScheduleBadCron { cron } => match crate::cron::Cron::parse(cron) {
+                Err(problem) => write!(
+                    f,
+                    "일정 `{cron}` 은 다섯 칸(분 시 일 월 요일, UTC)의 cron 식이어야 합니다. {problem}"
+                ),
+                Ok(_) => write!(
+                    f,
+                    "일정 `{cron}` 은 다섯 칸(분 시 일 월 요일, UTC)의 cron 식이어야 합니다"
+                ),
+            },
+            Self::ScheduleNeverRuns { cron } => write!(
+                f,
+                "일정 `{cron}` 은 맞는 때가 한 번도 오지 않습니다(2월 30일 같은 날). 오는 날로 적어 주세요"
+            ),
+            Self::DuplicateSchedule { path } => write!(
+                f,
+                "경로 `{path}` 의 같은 일정이 두 번 적혀 있습니다. 하나만 남겨 주세요"
+            ),
+            Self::BuildCommandEmpty => write!(
+                f,
+                "`[build].command` 가 비어 있습니다. 저장소에서 한 번 돌 명령(`npm ci` 같은 것)을 적거나 `[build]` 를 지워 주세요"
+            ),
+            Self::PublicPathOutsideService { service, path } => write!(
+                f,
+                "서비스 `{service}` 의 공개 경로 `{path}` 가 그 서비스의 `path` 아래가 아닙니다. 서비스의 경로 아래로 적어 주세요"
+            ),
+            Self::PublicPathNotPlain { service, path } => write!(
+                f,
+                "서비스 `{service}` 의 공개 경로 `{path}` 는 `/` 로 시작하고 `.` · `..` · 빈 조각 · `%` · `\\` · `;` 이 없는 평범한 경로여야 합니다(`/_next/static` 처럼)"
+            ),
+            Self::PublicPathMcp { service, path } => write!(
+                f,
+                "서비스 `{service}` 의 공개 경로 `{path}` 가 MCP 의 경로와 겹칩니다. MCP 의 경로는 토큰으로만 열리니 공개 경로에서 빼 주세요"
+            ),
+            Self::FallbackNotStatic { service } => write!(
+                f,
+                "`fallback` 은 정적 서비스만 적습니다. 서버 서비스 `{service}` 는 화면 안의 경로를 스스로 받아 주세요"
+            ),
+            Self::FallbackOutside { service, fallback } => write!(
+                f,
+                "서비스 `{service}` 의 `fallback` `{fallback}` 은 빌드 결과의 폴더 안의 파일이어야 합니다(`index.html` 처럼, `/` 로 시작하거나 `..` · `.` 으로 시작하는 조각 없이)"
+            ),
             Self::DuplicateSecret { secret } => write!(
                 f,
                 "비밀 `{secret}` 이 두 번 적혀 있습니다",
@@ -555,6 +661,40 @@ impl Manifest {
                     }
                 }
             }
+            for path in &service.public {
+                if !plain_path(path) {
+                    problems.push(ManifestProblem::PublicPathNotPlain {
+                        service: service.name.clone(),
+                        path: path.clone(),
+                    });
+                } else if is_layer_path(path) {
+                    problems.push(ManifestProblem::LayerPath { path: path.clone() });
+                } else if !under(path, &service.path) {
+                    problems.push(ManifestProblem::PublicPathOutsideService {
+                        service: service.name.clone(),
+                        path: path.clone(),
+                    });
+                } else if let Some(mcp) = self.auth.as_ref().and_then(|auth| auth.mcp.as_ref())
+                    && (under(path, &mcp.path) || under(&mcp.path, path))
+                {
+                    problems.push(ManifestProblem::PublicPathMcp {
+                        service: service.name.clone(),
+                        path: path.clone(),
+                    });
+                }
+            }
+            if let Some(fallback) = &service.fallback {
+                if service.kind != ServiceKind::Static {
+                    problems.push(ManifestProblem::FallbackNotStatic {
+                        service: service.name.clone(),
+                    });
+                } else if !inside_folder(fallback) {
+                    problems.push(ManifestProblem::FallbackOutside {
+                        service: service.name.clone(),
+                        fallback: fallback.clone(),
+                    });
+                }
+            }
             for role in &service.roles {
                 if !roles.contains(role) {
                     problems.push(ManifestProblem::UndeclaredRole {
@@ -565,7 +705,18 @@ impl Manifest {
             }
         }
 
+        let mut schedule_keys = BTreeSet::new();
         for schedule in &self.schedules {
+            if !schedule_keys.insert(schedule.key()) {
+                problems.push(ManifestProblem::DuplicateSchedule {
+                    path: schedule.path.clone(),
+                });
+            }
+            if is_layer_path(&schedule.path) {
+                problems.push(ManifestProblem::LayerPath {
+                    path: schedule.path.clone(),
+                });
+            }
             match self
                 .services
                 .iter()
@@ -588,11 +739,23 @@ impl Manifest {
                     }
                 }
             }
-            if schedule.cron.split_whitespace().count() != 5 {
-                problems.push(ManifestProblem::ScheduleBadCron {
+            match crate::cron::Cron::parse(&schedule.cron) {
+                Ok(_) => {}
+                Err(crate::cron::CronProblem::Never) => {
+                    problems.push(ManifestProblem::ScheduleNeverRuns {
+                        cron: schedule.cron.clone(),
+                    });
+                }
+                Err(_) => problems.push(ManifestProblem::ScheduleBadCron {
                     cron: schedule.cron.clone(),
-                });
+                }),
             }
+        }
+
+        if let Some(build) = &self.build
+            && build.command.trim().is_empty()
+        {
+            problems.push(ManifestProblem::BuildCommandEmpty);
         }
 
         if let Some(conformance) = &self.conformance {
@@ -716,6 +879,34 @@ impl Manifest {
 /// 레이어가 쓰는 경로인가. 조각의 경계를 따지지 않고 글자로 본다(`/_orbitalx` 도 받지 않는다). 넓게 막는 편이 안전하다.
 fn is_layer_path(path: &str) -> bool {
     path.starts_with(LAYER_PATH) || path.starts_with(WELL_KNOWN_PATH)
+}
+
+/// 공개 경로로 적을 수 있는 평범한 경로인가. `/` 로 시작하고, 조각마다 비어 있지 않고 `.` · `..` 이 아니며,
+/// `%` · `\\` · `;` · `?` · `#` · 제어 문자가 없다. 끝의 `/` 하나는 받는다. 글자 그대로 견줄 수 있어야 속일 수 없다.
+pub(crate) fn plain_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    !rest.is_empty()
+        && rest.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !part.contains(['%', '\\', ';', '?', '#'])
+                && !part.chars().any(char::is_control)
+        })
+}
+
+/// 폴더 안의 상대 경로인가(`index.html`, `app/index.html`). 조각이 `.` 으로 시작하거나 비었거나 `\\` · `%` · 제어 문자가 들면 아니다.
+fn inside_folder(path: &str) -> bool {
+    !path.is_empty()
+        && path.split('/').all(|part| {
+            !part.is_empty()
+                && !part.starts_with('.')
+                && !part.contains(['\\', '%'])
+                && !part.chars().any(char::is_control)
+        })
 }
 
 pub(crate) fn trim_path(path: &str) -> &str {
@@ -1244,6 +1435,163 @@ directory = ["manager"]
             problems(&service),
             vec![ManifestProblem::LayerPath {
                 path: "/.well-known/api".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn 공개_경로는_서비스의_경로_아래의_평범한_경로이고_레이어와_mcp_의_경로가_아니다() {
+        let with = |service_path: &str, public: &str| {
+            let mcp = format!("{}/mcp", service_path.trim_end_matches('/'));
+            format!(
+                r#"
+[[service]]
+name = "web"
+kind = "server"
+build = "b"
+start = "s"
+path = "{service_path}"
+public = ["{public}"]
+
+[auth]
+methods = ["email_link"]
+login_path = "{service_path}"
+
+[auth.mcp]
+service = "web"
+path = "{mcp}"
+consent_path = "{service_path}"
+"#
+            )
+        };
+        assert!(parse(&with("/", "/_next/static")).check().is_ok());
+        assert!(parse(&with("/", "/_next/static/")).check().is_ok());
+        assert_eq!(
+            problems(&with("/app", "/_next/static")),
+            vec![ManifestProblem::PublicPathOutsideService {
+                service: ident("web"),
+                path: "/_next/static".to_owned()
+            }]
+        );
+        for tricky in ["_next", "/a/../b", "/a/./b", "/a//b", "/a%2fb", "/a;b", "/"] {
+            assert_eq!(
+                problems(&with("/", tricky)),
+                vec![ManifestProblem::PublicPathNotPlain {
+                    service: ident("web"),
+                    path: tricky.to_owned()
+                }],
+                "{tricky}"
+            );
+        }
+        for layer in ["/_orbital/auth", "/.well-known/x"] {
+            assert_eq!(
+                problems(&with("/", layer)),
+                vec![ManifestProblem::LayerPath {
+                    path: layer.to_owned()
+                }]
+            );
+        }
+        for overlapping in ["/mcp", "/mcp/tools"] {
+            assert_eq!(
+                problems(&with("/", overlapping)),
+                vec![ManifestProblem::PublicPathMcp {
+                    service: ident("web"),
+                    path: overlapping.to_owned()
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_은_정적_서비스의_폴더_안의_파일만_적는다() {
+        let with = |kind: &str, fallback: &str| {
+            let extra = if kind == "static" {
+                "output = \"dist\""
+            } else {
+                "start = \"s\""
+            };
+            format!(
+                "[[service]]\nname = \"web\"\nkind = \"{kind}\"\nbuild = \"b\"\n{extra}\npath = \"/\"\nfallback = \"{fallback}\"\n"
+            )
+        };
+        assert!(parse(&with("static", "index.html")).check().is_ok());
+        assert!(parse(&with("static", "app/index.html")).check().is_ok());
+        assert_eq!(
+            problems(&with("server", "index.html")),
+            vec![ManifestProblem::FallbackNotStatic {
+                service: ident("web")
+            }]
+        );
+        for outside in ["/index.html", "../index.html", ".env", "a//b", ""] {
+            assert_eq!(
+                problems(&with("static", outside)),
+                vec![ManifestProblem::FallbackOutside {
+                    service: ident("web"),
+                    fallback: outside.to_owned()
+                }],
+                "{outside}"
+            );
+        }
+    }
+
+    #[test]
+    fn 저장소에서_한_번_도는_빌드는_명령이_있어야_하고_없으면_지금처럼_읽힌다() {
+        let manifest = parse(NEST_VITE).check().unwrap();
+        assert_eq!(manifest.get().build, None);
+        let with = format!("{NEST_VITE}\n[build]\ncommand = \"npm ci\"\n");
+        assert_eq!(
+            parse(&with).check().unwrap().get().build,
+            Some(Build {
+                command: "npm ci".to_owned()
+            })
+        );
+        let blank = format!("{NEST_VITE}\n[build]\ncommand = \" \"\n");
+        assert_eq!(problems(&blank), vec![ManifestProblem::BuildCommandEmpty]);
+        let unknown = format!("{NEST_VITE}\n[build]\ncommand = \"npm ci\"\nenv = \"x\"\n");
+        assert!(toml::from_str::<Manifest>(&unknown).is_err());
+    }
+
+    #[test]
+    fn 일정은_오는_때가_있는_식이어야_하고_같은_일정을_두_번_적지_못하며_레이어의_경로를_부르지_못한다()
+     {
+        let with = |schedules: &str| {
+            format!(
+                "[[service]]\nname = \"api\"\nkind = \"server\"\nbuild = \"b\"\nstart = \"s\"\npath = \"/\"\n{schedules}"
+            )
+        };
+        let one = |cron: &str, path: &str| {
+            format!("[[schedule]]\nservice = \"api\"\ncron = \"{cron}\"\npath = \"{path}\"\n")
+        };
+        assert_eq!(
+            problems(&with(&one("0 0 30 2 *", "/jobs"))),
+            vec![ManifestProblem::ScheduleNeverRuns {
+                cron: "0 0 30 2 *".to_owned()
+            }]
+        );
+        assert_eq!(
+            problems(&with(&format!(
+                "{}{}",
+                one("0 9 * * *", "/jobs"),
+                one("0  9 * * *", "/jobs")
+            ))),
+            vec![ManifestProblem::DuplicateSchedule {
+                path: "/jobs".to_owned()
+            }]
+        );
+        // 같은 경로라도 때가 다르면 다른 일정이다
+        assert!(
+            parse(&with(&format!(
+                "{}{}",
+                one("0 9 * * *", "/jobs"),
+                one("0 18 * * *", "/jobs")
+            )))
+            .check()
+            .is_ok()
+        );
+        assert_eq!(
+            problems(&with(&one("0 9 * * *", "/_orbital/x"))),
+            vec![ManifestProblem::LayerPath {
+                path: "/_orbital/x".to_owned()
             }]
         );
     }

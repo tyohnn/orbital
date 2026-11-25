@@ -51,6 +51,8 @@ pub fn needs_touch(last_seen_at: u64, now: u64) -> bool {
 pub enum Admission {
     /// 들여보낸다.
     Pass,
+    /// 공개 경로다. 들여보내되 신원을 싣지 않는다(세션이 있어도). 같은 답이 사람마다 달라지지 않아 캐시와 섞이지 않는다.
+    Public,
     /// 화면을 여는 요청이다. 로그인 화면으로 보낸다. `location` 은 `login_path?next=<원래 경로와 질의>` 다.
     ToLogin { location: String },
     /// 화면이 아닌 요청이다. 401 로 답한다.
@@ -103,9 +105,33 @@ fn decode_component(text: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
+/// 요청의 경로가 서비스의 공개 경로(`public`) 아래인가. `path` 는 질의를 뗀 요청의 경로다.
+///
+/// 앱이 경로를 풀어 다르게 읽을 수 있는 것은 공개로 보지 않는다(그러면 로그인이 필요한 쪽으로 간다): 빈 조각(`//`),
+/// 풀어 보면 `.` · `..` 이거나 `/` · `\` · 제어 문자가 드는 조각, `;` 이 든 조각, 풀지 못하는 `%`. 머리는 조각의 경계로 글자 그대로 견준다.
+pub fn is_public(service: &Service, path: &str) -> bool {
+    if service.public.is_empty() || !path.starts_with('/') {
+        return false;
+    }
+    let rest = &path[1..];
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let plain = rest.split('/').all(|piece| {
+        !piece.is_empty()
+            && !piece.contains(';')
+            && decode_component(piece).is_some_and(|part| {
+                part != "."
+                    && part != ".."
+                    && !part.contains(['/', '\\'])
+                    && !part.chars().any(char::is_control)
+            })
+    });
+    plain && service.public.iter().any(|head| under(path, head))
+}
+
 /// 요청을 서비스에 들여보낼지 정한다. `path_and_query` 는 요청의 경로와 질의다.
 ///
-/// 로그인을 요구하지 않는 서비스, 세션이 있는 요청, 로그인 화면(`login_path`)과 그 아래는 들여보낸다.
+/// 공개 경로는 신원 없이 들여보낸다([`Admission::Public`]). 로그인을 요구하지 않는 서비스, 세션이 있는 요청,
+/// 로그인 화면(`login_path`)과 그 아래는 들여보낸다.
 pub fn admit(
     manifest: &ValidManifest,
     service: &Service,
@@ -113,6 +139,12 @@ pub fn admit(
     signed_in: bool,
     page: bool,
 ) -> Admission {
+    let path = path_and_query
+        .split_once('?')
+        .map_or(path_and_query, |(path, _)| path);
+    if is_public(service, path) {
+        return Admission::Public;
+    }
     if service.auth == ServiceAuth::Optional || signed_in {
         return Admission::Pass;
     }
@@ -120,9 +152,6 @@ pub fn admit(
         // 선언의 검증이 막으므로 오지 않는다. 와도 들여보내지 않는다
         return Admission::Unauthorized;
     };
-    let path = path_and_query
-        .split_once('?')
-        .map_or(path_and_query, |(path, _)| path);
     if under(path, &auth.login_path) {
         return Admission::Pass;
     }
@@ -177,6 +206,59 @@ pub fn static_file(path: &str, service_path: &str) -> Option<Vec<String>> {
         parts.push("index.html".to_owned());
     }
     Some(parts)
+}
+
+/// 정적 서비스가 파일이 없을 때 대신 내줄 파일(`fallback`)의 조각. 되돌리지 않으면 `None` 이다.
+///
+/// 화면을 원하는 요청(`page`)이고, 폴더 안을 가리키며([`static_file`] 이 받는 경로), 마지막 조각에 확장자(`.`)가 없을 때만 되돌린다.
+/// 스크립트 · 그림처럼 파일처럼 생긴 경로의 404 는 그대로 둔다.
+pub fn fallback_file(service: &Service, path: &str, page: bool) -> Option<Vec<String>> {
+    let fallback = service.fallback.as_ref()?;
+    if !page {
+        return None;
+    }
+    static_file(path, &service.path)?;
+    let last = path.rsplit('/').next().unwrap_or_default();
+    if decode_component(last)?.contains('.') {
+        return None;
+    }
+    Some(fallback.split('/').map(str::to_owned).collect())
+}
+
+/// 요청의 경로가 선언에 적은 일정의 경로이거나 그 아래인가. 그런 요청은 밖에서 온 것이면 받지 않는다.
+///
+/// 앱의 라우터가 같게 읽을 수 있는 모양도 함께 막는다: `%` 를 풀고, 빈 조각(`//`)과 `.` 을 지우고 `..` 을 거슬러 올라가고,
+/// 조각의 `;` 뒤를 떼고, 대소문자를 가리지 않는다. 풀지 못하는 경로는 막는 쪽으로 본다.
+pub fn schedule_path(manifest: &ValidManifest, path: &str) -> bool {
+    let schedules = &manifest.get().schedules;
+    if schedules.is_empty() {
+        return false;
+    }
+    let Some(normal) = normalize(path) else {
+        return true;
+    };
+    schedules
+        .iter()
+        .any(|schedule| normalize(&schedule.path).is_some_and(|declared| under(&normal, &declared)))
+}
+
+/// 앱의 라우터가 읽을 법한 모양으로 경로를 고른다. 소문자 · 풀어 쓴 · `.` 과 `..` 을 거른 · 끝의 `/` 가 없는 경로다.
+fn normalize(path: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for piece in path.split('/') {
+        let piece = piece.split(';').next().unwrap_or_default();
+        let part = decode_component(piece)?.to_ascii_lowercase();
+        for part in part.split(['/', '\\']) {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other.to_owned()),
+            }
+        }
+    }
+    Some(format!("/{}", parts.join("/")))
 }
 
 /// 프리뷰의 씨앗 사용자(`db/seed/users.toml`). 프리뷰에만 들어가고 운영에는 들어가지 않는다.
@@ -706,6 +788,162 @@ mod tests {
                 location: "/login?next=/".to_owned()
             }
         );
+    }
+
+    /// 로그인이 필요한 Next.js 서비스와 공개 경로 · MCP · 일정 · 화면 안의 경로를 되돌리는 정적 서비스.
+    const OPEN_PARTS: &str = r#"
+[[service]]
+name = "web"
+kind = "server"
+build = "b"
+start = "s"
+path = "/"
+auth = "required"
+public = ["/_next/static", "/favicon.ico"]
+
+[[service]]
+name = "app"
+kind = "static"
+build = "b"
+output = "dist"
+path = "/app"
+fallback = "index.html"
+
+[[schedule]]
+service = "web"
+cron = "0 9 25 * *"
+path = "/api/jobs/payroll"
+
+[auth]
+methods = ["email_link"]
+login_path = "/login"
+
+[auth.mcp]
+service = "web"
+path = "/mcp"
+consent_path = "/consent"
+"#;
+
+    fn open_parts() -> ValidManifest {
+        toml::from_str::<Manifest>(OPEN_PARTS)
+            .unwrap()
+            .check()
+            .unwrap()
+    }
+
+    #[test]
+    fn 공개_경로_아래는_세션_없이_들여보내고_세션이_있어도_신원을_싣지_않는다() {
+        let manifest = open_parts();
+        let web = &manifest.get().services[0];
+        for open in [
+            "/_next/static/chunks/app.js",
+            "/_next/static/media/a%20b.woff2",
+            "/_next/static",
+            "/_next/static/",
+            "/favicon.ico",
+            "/_next/static/x.js?v=1",
+        ] {
+            for signed_in in [false, true] {
+                assert_eq!(
+                    admit(&manifest, web, open, signed_in, false),
+                    Admission::Public,
+                    "{open} {signed_in}"
+                );
+            }
+        }
+        // 머리는 조각의 경계로 본다. 공개 경로 밖은 앞처럼 로그인이 필요하다
+        for closed in [
+            "/_next/staticx/a.js",
+            "/_next/stat",
+            "/favicon.icox",
+            "/cards",
+        ] {
+            assert_eq!(
+                admit(&manifest, web, closed, false, false),
+                Admission::Unauthorized,
+                "{closed}"
+            );
+        }
+    }
+
+    #[test]
+    fn 앱이_다르게_읽을_수_있는_경로는_공개_경로로_보지_않는다() {
+        let manifest = open_parts();
+        let web = &manifest.get().services[0];
+        for tricky in [
+            "/_next/static/../../api/todos",
+            "/_next/static/%2e%2e/%2e%2e/api/todos",
+            "/_next/static/%2E%2E/api",
+            "/_next/static/./x.js",
+            "/_next/static//x.js",
+            "/_next/static/a%2f..%2f..%2fapi",
+            "/_next/static/a%5c..%5capi",
+            "/_next/static/a\\..\\api",
+            "/_next/static/x.js;jsessionid=1",
+            "/_next/static/%zz",
+            "/_next/static/%00",
+            "/_next/%73tatic/x.js",
+        ] {
+            assert_eq!(
+                admit(&manifest, web, tricky, false, false),
+                Admission::Unauthorized,
+                "{tricky}"
+            );
+        }
+    }
+
+    #[test]
+    fn 화면_안의_경로는_화면을_원하는_요청에만_fallback_으로_되돌린다() {
+        let manifest = open_parts();
+        let app = &manifest.get().services[1];
+        let index = Some(vec!["index.html".to_owned()]);
+        for inside in ["/app/payslips/2026-11", "/app/", "/app", "/app/a/b/c"] {
+            assert_eq!(fallback_file(app, inside, true), index, "{inside}");
+        }
+        // 화면이 아닌 요청 · 파일처럼 생긴 경로 · 폴더 밖 · 숨은 파일은 되돌리지 않는다
+        assert_eq!(fallback_file(app, "/app/payslips/2026-11", false), None);
+        for kept in [
+            "/app/assets/main.js",
+            "/app/logo.png",
+            "/app/v1.2",
+            "/app/../etc/passwd",
+            "/app/%2e%2e/x",
+            "/app/.env",
+            "/other",
+        ] {
+            assert_eq!(fallback_file(app, kept, true), None, "{kept}");
+        }
+        // 선언하지 않은 서비스는 되돌리지 않는다
+        let web = &manifest.get().services[0];
+        assert_eq!(fallback_file(web, "/payslips", true), None);
+    }
+
+    #[test]
+    fn 일정의_경로는_앱이_같게_읽을_수_있는_모양까지_일정의_경로로_본다() {
+        let declared = open_parts();
+        for same in [
+            "/api/jobs/payroll",
+            "/api/jobs/payroll/",
+            "/API/Jobs/Payroll",
+            "/api//jobs/payroll",
+            "/api/jobs/./payroll",
+            "/api/x/../jobs/payroll",
+            "/api/jobs/%70ayroll",
+            "/api/jobs/payroll;x=1",
+            "/api/jobs/payroll/more",
+            "/api/jobs%2fpayroll",
+            "/api/jobs/%zz",
+        ] {
+            assert!(schedule_path(&declared, same), "{same}");
+        }
+        for other in ["/api/jobs", "/api/jobs/payrolls", "/api/payroll", "/"] {
+            assert!(!schedule_path(&declared, other), "{other}");
+        }
+        // 일정이 없으면 어떤 경로도 일정의 경로가 아니다
+        assert!(!schedule_path(
+            &manifest(&[("web", "/")]),
+            "/api/jobs/payroll"
+        ));
     }
 
     #[test]
