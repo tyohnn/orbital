@@ -862,3 +862,33 @@ fn 원본에_끝나지_않는_연결이_있으면_복제하지_않고_바쁘다�
     ));
     assert_eq!(databases(&bench), vec![bench.names.database()]);
 }
+
+// ---- 마이그레이션이 관리 권한을 얻으려 할 때 ----
+
+fn role_exists(bench: &Bench, name: &str) -> bool {
+    let mut client = bench.admin.connect_as("postgres", "postgres").unwrap();
+    client
+        .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&name])
+        .unwrap()
+        .is_some()
+}
+
+#[test]
+fn 예행연습의_마이그레이션이_역할을_되돌려도_관리_권한을_얻지_못한다() {
+    let mut bench = bench!();
+    let intruder = format!("{}_x_intruder", bench.names.prefix());
+    let attack = format!("RESET ROLE; CREATE ROLE \"{intruder}\" SUPERUSER LOGIN");
+    let result = bench.admin.rehearse(&bench.names, &[&attack]).unwrap();
+    assert!(!result.passed);
+    assert_eq!(result.sqlstate.as_deref(), Some("42501"));
+    assert!(!role_exists(&bench, &intruder));
+    // 다른 database 를 읽는 길도 없다
+    let result = bench
+        .admin
+        .rehearse(
+            &bench.names,
+            &["RESET ROLE; COPY (SELECT 1) TO PROGRAM 'true'"],
+        )
+        .unwrap();
+    assert_eq!(result.sqlstate.as_deref(), Some("42501"));
+}
