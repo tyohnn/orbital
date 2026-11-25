@@ -67,6 +67,53 @@ export interface PendingPromotion
     migrations: string[];
     /** 이번 변경으로 앱이 새로 받게 되는 밖에서 넣는 비밀의 이름. 지금의 운영과 견준다. 사람이 무엇을 승인하는지 읽는다. */
     newSecrets: string[];
+    /** 이 release 가 담은 업데이트의 열린 rollout. 없으면 `null` 이다. 그 rollout 의 `change` 로만 오른다. */
+    rollout: string | null;
+}
+
+/** rollout 이 어디에 있는가. `halted` 는 인스턴스 하나가 실패해 멈춘 것이고 팩토리가 다시 열어야 이어진다. */
+export type RolloutStatus = "running" | "halted" | "cancelled" | "done";
+
+/**
+ * 인스턴스 하나가 업데이트를 어디까지 지났는가. `applied` 는 업데이트를 조상으로 담은 commit 이 포크에 선 것이고,
+ * `passed` 는 그 프리뷰가 권한 검사와 적합성 테스트를 통과한 것이다. `failed` 는 다시 열면 `waiting` 부터 다시 지난다.
+ */
+export type RolloutState = "waiting" | "applied" | "previewed" | "passed" | "promoted" | "failed";
+
+/** 인스턴스가 실패한 까닭. */
+export type RolloutFailure = "access_check_failed" | "conformance_failed" | "rolled_back";
+
+export interface RolloutInstance
+{
+    instance: string;
+    state: RolloutState;
+    /** `failed` 일 때만 있다. */
+    reason: RolloutFailure | null;
+}
+
+/** 앱(위쪽)의 업데이트 하나를 포크 셋에 물결로 미는(당기는) 것. */
+export interface Rollout
+{
+    id: string;
+    app: string;
+    /** 업데이트 commit. release 의 commit 이 이것을 조상으로 담으면 적용된 것이다. */
+    commit: string;
+    /** 이 업데이트를 담은 release 를 올릴 때 쓸 change. 기능 업데이트는 고객이, 법 · 보안 · 핵심 패키지는 팩토리가 승인한다. */
+    change: Change;
+    /** 순서 있는 물결. 앞 물결이 모두 오른 뒤에 뒤 물결이 오른다. */
+    waves: string[][];
+    status: RolloutStatus;
+    /** 물결의 차례대로. */
+    instances: RolloutInstance[];
+}
+
+/** 레이어가 업데이트를 합쳐 본 결과. 충돌하면 포크를 건드리지 않고 충돌한 파일의 이름만 온다. 에이전트가 풀어 올린다. */
+export interface RolloutApply
+{
+    applied: boolean;
+    /** 합친 뒤(또는 이미 담고 있던) 포크의 commit. 충돌했으면 `null` 이다. */
+    commit: string | null;
+    conflicts: string[];
 }
 
 /**
@@ -176,6 +223,20 @@ export interface Orbital
         pending(instance: string): Promise<PendingPromotion | null>;
         /** 사람이 승인했을 때: 그 release 를 운영에 올린다. 승인은 이 release 하나에 묶인다. */
         promote(input: { instance: string; release: string; change: Change; approvedBy: Approver }): Promise<Production>;
+    };
+    rollouts: {
+        /**
+         * 앱의 업데이트 하나로 rollout 을 만든다. `commit` 이 없으면 앱의 `main` 의 끝이다. 한 인스턴스는 같은 앱의 열린 rollout 하나에만 든다.
+         * 업데이트를 담은 release 는 위쪽이 정한 적합성 테스트를 통과해야 하고, 한 곳이 실패하면 rollout 이 멈춘다.
+         */
+        create(app: string, input: { commit?: string; change: Change; waves: readonly (readonly string[])[] }): Promise<Rollout>;
+        get(id: string): Promise<Rollout>;
+        /** 포크의 머리에 업데이트를 기계적으로 합친다(`git merge`). 에이전트를 돌리지 않는다. */
+        apply(id: string, instance: string): Promise<RolloutApply>;
+        /** 멈춘 rollout 을 다시 연다. 실패한 인스턴스는 고친 release 로 프리뷰부터 다시 지난다. */
+        resume(id: string): Promise<Rollout>;
+        /** 거둔다. 아직 오르지 않은 곳은 그대로 남고, 어떤 사건도 받지 않는다. */
+        cancel(id: string): Promise<Rollout>;
     };
     production: {
         /** 운영에 올라 있는 것. 아직 오른 것이 없으면 `null` 이다. */
@@ -291,6 +352,36 @@ function toSecret(value: Record<string, unknown>): Secret
     };
 }
 
+const CHANGES: readonly Change[] = ["customer_request", "feature_update", "legal_update", "security_update", "core_package"];
+const ROLLOUT_STATUSES: readonly RolloutStatus[] = ["running", "halted", "cancelled", "done"];
+const ROLLOUT_STATES: readonly RolloutState[] = ["waiting", "applied", "previewed", "passed", "promoted", "failed"];
+const ROLLOUT_FAILURES: readonly RolloutFailure[] = ["access_check_failed", "conformance_failed", "rolled_back"];
+
+function oneOf<T extends string>(choices: readonly T[], value: unknown, fallback: T): T
+{
+    return choices.find((choice) => choice === value) ?? fallback;
+}
+
+function toRollout(value: unknown): Rollout
+{
+    const record = isRecord(value) ? value : {};
+    const waves = Array.isArray(record.waves) ? record.waves.map(texts) : [];
+    const instances = Array.isArray(record.instances) ? record.instances.filter(isRecord) : [];
+    return {
+        id: text(record.id),
+        app: text(record.app),
+        commit: text(record.commit),
+        change: oneOf(CHANGES, record.change, "customer_request"),
+        waves,
+        status: oneOf(ROLLOUT_STATUSES, record.status, "running"),
+        instances: instances.map((entry) => ({
+            instance: text(entry.instance),
+            state: oneOf(ROLLOUT_STATES, entry.state, "waiting"),
+            reason: entry.reason === undefined ? null : oneOf(ROLLOUT_FAILURES, entry.reason, "rolled_back"),
+        })),
+    };
+}
+
 function toAuthSettings(value: unknown): AuthSettings
 {
     const record = isRecord(value) ? value : {};
@@ -396,6 +487,7 @@ export function createOrbital(options: OrbitalOptions): Orbital
                     changes: texts(reply.changes),
                     migrations: texts(reply.migrations),
                     newSecrets: texts(reply.new_secrets),
+                    rollout: typeof reply.rollout === "string" ? reply.rollout : null,
                 };
             },
             async promote({ instance, release, change, approvedBy })
@@ -406,6 +498,39 @@ export function createOrbital(options: OrbitalOptions): Orbital
                     approved_by: approvedBy,
                 });
                 return toProduction(reply);
+            },
+        },
+        rollouts: {
+            async create(app, { commit, change, waves })
+            {
+                const body: { [key: string]: Json } = { change, waves: waves.map((wave) => [...wave]) };
+                if (commit !== undefined)
+                {
+                    body.commit = commit;
+                }
+                return toRollout(await call("POST", `apps/${encodeURIComponent(app)}/rollouts`, body));
+            },
+            async get(id)
+            {
+                return toRollout(await call("GET", `rollouts/${encodeURIComponent(id)}`));
+            },
+            async apply(id, instance)
+            {
+                const reply = await call("POST", `rollouts/${encodeURIComponent(id)}/instances/${encodeURIComponent(instance)}/apply`);
+                const record = isRecord(reply) ? reply : {};
+                return {
+                    applied: record.applied === true,
+                    commit: typeof record.commit === "string" ? record.commit : null,
+                    conflicts: texts(record.conflicts),
+                };
+            },
+            async resume(id)
+            {
+                return toRollout(await call("POST", `rollouts/${encodeURIComponent(id)}/resume`));
+            },
+            async cancel(id)
+            {
+                return toRollout(await call("POST", `rollouts/${encodeURIComponent(id)}/cancel`));
             },
         },
         production: {
