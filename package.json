@@ -16,6 +16,7 @@
         "typecheck": "npm run typecheck --workspaces --if-present",
         "test:sdk": "cargo build -p orbital-server && npm test -w @harmony/orbital",
         "pr:check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && npm run check && npm run typecheck && npm run test:sdk && npm run test:factory",
-        "test:factory": "cargo build -p orbital-server && npm test -w @harmony/factory-todo"
+        "test:factory": "cargo build -p orbital-server && npm test -w @harmony/factory-todo",
+        "test:frameworks": "ORBITAL_FRAMEWORKS=1 cargo test -p orbital-server --test frameworks -- --nocapture --test-threads=2"
     }
 }

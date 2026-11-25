@@ -1,0 +1,18 @@
+# 빌드의 환경과 캐시를 재는 스캐폴드. 빌드는 받은 환경을 적어 두고 레지스트리에서 의존성 하나를 받는다
+
+[[service]]
+name = "web"
+kind = "server"
+build = "env > build-env.txt && npm config get cache > build-cache.txt && npm ci"
+start = "node server.js"
+path = "/"
+roles = ["member"]
+
+[database]
+schemas = ["tiny"]
+migrations = "db/migrations"
+roles = ["member"]
+
+[secrets]
+generated = ["SESSION_KEY"]
+external = ["BANK_API_KEY"]

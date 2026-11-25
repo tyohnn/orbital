@@ -1,0 +1,9 @@
+{
+    "name": "npm-tiny",
+    "version": "0.0.0",
+    "private": true,
+    "description": "빌드가 레지스트리에서 받는 것을 재는 가장 작은 앱. 의존성 하나(is-number)를 npm ci 로 받는다",
+    "dependencies": {
+        "is-number": "7.0.0"
+    }
+}

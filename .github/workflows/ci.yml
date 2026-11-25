@@ -35,3 +35,28 @@ jobs:
       # 백업의 테스트(orbital-backup · orbital-server 의 backup)는 이 클러스터를 쓰지 않고 테스트마다 자기 클러스터를 initdb 로 세운다.
       # CI(환경 변수 CI)에서는 도구가 없어도 건너뛰지 않고 실패한다
       - run: ORBITAL_PG=postgres://postgres@127.0.0.1:54519/postgres npm run pr:check
+
+  # 실제 프레임워크(Next.js, NestJS + Vite)의 본보기를 레이어에 세운다. 레지스트리에서 npm ci 로 받고 빌드해 느리므로 기본 게이트와 따로 돈다.
+  # 러너는 바로 나가므로 빌드에 건넬 운영자의 환경(프록시 · CA 묶음)이 없다. 테스트의 목록에서 값이 없는 이름은 건너뛴다
+  frameworks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-frameworks-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -sS -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-19
+      - run: sudo PG_DATA=/tmp/orbital-pg scripts/pg-local.sh
+      - run: ORBITAL_PG=postgres://postgres@127.0.0.1:54519/postgres npm run test:frameworks
