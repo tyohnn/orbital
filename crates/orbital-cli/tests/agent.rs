@@ -300,3 +300,43 @@ fn 에이전트가_코드를_받아_고쳐_올리고_프리뷰의_주소를_받�
         .call();
     let _ = fs::remove_dir_all(&scratch);
 }
+
+/// 운영의 레이어는 `https` 로 듣는다. 가짜 서버가 받은 첫 바이트가 TLS 의 인사(handshake, `0x16`)인지만 본다.
+#[test]
+fn https_주소의_레이어에는_tls_로_말을_건다() {
+    use std::io::Read as _;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let first_byte = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut byte = [0_u8; 1];
+                    return stream.read_exact(&mut byte).ok().map(|()| byte[0]);
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return None,
+            }
+        }
+    });
+    let agent = Agent {
+        url: format!("https://127.0.0.1:{port}"),
+        instance: "i0000000000".to_owned(),
+        token: "orb1.none".to_owned(),
+    };
+    // 가짜 서버는 인사에 답하지 않으니 명령은 실패한다. 닿으려 했는지만 본다
+    let said = agent.fails(&std::env::temp_dir(), &["preview"]);
+    assert!(said.contains("닿지 못했습니다"), "{said}");
+    assert_eq!(first_byte.join().unwrap(), Some(0x16));
+}
