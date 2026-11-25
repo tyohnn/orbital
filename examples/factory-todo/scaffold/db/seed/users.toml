@@ -1,0 +1,11 @@
+# 미리보기에만 들어가는 씨앗 사용자다. 운영에는 들어가지 않는다. 씨앗 카드의 owner 와 식별자가 같다
+
+[[user]]
+id = "u1"
+email = "u1@example.test"
+roles = ["member"]
+
+[[user]]
+id = "u2"
+email = "u2@example.test"
+roles = ["member"]

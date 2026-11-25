@@ -25,7 +25,7 @@ description: "사용자의 할 일 앱을 고쳐 달라는 요청을 받았을 �
 5. **올리기.** `orbital push`. 레이어의 이력을 잇지 않으면 거절되니 `orbital pull` 로 합친 뒤 다시 올립니다.
 6. **미리보기.** `orbital preview`. 레이어가 그 commit 에서 직접 빌드하고, 씨앗 데이터의 DB 로 서버를 띄워 주소를 돌려줍니다.
    답의 `release` 를 적어 둡니다. 「권한 검사에서 어긋난 것」이나 「승격을 막는 것」이 있으면 고쳐서 4번부터 다시 합니다.
-   씨앗 데이터의 사람으로 요청해 보려면 `orbital identity <사람>` 으로 신원을 받아 `x-orbital-identity` 머리에 싣습니다.
+   씨앗 사용자(`db/seed/users.toml`)로 요청해 보려면 `orbital identity <사용자>` 로 받은 값을 `Cookie` 머리에 그대로 싣습니다.
    「예행연습을 아직 돌리지 않았습니다」가 나오면 `orbital rehearse <release>` 를 돌립니다. 운영 DB 의 사본에 마이그레이션을 돌려 보고 숫자만 돌려줍니다.
 7. **승격 요청.** `orbital request-promotion <release>`.
 8. **카드 보이기.** `promotion_show` 도구를 부릅니다. 사용자에게 승인 카드(올릴 release, 권한이 바뀌는 문장, 실행될 마이그레이션)가 섭니다.

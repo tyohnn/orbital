@@ -448,15 +448,15 @@ test("토큰에는 source · preview · rehearse 만 실리고 두 시간 뒤 �
 
     // 코드는 받는다
     await agent(scratch, opened, "clone", "alice-probe");
-    // 운영을 바꾸는 길은 두드려도 열리지 않는다
-    for (const tail of ["promotions", "production/identities"])
+    // 운영을 바꾸는 길과 사용자를 초대하는 길은 두드려도 열리지 않는다. 신원을 받아 가는 길은 아예 없다
+    for (const [tail, status] of [["promotions", 403], ["users", 404], ["production/identities", 404]] as const)
     {
         const tried = await fetch(`${opened.url}/v1/instances/${opened.instance}/${tail}`, {
             method: "POST",
             headers: { authorization: `Bearer ${opened.token}`, "content-type": "application/json" },
-            body: JSON.stringify({ release: "r", change: "customer_request", approved_by: "customer", subject: "u1" }),
+            body: JSON.stringify({ release: "r", change: "customer_request", approved_by: "customer", subject: "u1", email: "u1@example.test" }),
         });
-        assert.equal(tried.status, 403, tail);
+        assert.equal(tried.status, status, tail);
     }
     assert.equal(await orbital.production.get(opened.instance), null);
     workspaces.set("alice", opened);

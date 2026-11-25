@@ -216,10 +216,10 @@ fn 에이전트가_코드를_받아_고쳐_올리고_미리보기의_주소를_�
         .unwrap();
     assert_eq!(health["version"], 2);
 
-    // 씨앗 데이터의 사람으로 요청해 본다
-    let identity = agent.ok(&work, &["identity", "u1"]);
+    // 씨앗 사용자로 들어가 요청해 본다. 받은 값을 Cookie 머리말에 그대로 붙인다
+    let cookie = agent.ok(&work, &["identity", "u1"]);
     let cards: Value = ureq::get(&format!("{address}/cards"))
-        .set("x-orbital-identity", identity.trim())
+        .set("Cookie", cookie.trim())
         .call()
         .unwrap()
         .into_json()

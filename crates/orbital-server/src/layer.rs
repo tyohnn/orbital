@@ -8,13 +8,13 @@ use std::fs;
 use std::io::Read as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orbital_core::access::Access;
 use orbital_core::check::judge as judge_access;
 use orbital_core::describe::changes;
-use orbital_core::manifest::ServiceKind;
+use orbital_core::manifest::{ServiceKind, ValidManifest};
 use orbital_core::name::{Ident, InstanceId};
 use orbital_core::plan::Names;
 use orbital_core::release::{
@@ -25,9 +25,13 @@ use orbital_core::scope::{
     Action, Capability, DenyReason, OrganizationId, Request, Token, Verdict, judge,
 };
 use orbital_pg::Admin;
-use orbital_pg::identity::{Claims, sign as sign_identity};
+use orbital_pg::auth::AuthStore;
 use orbital_pg::rehearsal::RestorePoint;
 use orbital_proxy::{Route, serve};
+use orbital_router::{
+    Config as RouterConfig, Connect, Mailer, Outbox, SESSION_COOKIE, Stage as RouterStage,
+    Target as RouterTarget, serve as serve_router,
+};
 use orbital_run::{Job, Runner, Running, free_port, wait_for_port};
 use orbital_source::assemble::{AssembleError, Assembled, assemble};
 use orbital_source::{Commit, Error as SourceError, SourceStore, receive_scaffold};
@@ -112,9 +116,33 @@ enum Stage {
 struct LiveService {
     name: String,
     kind: ServiceKind,
-    port: Option<u16>,
+    /// 밖에 알리는 주소. router 의 주소 + 서비스의 `path` 다.
+    url: String,
     process: Option<Box<dyn Running>>,
     proxy: Option<JoinHandle<std::io::Result<()>>>,
+}
+
+/// 떠 있는 router. 내리면 듣기를 멈추고 붙어 있던 연결도 함께 내린다.
+struct RouterTask(JoinHandle<std::io::Result<()>>);
+
+impl Drop for RouterTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// 띄운 서비스들과 그 앞의 router.
+struct Launched {
+    services: Vec<LiveService>,
+    router: RouterTask,
+}
+
+/// 띄울 자리. 미리보기와 운영이 이름 · 비밀 · 서명의 열쇠를 따로 갖는다.
+struct Stand<'a> {
+    names: &'a Names,
+    generated: &'a BTreeMap<String, String>,
+    identity_key: &'a [u8],
+    stage: Stage,
 }
 
 impl Drop for LiveService {
@@ -128,12 +156,15 @@ impl Drop for LiveService {
     }
 }
 
-/// 떠 있는 것 하나(미리보기이거나 운영).
+/// 떠 있는 것 하나(미리보기이거나 운영). 서비스가 먼저 내려가고 router 가 뒤에 내려간다.
 struct Live {
     release: String,
     names: Names,
-    identity_key: Vec<u8>,
+    manifest: ValidManifest,
+    /// 미리보기의 씨앗 사용자. 운영에는 없다.
+    seed_users: Vec<String>,
     services: Vec<LiveService>,
+    _router: RouterTask,
 }
 
 /// 운영에 올리려는 release 하나와 그것이 설 자리.
@@ -143,6 +174,7 @@ struct Target<'a> {
     folder: &'a Path,
     names: &'a Names,
     generated: &'a BTreeMap<String, String>,
+    identity_key: &'a [u8],
 }
 
 /// 승격이 깨지기 앞의 운영.
@@ -153,7 +185,7 @@ struct Prior<'a> {
 }
 
 /// 띄운 서비스와, 돌린 마이그레이션의 이름.
-type Raised = (Vec<LiveService>, Vec<String>);
+type Raised = (Launched, Vec<String>);
 /// 깨진 까닭과, 마이그레이션이 돌았는지.
 type Fallen = (Failure, bool);
 
@@ -167,7 +199,7 @@ struct Inner {
 pub struct ServiceReport {
     pub name: String,
     pub kind: ServiceKind,
-    /// 서버 서비스가 요청을 받는 주소.
+    /// 서비스에 닿는 주소. 인스턴스의 router 의 주소 + 서비스의 `path` 다. 서비스의 직접 포트는 알리지 않는다.
     pub url: Option<String>,
 }
 
@@ -226,6 +258,10 @@ pub struct Options {
 
 pub struct Layer {
     home: PathBuf,
+    /// DB 의 관리 주소. router 가 인증 역할로 붙을 때 사용자와 database 만 바꿔 쓴다.
+    pg_url: String,
+    /// 로그인 링크를 보내는 것. 실제 발송기가 붙기 전까지는 `ORBITAL_HOME/outbox.jsonl` 에 쌓는다.
+    mailer: Arc<dyn Mailer>,
     upstream: String,
     sources: SourceStore,
     runner: Box<dyn Runner>,
@@ -234,6 +270,9 @@ pub struct Layer {
     service_keys: Vec<([u8; 32], String)>,
     inner: Mutex<Inner>,
 }
+
+/// 개발용 메일함의 파일. `ORBITAL_HOME` 아래에 둔다.
+pub const OUTBOX: &str = "outbox.jsonl";
 
 fn digest(text: &str) -> [u8; 32] {
     Sha256::digest(text.as_bytes()).into()
@@ -287,6 +326,8 @@ impl Layer {
 
         Ok(Self {
             sources: SourceStore::new(options.home.join("sources")),
+            mailer: Arc::new(Outbox::new(options.home.join(OUTBOX))),
+            pg_url: options.pg_url,
             upstream,
             runner: options.runner,
             runtime: Runtime::new()
@@ -530,16 +571,26 @@ impl Layer {
     }
 
     /// 빌드한 것을 띄운다. 서버 서비스마다 proxy 를 하나 세우고, 앱에는 그 주소와 레이어가 만든 비밀만 건넨다.
+    /// 서비스들 앞에 router 를 세운다. 밖에서는 router 의 주소로만 닿는다.
     fn launch(
         &self,
         instance: &InstanceId,
         assembled: &Assembled,
         folder: &Path,
-        names: &Names,
-        generated: &BTreeMap<String, String>,
-        stage: Stage,
-    ) -> Outcome<Vec<LiveService>> {
+        stand: &Stand<'_>,
+    ) -> Outcome<Launched> {
+        let (names, generated, stage) = (stand.names, stand.generated, stand.stage);
+        let listener = self
+            .runtime
+            .block_on(TcpListener::bind("127.0.0.1:0"))
+            .map_err(internal)?;
+        let origin = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().map_err(internal)?.port()
+        );
+        let url = |path: &str| format!("{origin}{}", path.trim_end_matches('/'));
         let mut services = Vec::new();
+        let mut targets = BTreeMap::new();
         for service in &assembled.manifest.get().services {
             if service.kind == ServiceKind::Static {
                 let output = folder.join(service.output.as_deref().unwrap_or_default());
@@ -549,10 +600,14 @@ impl Layer {
                         log: "빌드 결과의 폴더(`output`)가 없습니다. 빌드 명령이 그 폴더를 만드는지 확인해 주세요".to_owned(),
                     });
                 }
+                targets.insert(
+                    service.name.to_string(),
+                    RouterTarget::Static { folder: output },
+                );
                 services.push(LiveService {
                     name: service.name.to_string(),
                     kind: service.kind,
-                    port: None,
+                    url: url(&service.path),
                     process: None,
                     proxy: None,
                 });
@@ -620,7 +675,7 @@ impl Layer {
             let mut live = LiveService {
                 name: service.name.to_string(),
                 kind: service.kind,
-                port: Some(port),
+                url: url(&service.path),
                 process: None,
                 proxy,
             };
@@ -647,9 +702,57 @@ impl Layer {
             if !up {
                 return Err(failed(&log));
             }
+            targets.insert(service.name.to_string(), RouterTarget::Server { port });
             services.push(live);
         }
-        Ok(services)
+
+        let label = if stage == Stage::Preview {
+            "preview"
+        } else {
+            "production"
+        };
+        let log = self.log(instance, &assembled.release, &format!("{label}-router"));
+        if let Some(parent) = log.parent() {
+            fs::create_dir_all(parent).map_err(|_| internal("기록의 폴더를 만들지 못했습니다"))?;
+        }
+        let auth: Option<Connect> = assembled.manifest.get().auth.as_ref().map(|_| {
+            let (url, names, manifest) = (
+                self.pg_url.clone(),
+                names.clone(),
+                assembled.manifest.clone(),
+            );
+            Arc::new(move || AuthStore::connect(&url, &names, &manifest)) as Connect
+        });
+        let config = RouterConfig {
+            origin,
+            manifest: assembled.manifest.clone(),
+            names: names.clone(),
+            identity_key: stand.identity_key.to_vec(),
+            targets,
+            auth,
+            mailer: Arc::clone(&self.mailer),
+            stage: match stage {
+                Stage::Preview => RouterStage::Preview,
+                Stage::Production => RouterStage::Production,
+            },
+            seed_users: Self::seed_ids(assembled, stage),
+            log: Some(log),
+        };
+        let router = RouterTask(self.runtime.spawn(serve_router(listener, config)));
+        Ok(Launched { services, router })
+    }
+
+    /// 씨앗 사용자의 식별자. 미리보기에만 있다.
+    fn seed_ids(assembled: &Assembled, stage: Stage) -> Vec<String> {
+        if stage == Stage::Preview {
+            assembled
+                .seed_users
+                .iter()
+                .map(|user| user.id.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     fn secrets(assembled: &Assembled) -> Outcome<BTreeMap<String, String>> {
@@ -666,7 +769,7 @@ impl Layer {
             .map(|service| ServiceReport {
                 name: service.name.clone(),
                 kind: service.kind,
-                url: service.port.map(|port| format!("http://127.0.0.1:{port}")),
+                url: Some(service.url.clone()),
             })
             .collect()
     }
@@ -722,15 +825,15 @@ impl Layer {
                 return Err(failure);
             }
         };
-        let services = match self.launch(
-            instance,
-            &assembled,
-            &folder,
-            &names,
-            &Self::secrets(&assembled)?,
-            Stage::Preview,
-        ) {
-            Ok(services) => services,
+        let generated = Self::secrets(&assembled)?;
+        let stand = Stand {
+            names: &names,
+            generated: &generated,
+            identity_key: &identity_key,
+            stage: Stage::Preview,
+        };
+        let launched = match self.launch(instance, &assembled, &folder, &stand) {
+            Ok(launched) => launched,
             Err(failure) => {
                 let _ = inner.admin.destroy(&names);
                 return Err(failure);
@@ -761,7 +864,7 @@ impl Layer {
         let report = PreviewReport {
             release: assembled.release.0.clone(),
             commit: commit.to_string(),
-            services: Self::report(&services),
+            services: Self::report(&launched.services),
             findings: findings.iter().map(ToString::to_string).collect(),
             changes: changes(&before, &assembled.access)
                 .into_iter()
@@ -798,8 +901,10 @@ impl Layer {
             Live {
                 release: assembled.release.0.clone(),
                 names,
-                identity_key,
-                services,
+                seed_users: Self::seed_ids(&assembled, Stage::Preview),
+                manifest: assembled.manifest.clone(),
+                services: launched.services,
+                _router: launched.router,
             },
         );
         Ok(report)
@@ -818,6 +923,10 @@ impl Layer {
         admin
             .install_identity(names, identity_key)
             .map_err(internal)?;
+        // 앱의 마이그레이션이 사용자를 외래 키로 가리킬 수 있게 마이그레이션 앞에 둔다
+        admin
+            .install_auth(names, &assembled.manifest)
+            .map_err(internal)?;
         let scripts: Vec<(&str, &str)> = assembled
             .migrations
             .iter()
@@ -828,6 +937,12 @@ impl Layer {
                 "빈 DB 에 마이그레이션을 돌리다가 실패했습니다. {error}"
             ))
         })?;
+        // 씨앗 데이터의 SQL 이 씨앗 사용자를 가리킬 수 있게 그 앞에 넣는다. 미리보기에만 들어간다
+        admin
+            .seed_users(names, &assembled.seed_users, now())
+            .map_err(|error| {
+                Failure::MigrationFailed(format!("씨앗 사용자를 넣다가 실패했습니다. {error}"))
+            })?;
         let seed: Vec<&str> = assembled
             .seed
             .iter()
@@ -848,25 +963,36 @@ impl Layer {
         ))
     }
 
-    /// 미리보기에서 씨앗 데이터의 사람으로 요청해 볼 수 있게 신원에 서명해 준다. 미리보기의 열쇠라 운영에서는 읽히지 않는다.
-    pub fn preview_identity(&self, instance: &InstanceId, subject: &str) -> Outcome<String> {
-        let inner = self.lock();
-        let live = inner
-            .live
-            .get(&(instance.as_str().to_owned(), Stage::Preview))
-            .ok_or_else(|| {
-                Failure::Conflict(
-                    "떠 있는 미리보기가 없습니다. `orbital preview` 로 먼저 세워 주세요".to_owned(),
-                )
-            })?;
-        Ok(sign_identity(
-            &live.identity_key,
-            &live.names,
-            &Claims {
-                subject: subject.to_owned(),
-                expires_at: now() + 3600,
-            },
-        ))
+    /// 미리보기에서 씨앗 사용자로 요청해 볼 수 있게 그 사용자의 세션을 만들고, 요청에 그대로 붙일 `Cookie` 머리말의 값을 돌려준다.
+    ///
+    /// 미리보기의 DB 에만 있는 세션이라 운영에서는 읽히지 않는다. 씨앗 사용자(`db/seed/users.toml`)만 된다.
+    pub fn preview_session(&self, instance: &InstanceId, user: &str) -> Outcome<String> {
+        let (names, manifest) = {
+            let inner = self.lock();
+            let live = inner
+                .live
+                .get(&(instance.as_str().to_owned(), Stage::Preview))
+                .ok_or_else(|| {
+                    Failure::Conflict(
+                        "떠 있는 미리보기가 없습니다. `orbital preview` 로 먼저 세워 주세요"
+                            .to_owned(),
+                    )
+                })?;
+            if live.manifest.get().auth.is_none() {
+                return Err(Failure::Problems(vec![
+                    "이 앱은 로그인을 레이어에 맡기지 않아 사용자가 없습니다. `orbital.toml` 에 `[auth]` 를 적어 주세요".to_owned(),
+                ]));
+            }
+            if !live.seed_users.iter().any(|seed| seed == user) {
+                return Err(Failure::Problems(vec![format!(
+                    "씨앗 사용자 `{user}` 가 없습니다. `db/seed/users.toml` 에 적힌 식별자로 들어가 주세요"
+                )]));
+            }
+            (live.names.clone(), live.manifest.clone())
+        };
+        let mut store = AuthStore::connect(&self.pg_url, &names, &manifest).map_err(internal)?;
+        let (session, _) = store.start_session(user, now()).map_err(internal)?;
+        Ok(format!("{SESSION_COOKIE}={}", session.to_text()))
     }
 
     /// 미리보기를 걷는다.
@@ -1075,9 +1201,10 @@ impl Layer {
             folder: &folder,
             names: &names,
             generated: &generated,
+            identity_key: &identity_key,
         };
         let outcome = self.promote_onto(&mut inner, &target, &scripts);
-        let (services, ran) = match outcome {
+        let (launched, ran) = match outcome {
             Ok(done) => done,
             Err((failure, migrated)) => {
                 // 새 release 가 서지 못했다. 어디로 돌아갈지는 core 가 정한다
@@ -1105,7 +1232,7 @@ impl Layer {
         }
         let report = PromotionReport {
             release: release.to_owned(),
-            services: Self::report(&services),
+            services: Self::report(&launched.services),
             migrations: ran,
         };
         let stored = inner
@@ -1131,8 +1258,10 @@ impl Layer {
             Live {
                 release: release.to_owned(),
                 names,
-                identity_key,
-                services,
+                manifest: assembled.manifest.clone(),
+                seed_users: Vec::new(),
+                services: launched.services,
+                _router: launched.router,
             },
         );
         Ok(report)
@@ -1146,6 +1275,11 @@ impl Layer {
         scripts: &[(&str, &str)],
     ) -> Result<Raised, Fallen> {
         let (names, assembled) = (target.names, target.assembled);
+        // 앱의 마이그레이션이 사용자를 외래 키로 가리킬 수 있게 마이그레이션 앞에 둔다. 다시 불러도 되고, 뷰의 권한을 선언에 맞춘다
+        inner
+            .admin
+            .install_auth(names, &assembled.manifest)
+            .map_err(|error| (internal(error), false))?;
         let ran = inner.admin.migrate_named(names, scripts).map_err(|error| {
             (
                 Failure::MigrationFailed(format!(
@@ -1174,17 +1308,16 @@ impl Layer {
                 migrated,
             ));
         }
-        let services = self
-            .launch(
-                target.instance,
-                assembled,
-                target.folder,
-                names,
-                target.generated,
-                Stage::Production,
-            )
+        let stand = Stand {
+            names,
+            generated: target.generated,
+            identity_key: target.identity_key,
+            stage: Stage::Production,
+        };
+        let launched = self
+            .launch(target.instance, assembled, target.folder, &stand)
             .map_err(|failure| (failure, migrated))?;
-        Ok((services, ran))
+        Ok((launched, ran))
     }
 
     /// 승격이 깨졌을 때 앞의 모습으로 돌린다. 데이터를 잃는 되돌리기는 기계가 정하지 않는다.
@@ -1247,22 +1380,23 @@ impl Layer {
         let _ = inner
             .admin
             .grant(prior.names, &assembled.manifest, &assembled.access);
-        if let Ok(services) = self.launch(
-            prior.instance,
-            &assembled,
-            &folder,
-            prior.names,
-            &production.generated,
-            Stage::Production,
-        ) {
-            let identity_key = token::unhex(&production.identity_key).unwrap_or_default();
+        let identity_key = token::unhex(&production.identity_key).unwrap_or_default();
+        let stand = Stand {
+            names: prior.names,
+            generated: &production.generated,
+            identity_key: &identity_key,
+            stage: Stage::Production,
+        };
+        if let Ok(launched) = self.launch(prior.instance, &assembled, &folder, &stand) {
             inner.live.insert(
                 (prior.instance.as_str().to_owned(), Stage::Production),
                 Live {
                     release: production.release.clone(),
                     names: prior.names.clone(),
-                    identity_key,
-                    services,
+                    manifest: assembled.manifest.clone(),
+                    seed_users: Vec::new(),
+                    services: launched.services,
+                    _router: launched.router,
                 },
             );
         }
@@ -1327,27 +1461,53 @@ impl Layer {
             }))
     }
 
-    /// 운영에서 로그인한 사람의 신원에 서명한다. 로그인을 확인한 router 가 부를 자리이고, 지금은 팩토리의 서버가 부른다.
-    pub fn production_identity(
+    /// 운영의 사용자 저장소(인증 역할로 붙은 연결). 운영이 서 있고 `[auth]` 를 선언했을 때만 있다.
+    pub fn production_auth(&self, organization: &str, instance: &InstanceId) -> Outcome<AuthStore> {
+        let (names, manifest) = {
+            let mut inner = self.lock();
+            Self::owned(&mut inner, organization, instance)?;
+            let live = inner
+                .live
+                .get(&(instance.as_str().to_owned(), Stage::Production))
+                .ok_or_else(|| {
+                    Failure::Conflict(
+                        "운영에 오른 것이 없습니다. 운영에 먼저 올린 뒤에 사용자를 초대해 주세요"
+                            .to_owned(),
+                    )
+                })?;
+            if live.manifest.get().auth.is_none() {
+                return Err(Failure::Problems(vec![
+                    "이 앱은 로그인을 레이어에 맡기지 않아 사용자가 없습니다. `orbital.toml` 에 `[auth]` 를 적어 주세요".to_owned(),
+                ]));
+            }
+            (live.names.clone(), live.manifest.clone())
+        };
+        AuthStore::connect(&self.pg_url, &names, &manifest).map_err(internal)
+    }
+
+    /// 운영에 사용자를 초대한다. 팩토리의 서버(service key)만 부른다. 선언에 없는 업무 역할이면 고칠 것으로 돌려준다.
+    pub fn invite(
         &self,
         organization: &str,
         instance: &InstanceId,
-        subject: &str,
-    ) -> Outcome<String> {
-        let mut inner = self.lock();
-        Self::owned(&mut inner, organization, instance)?;
-        let live = inner
-            .live
-            .get(&(instance.as_str().to_owned(), Stage::Production))
-            .ok_or(Failure::NotFound)?;
-        Ok(sign_identity(
-            &live.identity_key,
-            &live.names,
-            &Claims {
-                subject: subject.to_owned(),
-                expires_at: now() + 3600,
-            },
-        ))
+        email: &str,
+        roles: &[String],
+    ) -> Outcome<()> {
+        let mut parsed = Vec::new();
+        for role in roles {
+            parsed.push(Ident::parse(role).map_err(|error| {
+                Failure::Problems(vec![format!("업무 역할 `{role}`: {error}")])
+            })?);
+        }
+        let mut store = self.production_auth(organization, instance)?;
+        store
+            .invite(email, &parsed, now())
+            .map_err(|error| match error {
+                orbital_pg::auth::AuthError::UndeclaredRoles { .. } => {
+                    Failure::Problems(vec![error.to_string()])
+                }
+                other => internal(other),
+            })
     }
 
     /// 인스턴스를 걷는다. 떠 있는 것을 내리고 DB 와 코드 저장소를 지운다. 되돌릴 수 없다.

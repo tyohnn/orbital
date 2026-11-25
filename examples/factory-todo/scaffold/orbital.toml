@@ -16,3 +16,8 @@ seed = "db/seed"
 
 [secrets]
 generated = ["SESSION_KEY"]
+
+# 로그인은 레이어가 맡는다. 서비스는 로그인 없이도 열리고(auth 의 기본은 optional), 로그인했으면 router 가 신원을 싣는다
+[auth]
+methods = ["email_link"]
+login_path = "/login"

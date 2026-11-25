@@ -89,6 +89,13 @@ http.createServer(async (request, response) => {
     };
     try {
         if (request.url === "/health") return send(200, { ok: true, version: 1 });
+        // 로그인 화면. 화면만 그리고, 링크를 보내고 받는 일은 레이어(/_orbital/auth/…)가 한다
+        if (request.url.split("?")[0] === "/login") {
+            response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+            return response.end("<!doctype html><title>로그인</title><form id=login><input name=email type=email><button>링크 받기</button></form>");
+        }
+        // 앱에 닿은 머리말을 그대로 돌려준다. router 가 무엇을 지우고 붙였는지 테스트가 본다
+        if (request.url === "/echo") return send(200, { headers: request.headers });
         if (request.url === "/env") return send(200, { names: Object.keys(process.env).sort() });
         if (request.url === "/cards" && request.method === "GET") {
             const sets = await query("member", withIdentity(request, "SELECT to_jsonb(c) - 'owner' FROM todo.card c ORDER BY id"));

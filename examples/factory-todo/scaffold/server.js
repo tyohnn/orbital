@@ -89,6 +89,11 @@ http.createServer(async (request, response) => {
     };
     try {
         if (request.url === "/health") return send(200, { ok: true, version: 1 });
+        // 로그인 화면. 화면만 그리고, 링크를 보내고 받는 일은 레이어(/_orbital/auth/…)가 한다
+        if (request.url.split("?")[0] === "/login") {
+            response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+            return response.end("<!doctype html><title>로그인</title><form id=login><input name=email type=email><button>링크 받기</button></form>");
+        }
         if (request.url === "/cards" && request.method === "GET") {
             const sets = await query("member", withIdentity(request, "SELECT to_jsonb(c) - 'owner' FROM todo.card c ORDER BY id"));
             return send(200, sets[1].map((row) => JSON.parse(row[0])));

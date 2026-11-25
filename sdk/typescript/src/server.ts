@@ -105,8 +105,13 @@ export interface Orbital
     production: {
         /** 운영에 올라 있는 것. 아직 오른 것이 없으면 `null` 이다. */
         get(instance: string): Promise<Production | null>;
-        /** 로그인을 확인한 사람의 신원에 서명한다. 앱에 보내는 요청의 `x-orbital-identity` 에 싣는다. */
-        identity(input: { instance: string; subject: string }): Promise<string>;
+    };
+    users: {
+        /**
+         * 운영에 사용자를 초대한다. 초대받은 사람은 앱의 로그인 화면에서 이메일 링크를 받아 들어온다.
+         * `roles` 는 선언의 업무 역할이다. 신원은 router 가 로그인을 확인해 앱에 싣고, 레이어 밖으로는 내주지 않는다.
+         */
+        invite(input: { instance: string; email: string; roles: readonly string[] }): Promise<void>;
     };
 }
 
@@ -244,10 +249,11 @@ export function createOrbital(options: OrbitalOptions): Orbital
                 const reply = await call("GET", at(instance, "/production"));
                 return isRecord(reply) ? toProduction(reply) : null;
             },
-            async identity({ instance, subject })
+        },
+        users: {
+            async invite({ instance, email, roles })
             {
-                const reply = await call("POST", at(instance, "/production/identities"), { subject });
-                return text(isRecord(reply) ? reply.identity : undefined);
+                await call("POST", at(instance, "/users"), { email, roles: [...roles] });
             },
         },
     };
