@@ -344,10 +344,12 @@ fn action() -> impl Strategy<Value = Action> {
         Just(Action::RequestPromotion),
         Just(Action::Rehearse),
         Just(Action::SecretsRequest),
+        Just(Action::SecretsList),
         Just(Action::Promote),
         Just(Action::ProductionLogs),
         Just(Action::ProductionDatabase),
         Just(Action::SecretsRead),
+        Just(Action::SecretsWrite),
     ]
 }
 
@@ -390,7 +392,11 @@ fn request() -> impl Strategy<Value = Request> {
 fn touches_production(action: Action) -> bool {
     matches!(
         action,
-        Action::Promote | Action::ProductionLogs | Action::ProductionDatabase | Action::SecretsRead
+        Action::Promote
+            | Action::ProductionLogs
+            | Action::ProductionDatabase
+            | Action::SecretsRead
+            | Action::SecretsWrite
     )
 }
 
@@ -422,6 +428,62 @@ proptest! {
         wider.can.insert(extra);
         if judge(&token, &request) == Verdict::Allow {
             prop_assert_eq!(judge(&wider, &request), Verdict::Allow);
+        }
+    }
+}
+
+/// 비밀의 값에 닿는 일. 구현의 `Action::needs` 와 따로 적는다.
+fn touches_secret_values(action: Action) -> bool {
+    matches!(action, Action::SecretsRead | Action::SecretsWrite)
+}
+
+/// 토큰에 적어 보낼 능력의 이름. 값을 읽거나 넣는 능력의 이름을 섞는다.
+fn capability_word() -> impl Strategy<Value = &'static str> {
+    prop_oneof![
+        Just("source"),
+        Just("preview"),
+        Just("rehearse"),
+        Just("secrets_request"),
+        Just("secrets_read"),
+        Just("secrets_write"),
+        Just("secrets"),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn 어떤_토큰으로도_값을_읽거나_넣는_능력을_얻지_못한다(
+        token in token(),
+        request in request(),
+        words in proptest::collection::vec(capability_word(), 0..5),
+    ) {
+        // 받은 토큰이 무엇을 할 수 있든 값을 읽거나 넣는 일은 허락되지 않는다
+        if touches_secret_values(request.action) {
+            prop_assert_ne!(judge(&token, &request), Verdict::Allow);
+        }
+        // 값에 닿는 능력의 이름을 적어 보낸 토큰은 읽히지 않는다
+        let text = serde_json::json!({
+            "organization": "org_a",
+            "instance": "k3f9x2ab",
+            "can": words,
+            "expires_at": 5,
+        })
+        .to_string();
+        let reaches_values = words
+            .iter()
+            .any(|word| matches!(*word, "secrets_read" | "secrets_write" | "secrets"));
+        let parsed = serde_json::from_str::<Token>(&text);
+        prop_assert_eq!(parsed.is_ok(), !reaches_values);
+        if let Ok(parsed) = parsed {
+            for action in [Action::SecretsRead, Action::SecretsWrite] {
+                let request = Request {
+                    organization: parsed.organization.clone(),
+                    instance: parsed.instance.clone(),
+                    action,
+                    at: 0,
+                };
+                prop_assert_eq!(judge(&parsed, &request), Verdict::Deny(DenyReason::ServiceKeyOnly));
+            }
         }
     }
 }
@@ -603,6 +665,7 @@ mod release {
                 access_findings,
                 rehearsal,
                 missing_keys: Vec::new(),
+                missing_secrets: Vec::new(),
             })
     }
 
@@ -645,6 +708,81 @@ mod release {
                 approval.release == release.id && (approval.by == Approver::Customer) == needs_customer
             });
             prop_assert_eq!(promote(&release, change, approval.as_ref()).is_ok(), checks_pass && approved);
+        }
+    }
+}
+
+// ---- 밖에서 넣는 비밀 ----
+
+mod secrets {
+    use std::collections::BTreeSet;
+
+    use orbital_core::manifest::{Manifest, Secrets, Service, ServiceAuth, ServiceKind};
+    use orbital_core::name::{Ident, SecretName};
+    use orbital_core::release::{
+        Approval, Approver, Blocker, BuiltBy, Change, Rehearsed, Release, ReleaseId, blockers,
+        promote,
+    };
+    use orbital_core::secrets::missing_secrets;
+    use proptest::prelude::*;
+
+    const NAMES: [&str; 3] = ["BANK_API_KEY", "MAP_KEY", "MAIL_TOKEN"];
+
+    proptest! {
+        #[test]
+        fn 넣지_않은_비밀이_하나라도_있으면_승격하지_못한다(
+            declared in proptest::array::uniform3(any::<bool>()),
+            filled in proptest::array::uniform3(any::<bool>()),
+        ) {
+            let pick = |mask: &[bool; 3]| -> Vec<SecretName> {
+                NAMES
+                    .iter()
+                    .zip(mask)
+                    .filter(|(_, on)| **on)
+                    .map(|(name, _)| SecretName::parse(name).unwrap())
+                    .collect()
+            };
+            let manifest = Manifest {
+                services: vec![Service {
+                    name: Ident::parse("web").unwrap(),
+                    kind: ServiceKind::Server,
+                    build: "true".to_owned(),
+                    start: Some("true".to_owned()),
+                    output: None,
+                    path: "/".to_owned(),
+                    roles: Vec::new(),
+                    auth: ServiceAuth::Optional,
+                }],
+                secrets: Secrets {
+                    generated: Vec::new(),
+                    external: pick(&declared),
+                },
+                ..Manifest::default()
+            }
+            .check()
+            .unwrap();
+            let filled: BTreeSet<SecretName> = pick(&filled).into_iter().collect();
+            let release = Release {
+                id: ReleaseId("r1".to_owned()),
+                built_by: BuiltBy::Layer,
+                access_findings: 0,
+                rehearsal: Rehearsed::Passed,
+                missing_keys: Vec::new(),
+                missing_secrets: missing_secrets(&manifest, &filled),
+            };
+            // 구현을 부르지 않고 마스크에서 바로 기대값을 찾는다
+            let expected: Vec<Blocker> = NAMES
+                .iter()
+                .enumerate()
+                .filter(|(at, name)| declared[*at] && !filled.contains(&SecretName::parse(name).unwrap()))
+                .map(|(_, name)| Blocker::SecretMissing { secret: SecretName::parse(name).unwrap() })
+                .collect();
+            prop_assert_eq!(blockers(&release), expected.clone());
+            let approval = Approval { release: ReleaseId("r1".to_owned()), by: Approver::Customer };
+            prop_assert_eq!(
+                promote(&release, Change::CustomerRequest, Some(&approval)).is_ok(),
+                expected.is_empty()
+            );
         }
     }
 }

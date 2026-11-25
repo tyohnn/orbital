@@ -19,7 +19,7 @@ use orbital_core::describe::changes;
 use orbital_core::google::{IdTokenRefusal, callback_url, judge_id_token, judge_state};
 use orbital_core::host::{BaseDomain, HostTarget, Scheme, origin as host_origin};
 use orbital_core::manifest::{ServiceKind, ValidManifest};
-use orbital_core::name::{Ident, InstanceId};
+use orbital_core::name::{Ident, InstanceId, SecretName};
 use orbital_core::oauth::registrable_redirect;
 use orbital_core::plan::Names;
 use orbital_core::release::{
@@ -484,7 +484,16 @@ fn blocker_text(blocker: &orbital_core::release::Blocker) -> String {
         }
         Blocker::RehearsalFailed => "마이그레이션의 예행연습이 실패했습니다".to_owned(),
         Blocker::KeyMissing { key } => key_text(*key),
+        Blocker::SecretMissing { secret } => secret_text(secret),
     }
+}
+
+/// 밖에서 넣는 비밀의 운영 값이 없어 막힌 까닭. 에이전트가 고칠 수 없는 일임을 밝힌다.
+pub fn secret_text(secret: &SecretName) -> String {
+    format!(
+        "비밀 `{secret}` 의 운영 값이 없습니다. 에이전트가 고칠 수 없는 일입니다. 에이전트는 값을 묻거나 코드에 적지 말고 사람에게 입력을 요청하고(`POST /v1/instances/{{id}}/secrets/{secret}/request`), 사람이 입력 카드에서 운영의 값을 넣어야 운영에 오릅니다",
+        secret = secret.as_str()
+    )
 }
 
 /// 팩토리의 키가 없어 막힌 까닭. 에이전트가 고칠 수 없는 일임을 밝힌다.
@@ -1277,6 +1286,7 @@ impl Layer {
                 access_findings: findings.len(),
                 rehearsal,
                 missing_keys: self.missing_keys(&record.organization, &assembled.manifest),
+                missing_secrets: Vec::new(),
             })
             .iter()
             .map(blocker_text)
@@ -1541,6 +1551,7 @@ impl Layer {
             access_findings,
             rehearsal,
             missing_keys: self.missing_keys(&organization, &manifest),
+            missing_secrets: Vec::new(),
         });
         if !found.is_empty() {
             return Err(Failure::Denied(PromoteDenied::Blocked { blockers: found }));
@@ -1581,6 +1592,7 @@ impl Layer {
             rehearsal: known.rehearsal,
             // 팩토리의 키는 올리는 때의 것을 본다. 앞에서 넣었다가 지웠으면 막힌다
             missing_keys: self.missing_keys(organization, &assembled.manifest),
+            missing_secrets: Vec::new(),
         };
         // 승인은 호출에 적힌 release 하나에 묶인다. 승인한 뒤 commit 이 더해졌으면 식별자가 달라 여기서 찾지 못하거나 예행연습이 다시 필요하다
         let approval = Approval {

@@ -73,6 +73,7 @@ fn denied(denied: &PromoteDenied) -> Reply {
                     Blocker::RehearsalNotRun => "마이그레이션의 예행연습을 아직 돌리지 않았습니다. `orbital rehearse` 로 돌려 주세요".to_owned(),
                     Blocker::RehearsalFailed => "마이그레이션의 예행연습이 실패했습니다".to_owned(),
                     Blocker::KeyMissing { key } => crate::layer::key_text(*key),
+                    Blocker::SecretMissing { secret } => crate::layer::secret_text(secret),
                 })
                 .collect(),
         ),

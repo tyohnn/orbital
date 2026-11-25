@@ -39,12 +39,18 @@ pub enum Action {
     PreviewDatabase,
     RequestPromotion,
     Rehearse,
+    /// 사람에게 비밀의 입력을 요청한다.
     SecretsRequest,
+    /// 비밀의 이름과 채워졌는지를 본다. 값은 싣지 않는다.
+    SecretsList,
     /// 여기부터는 운영이다. service key 로만 한다.
     Promote,
     ProductionLogs,
     ProductionDatabase,
+    /// 비밀의 값을 읽는다. 이 일을 하는 길은 레이어에 없다. 어떤 열쇠로도 값은 나가지 않는다.
     SecretsRead,
+    /// 비밀의 값을 넣거나 지우고, 사람의 입력 표를 받는다.
+    SecretsWrite,
 }
 
 impl Action {
@@ -57,10 +63,12 @@ impl Action {
             | Self::PreviewDatabase
             | Self::RequestPromotion => Some(Capability::Preview),
             Self::Rehearse => Some(Capability::Rehearse),
-            Self::SecretsRequest => Some(Capability::SecretsRequest),
-            Self::Promote | Self::ProductionLogs | Self::ProductionDatabase | Self::SecretsRead => {
-                None
-            }
+            Self::SecretsRequest | Self::SecretsList => Some(Capability::SecretsRequest),
+            Self::Promote
+            | Self::ProductionLogs
+            | Self::ProductionDatabase
+            | Self::SecretsRead
+            | Self::SecretsWrite => None,
         }
     }
 }
@@ -183,6 +191,7 @@ mod tests {
             Action::ProductionLogs,
             Action::ProductionDatabase,
             Action::SecretsRead,
+            Action::SecretsWrite,
         ] {
             assert_eq!(
                 judge(&token, &request(action)),

@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{Auth, ValidManifest};
+use crate::name::SecretName;
 
 /// release 의 식별자. 레이어가 commit · 선언 · 권한 표 · 마이그레이션의 내용에서 짓는다. 넷 중 하나라도 바뀌면 달라진다.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -45,6 +46,9 @@ pub struct Release {
     /// 선언의 로그인 방법이 쓰는데 팩토리가 넣지 않은 키. [`missing_keys`] 가 셈한다.
     #[serde(default)]
     pub missing_keys: Vec<FactoryKey>,
+    /// 선언이 밖에서 넣는다고 적었는데 운영의 값이 없는 비밀. [`crate::secrets::missing_secrets`] 가 셈한다.
+    #[serde(default)]
+    pub missing_secrets: Vec<SecretName>,
 }
 
 /// 운영의 로그인이 쓰는 팩토리의 키. 레이어는 공용 발송 도메인도 공용 Google 클라이언트도 갖지 않는다.
@@ -82,7 +86,7 @@ pub fn missing_keys(manifest: &ValidManifest, keys: &Keys) -> Vec<FactoryKey> {
 }
 
 /// 승격을 막는 것.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "blocker", rename_all = "snake_case")]
 pub enum Blocker {
     NotBuiltByLayer,
@@ -94,6 +98,10 @@ pub enum Blocker {
     /// 팩토리가 키를 넣지 않았다. 에이전트가 고칠 수 없고 팩토리의 관리자가 설정에 넣어야 한다.
     KeyMissing {
         key: FactoryKey,
+    },
+    /// 밖에서 넣는 비밀의 운영 값이 없다. 에이전트가 고칠 수 없고 사람이 입력 카드에서 넣어야 한다.
+    SecretMissing {
+        secret: SecretName,
     },
 }
 
@@ -118,6 +126,14 @@ pub fn blockers(release: &Release) -> Vec<Blocker> {
             .missing_keys
             .iter()
             .map(|&key| Blocker::KeyMissing { key }),
+    );
+    found.extend(
+        release
+            .missing_secrets
+            .iter()
+            .map(|secret| Blocker::SecretMissing {
+                secret: secret.clone(),
+            }),
     );
     found
 }
@@ -243,6 +259,7 @@ mod tests {
             access_findings: 0,
             rehearsal: Rehearsed::Passed,
             missing_keys: Vec::new(),
+            missing_secrets: Vec::new(),
         }
     }
 
@@ -433,8 +450,9 @@ path = "/"
             access_findings: 1,
             rehearsal: Rehearsed::Failed,
             missing_keys: vec![FactoryKey::Mail, FactoryKey::Google],
+            missing_secrets: vec![SecretName::parse("BANK_API_KEY").unwrap()],
         };
-        assert_eq!(blockers(&release).len(), 5);
+        assert_eq!(blockers(&release).len(), 6);
     }
 
     #[test]
