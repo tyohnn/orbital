@@ -4,6 +4,7 @@
 //! 선언의 `directory` 에 적힌 업무 역할만 뷰 `orbital.users` 를 읽는다. 소유자는 `users(id)` 를 가리키는 외래 키만 만든다.
 //!
 //! 토큰(로그인 링크 · 세션 · 브라우저의 표식)은 32바이트 무작위 값이고, DB 에는 sha256 해시만 둔다. 표를 통째로 읽어도 그 값으로는 들어오지 못한다.
+//! Google 로 들어오는 사람은 레이어의 콜백이 확인한 뒤 한 번 쓰는 표(`google_ticket`, 60초)를 받아 router 에서 들어온다. 표도 해시로만 둔다.
 //! 링크 · 초대 · 세션이 아직 읽히는지는 core 의 `orbital_core::auth` 가 판정하고, 여기서는 읽어 와 넘기고 그 결과대로 적기만 한다.
 
 use std::fmt;
@@ -13,6 +14,7 @@ use orbital_core::auth::{
     invitation_expires_at, judge_invitation, judge_link, judge_session, link_expires_at,
     may_create_link, needs_touch, safe_next, session_expires_at, undeclared_roles,
 };
+use orbital_core::google::ticket_expires_at;
 use orbital_core::manifest::{Signup, ValidManifest};
 use orbital_core::name::Ident;
 use orbital_core::plan::Names;
@@ -58,8 +60,8 @@ impl Secret {
         Some(Self(bytes))
     }
 
-    /// DB 에 두는 값.
-    pub(crate) fn hash(&self) -> Vec<u8> {
+    /// DB 에 두는 값(sha256). 한쪽으로만 지어서 이것으로는 값을 되짚지 못한다. Google 의 `state` 가 브라우저의 표식을 이것으로 싣는다.
+    pub fn hash(&self) -> Vec<u8> {
         Sha256::digest(self.0).to_vec()
     }
 
@@ -97,6 +99,8 @@ pub enum AuthError {
     UndeclaredRoles { roles: Vec<Ident> },
     /// 그런 링크가 없다.
     NoSuchLink,
+    /// 그런 Google 로그인의 표가 없다(다른 인스턴스의 것이거나 지어낸 것).
+    NoSuchTicket,
     /// 링크가 읽히지 않는다(만료 · 이미 씀 · 다른 브라우저).
     Link(LinkRefusal),
     /// 초대받지 않은 이메일이다.
@@ -137,6 +141,10 @@ impl fmt::Display for AuthError {
             Self::NoSuchLink => write!(
                 f,
                 "로그인 링크를 찾지 못했습니다. 로그인 화면에서 링크를 다시 받아 주세요"
+            ),
+            Self::NoSuchTicket => write!(
+                f,
+                "Google 로그인의 표를 찾지 못했습니다. 로그인 화면에서 Google 로 다시 들어와 주세요"
             ),
             Self::Link(LinkRefusal::Expired) => write!(
                 f,
@@ -253,11 +261,14 @@ CREATE TABLE IF NOT EXISTS orbital_auth.user_role (
     PRIMARY KEY (user_id, role)
 );
 CREATE TABLE IF NOT EXISTS orbital_auth.login (
-    provider text NOT NULL CHECK (provider IN ('email')),
+    provider text NOT NULL CONSTRAINT login_provider_check CHECK (provider IN ('email', 'google')),
     subject text NOT NULL,
     user_id text NOT NULL REFERENCES orbital_auth.users (id) ON DELETE CASCADE,
     PRIMARY KEY (provider, subject)
 );
+-- 앞의 판(email 만 받던 것)에서 선 표도 google 을 받게 맞춘다. 다시 불러도 같다
+ALTER TABLE orbital_auth.login DROP CONSTRAINT IF EXISTS login_provider_check;
+ALTER TABLE orbital_auth.login ADD CONSTRAINT login_provider_check CHECK (provider IN ('email', 'google'));
 CREATE TABLE IF NOT EXISTS orbital_auth.invitation (
     email orbital.citext PRIMARY KEY,
     roles text[] NOT NULL,
@@ -268,6 +279,17 @@ CREATE TABLE IF NOT EXISTS orbital_auth.invitation (
 CREATE TABLE IF NOT EXISTS orbital_auth.email_link (
     token_hash bytea PRIMARY KEY CHECK (length(token_hash) = 32),
     email orbital.citext NOT NULL,
+    next text NOT NULL,
+    browser_hash bytea NOT NULL CHECK (length(browser_hash) = 32),
+    created_at timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL,
+    used_at timestamptz
+);
+-- 레이어의 콜백이 Google 계정을 확인한 뒤 낸 한 번 쓰는 표. 60초, 요청한 브라우저에서만 쓰인다
+CREATE TABLE IF NOT EXISTS orbital_auth.google_ticket (
+    token_hash bytea PRIMARY KEY CHECK (length(token_hash) = 32),
+    email orbital.citext NOT NULL,
+    subject text NOT NULL,
     next text NOT NULL,
     browser_hash bytea NOT NULL CHECK (length(browser_hash) = 32),
     created_at timestamptz NOT NULL,
@@ -381,12 +403,13 @@ REVOKE ALL ON orbital.me, orbital.users FROM PUBLIC;
 "#;
 
 /// 주인 역할에게 넘기는 것. [`INSTALL`] 이 만드는 표와 뷰를 모두 적는다(글자로 고정한 이름이라 SQL 에 바로 넣는다).
-const AUTH_RELATIONS: [(&str, &str); 13] = [
+const AUTH_RELATIONS: [(&str, &str); 14] = [
     ("TABLE", "orbital_auth.users"),
     ("TABLE", "orbital_auth.user_role"),
     ("TABLE", "orbital_auth.login"),
     ("TABLE", "orbital_auth.invitation"),
     ("TABLE", "orbital_auth.email_link"),
+    ("TABLE", "orbital_auth.google_ticket"),
     ("TABLE", "orbital_auth.session"),
     ("TABLE", "orbital_auth.oauth_client"),
     ("TABLE", "orbital_auth.oauth_request"),
@@ -748,33 +771,131 @@ impl AuthStore {
             Some(row) if row.get::<_, bool>(1) => return Err(AuthError::UserDisabled),
             Some(row) => row.get::<_, String>(0),
             None => {
-                let roles = match invitation(&mut transaction, &email, true)? {
-                    Some((state, roles)) => {
-                        judge_invitation(&state, now).map_err(AuthError::Invitation)?;
+                let roles = new_user_roles(&self.manifest, &mut transaction, &email, now)?;
+                create_user(&mut transaction, &email, &roles, ("email", &email), now)?
+            }
+        };
+
+        let session = create_session(&mut transaction, &id, now)?;
+        let user = session_user(&mut transaction, &id)?.ok_or(AuthError::NoSuchUser)?;
+        transaction.commit().map_err(db("들어오기를 마무리"))?;
+        Ok(Entered {
+            session,
+            user,
+            next: safe_next(&next),
+        })
+    }
+
+    /// Google 로 들어온 계정에 한 번 쓰는 표를 낸다. **레이어의 콜백만 부른다**(그 인스턴스의 팩토리 키로 Google 이 확인한 뒤).
+    ///
+    /// 표는 60초, 한 번, `browser_hash` 의 브라우저에서만 쓰인다. 들어올 수 있는 사람인지는 표를 쓸 때([`AuthStore::enter_google`]) 본다.
+    pub fn issue_google_ticket(
+        &mut self,
+        email: &str,
+        subject: &str,
+        next: &str,
+        browser_hash: &[u8],
+        now: u64,
+    ) -> Result<Secret, AuthError> {
+        let ticket = Secret::generate()?;
+        self.client
+            .execute(
+                "INSERT INTO orbital_auth.google_ticket (token_hash, email, subject, next, browser_hash, created_at, expires_at) \
+                 VALUES ($1, $2, $3, $4, $5, to_timestamp($6::bigint), to_timestamp($7::bigint))",
+                &[
+                    &ticket.hash(),
+                    &email,
+                    &subject,
+                    &safe_next(next),
+                    &browser_hash,
+                    &seconds(now),
+                    &seconds(ticket_expires_at(now)),
+                ],
+            )
+            .map_err(db("Google 로그인의 표를 적"))?;
+        Ok(ticket)
+    }
+
+    /// Google 로그인의 표로 들어온다. 표를 「쓴 것」으로 적고, 사용자를 찾거나 만들고, 세션을 만든다.
+    ///
+    /// 표의 판정은 로그인 링크와 같다(한 번 · 만료 · 요청한 브라우저). 사람은 Google 의 계정(`sub`)으로 먼저 찾고, 없으면 같은 이메일의
+    /// 사용자에게 Google 을 로그인 수단으로 더한다. 처음 오는 이메일이면 이메일 링크와 같이 초대(또는 `signup = "open"`)가 있어야 한다.
+    pub fn enter_google(
+        &mut self,
+        ticket: &Secret,
+        browser: &Secret,
+        now: u64,
+    ) -> Result<Entered, AuthError> {
+        let mut transaction = self.client.transaction().map_err(db("들어오기 시작"))?;
+        let Some(row) = transaction
+            .query_opt(
+                "SELECT email::text, subject, next, browser_hash, extract(epoch FROM created_at)::bigint, \
+                 extract(epoch FROM expires_at)::bigint, extract(epoch FROM used_at)::bigint \
+                 FROM orbital_auth.google_ticket WHERE token_hash = $1 FOR UPDATE",
+                &[&ticket.hash()],
+            )
+            .map_err(db("Google 로그인의 표를 찾"))?
+        else {
+            return Err(AuthError::NoSuchTicket);
+        };
+        let email: String = row.get(0);
+        let subject: String = row.get(1);
+        let next: String = row.get(2);
+        let state = LinkState {
+            created_at: unix(Some(row.get(4))).unwrap_or(0),
+            expires_at: unix(Some(row.get(5))).unwrap_or(0),
+            used_at: unix(row.get(6)),
+            browser_hash: row.get(3),
+        };
+        judge_link(&state, &browser.hash(), now).map_err(AuthError::Link)?;
+        let marked = transaction
+            .execute(
+                "UPDATE orbital_auth.google_ticket SET used_at = to_timestamp($2::bigint) \
+                 WHERE token_hash = $1 AND used_at IS NULL",
+                &[&ticket.hash(), &seconds(now)],
+            )
+            .map_err(db("Google 로그인의 표를 쓴 것으로 적"))?;
+        if marked != 1 {
+            return Err(AuthError::Link(LinkRefusal::Used));
+        }
+
+        // Google 의 계정으로 먼저 찾는다. 이메일이 바뀌어도 같은 사람이다
+        let bound = transaction
+            .query_opt(
+                "SELECT u.id, u.disabled_at IS NOT NULL FROM orbital_auth.login l \
+                 JOIN orbital_auth.users u ON u.id = l.user_id \
+                 WHERE l.provider = 'google' AND l.subject = $1 FOR UPDATE OF u",
+                &[&subject],
+            )
+            .map_err(db("Google 의 계정을 찾"))?;
+        let id = match bound {
+            Some(row) if row.get::<_, bool>(1) => return Err(AuthError::UserDisabled),
+            Some(row) => row.get::<_, String>(0),
+            None => {
+                let user = transaction
+                    .query_opt(
+                        "SELECT id, disabled_at IS NOT NULL FROM orbital_auth.users WHERE email = $1 FOR UPDATE",
+                        &[&email],
+                    )
+                    .map_err(db("사용자를 찾"))?;
+                match user {
+                    Some(row) if row.get::<_, bool>(1) => return Err(AuthError::UserDisabled),
+                    Some(row) => {
+                        let id: String = row.get(0);
                         transaction
                             .execute(
-                                "UPDATE orbital_auth.invitation SET accepted_at = to_timestamp($2::bigint) WHERE email = $1",
-                                &[&email, &seconds(now)],
+                                "INSERT INTO orbital_auth.login (provider, subject, user_id) VALUES ('google', $1, $2) \
+                                 ON CONFLICT DO NOTHING",
+                                &[&subject, &id],
                             )
-                            .map_err(db("초대를 받아들인 것으로 적"))?;
-                        roles
+                            .map_err(db("로그인 방법을 더하"))?;
+                        id
                     }
-                    None => match &self.manifest.get().auth {
-                        Some(auth) if auth.signup == Signup::Open => auth
-                            .default_roles
-                            .iter()
-                            .map(|role| role.as_str().to_owned())
-                            .collect(),
-                        _ => return Err(AuthError::NotInvited),
-                    },
-                };
-                // 초대한 뒤 선언에서 빠진 업무 역할은 주지 않는다
-                let declared = &self.manifest.get().database.roles;
-                let roles: Vec<String> = roles
-                    .into_iter()
-                    .filter(|role| declared.iter().any(|known| known.as_str() == role))
-                    .collect();
-                create_user(&mut transaction, &email, &roles, now)?
+                    None => {
+                        let roles = new_user_roles(&self.manifest, &mut transaction, &email, now)?;
+                        create_user(&mut transaction, &email, &roles, ("google", &subject), now)?
+                    }
+                }
             }
         };
 
@@ -995,10 +1116,47 @@ fn invitation(
     }))
 }
 
+/// 처음 들어오는 이메일이 가질 업무 역할. 초대가 있으면 받아들인 것으로 적고 그 역할을, `signup = "open"` 이면 `default_roles` 를 준다.
+/// 초대한 뒤 선언에서 빠진 업무 역할은 주지 않는다.
+fn new_user_roles(
+    manifest: &ValidManifest,
+    transaction: &mut Transaction<'_>,
+    email: &str,
+    now: u64,
+) -> Result<Vec<String>, AuthError> {
+    let roles = match invitation(transaction, email, true)? {
+        Some((state, roles)) => {
+            judge_invitation(&state, now).map_err(AuthError::Invitation)?;
+            transaction
+                .execute(
+                    "UPDATE orbital_auth.invitation SET accepted_at = to_timestamp($2::bigint) WHERE email = $1",
+                    &[&email, &seconds(now)],
+                )
+                .map_err(db("초대를 받아들인 것으로 적"))?;
+            roles
+        }
+        None => match &manifest.get().auth {
+            Some(auth) if auth.signup == Signup::Open => auth
+                .default_roles
+                .iter()
+                .map(|role| role.as_str().to_owned())
+                .collect(),
+            _ => return Err(AuthError::NotInvited),
+        },
+    };
+    let declared = &manifest.get().database.roles;
+    Ok(roles
+        .into_iter()
+        .filter(|role| declared.iter().any(|known| known.as_str() == role))
+        .collect())
+}
+
+/// 사용자를 만든다. `login` 은 처음 들어온 수단(`email` 이면 이메일, `google` 이면 Google 의 계정)이다.
 fn create_user(
     transaction: &mut Transaction<'_>,
     email: &str,
     roles: &[String],
+    login: (&str, &str),
     now: u64,
 ) -> Result<String, AuthError> {
     let id = user_id()?;
@@ -1014,11 +1172,14 @@ fn create_user(
             &[&id, &roles],
         )
         .map_err(db("사용자의 역할을 적"))?;
+    let (provider, subject) = login;
+    let sql = if provider == "email" {
+        "INSERT INTO orbital_auth.login (provider, subject, user_id) VALUES ($1, lower($2), $3)"
+    } else {
+        "INSERT INTO orbital_auth.login (provider, subject, user_id) VALUES ($1, $2, $3)"
+    };
     transaction
-        .execute(
-            "INSERT INTO orbital_auth.login (provider, subject, user_id) VALUES ('email', lower($1), $2)",
-            &[&email, &id],
-        )
+        .execute(sql, &[&provider, &subject, &id])
         .map_err(db("로그인 방법을 적"))?;
     Ok(id)
 }
