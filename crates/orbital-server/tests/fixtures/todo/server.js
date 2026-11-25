@@ -106,6 +106,13 @@ http.createServer(async (request, response) => {
             response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
             return response.end("<!doctype html><title>연결 승인</title><button>승인</button><button>거절</button>");
         }
+        // 답의 머리와 본문의 앞을 보낸 뒤 끝을 `ms` 만큼 늦게 보낸다. 처리 중인 요청이 있는 동안 재우지 않는지 테스트가 본다
+        if (request.url.split("?")[0] === "/slow") {
+            const ms = Number(new URL(request.url, "http://app").searchParams.get("ms") ?? 1000);
+            response.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+            response.write("처음");
+            return setTimeout(() => response.end("끝"), ms);
+        }
         if (request.url === "/env") return send(200, { names: Object.keys(process.env).sort() });
         if (request.url === "/cards" && request.method === "GET") {
             const sets = await query("member", withIdentity(request, "SELECT to_jsonb(c) - 'owner' FROM todo.card c ORDER BY id"));

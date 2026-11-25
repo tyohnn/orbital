@@ -43,6 +43,9 @@ pub struct InstanceRecord {
     /// 에이전트가 승격을 요청한 release. 사람의 승인을 기다린다.
     #[serde(default)]
     pub promotion_requested: Option<String>,
+    /// 미리보기가 쓰는 database 의 식별자. 관리 서버가 다시 뜨면 미리보기는 되살리지 않고 이것으로 남은 database 를 걷는다.
+    #[serde(default)]
+    pub preview: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

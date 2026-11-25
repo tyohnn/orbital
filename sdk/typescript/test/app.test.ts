@@ -97,13 +97,34 @@ function browser(): { fetch: typeof fetch; cookies: Map<string, string> }
     return { fetch: send, cookies };
 }
 
-function outbox(email: string): string
+/** 개발용 메일함에 그 이메일로 쌓인 마지막 링크. 메일은 레이어가 답을 보낸 뒤에 뒤에서 쌓으니 올 때까지 기다린다. */
+async function outbox(email: string): Promise<string>
 {
-    const mails = readFileSync(join(scratch, "home", "outbox.jsonl"), "utf8")
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line) as { to: string; link: string });
-    return mails.filter((mail) => mail.to === email).at(-1)?.link ?? "";
+    const deadline = Date.now() + 10_000;
+    for (;;)
+    {
+        let text = "";
+        try
+        {
+            text = readFileSync(join(scratch, "home", "outbox.jsonl"), "utf8");
+        }
+        catch
+        {
+            text = "";
+        }
+        const link = text
+            .trim()
+            .split("\n")
+            .filter((line) => line !== "")
+            .map((line) => JSON.parse(line) as { to: string; link: string })
+            .filter((mail) => mail.to === email)
+            .at(-1)?.link;
+        if (link !== undefined || Date.now() >= deadline)
+        {
+            return link ?? "";
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+    }
 }
 
 before(async () =>
@@ -195,7 +216,7 @@ test("앱의 화면이 같은 주소의 레이어로 로그인하고 동의를 �
     // 로그인 화면은 이메일 주소만 다룬다. 링크는 메일로 가고, 같은 브라우저로 연다
     assert.equal(await app.me(), null);
     await app.sendLoginLink({ email: "ana@example.test", next: "/" });
-    const opened = await person.fetch(outbox("ana@example.test"), { redirect: "manual" });
+    const opened = await person.fetch(await outbox("ana@example.test"), { redirect: "manual" });
     assert.equal(opened.status, 302);
     assert.ok(person.cookies.has("__Host-orbital-session"));
     const me = await app.me();

@@ -6,16 +6,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read as _;
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orbital_core::access::Access;
 use orbital_core::auth::query_value;
 use orbital_core::check::{judge as judge_access, unguarded};
 use orbital_core::describe::changes;
 use orbital_core::google::{IdTokenRefusal, callback_url, judge_id_token, judge_state};
+use orbital_core::host::{BaseDomain, HostTarget, Scheme, origin as host_origin};
 use orbital_core::manifest::{ServiceKind, ValidManifest};
 use orbital_core::name::{Ident, InstanceId};
 use orbital_core::oauth::registrable_redirect;
@@ -33,8 +35,9 @@ use orbital_pg::auth::AuthStore;
 use orbital_pg::rehearsal::RestorePoint;
 use orbital_proxy::{Route, serve};
 use orbital_router::{
-    Config as RouterConfig, Connect, DocumentFetcher, GoogleDoor, HttpsFetcher, Outbox, Resend,
-    SESSION_COOKIE, Stage as RouterStage, Target as RouterTarget, serve as serve_router,
+    AppServer, Config as RouterConfig, Connect, DocumentFetcher, GoogleDoor, Hosts, HttpsFetcher,
+    Outbox, Resend, Router, SESSION_COOKIE, Stage as RouterStage, Starter, Target as RouterTarget,
+    WakeFailure, serve as serve_router, serve_hosts,
 };
 use orbital_run::{Job, Runner, Running, free_port, wait_for_port};
 use orbital_source::assemble::{AssembleError, Assembled, assemble};
@@ -127,25 +130,101 @@ struct LiveService {
     kind: ServiceKind,
     /// 밖에 알리는 주소. router 의 주소 + 서비스의 `path` 다.
     url: String,
-    process: Option<Box<dyn Running>>,
+    /// 서버 서비스의 프로세스를 재우고 깨우는 것. 정적 서비스에는 없다.
+    server: Option<Arc<AppServer>>,
     proxy: Option<JoinHandle<std::io::Result<()>>>,
 }
 
-/// 떠 있는 router. 내리면 듣기를 멈추고 붙어 있던 연결도 함께 내린다.
-struct RouterTask(JoinHandle<std::io::Result<()>>);
+/// 떠 있는 router. 내리면 요청을 받지 않는다.
+enum Front {
+    /// 인스턴스마다 포트 하나를 듣는다. 내리면 듣기를 멈추고 붙어 있던 연결도 함께 내린다.
+    Port(JoinHandle<std::io::Result<()>>),
+    /// 레이어의 주소 하나에서 하위 도메인으로 가른다. 내리면 그 하위 도메인을 표에서 걷는다.
+    Host {
+        hosts: Arc<Hosts>,
+        target: HostTarget,
+        router: Router,
+    },
+}
 
-impl Drop for RouterTask {
+impl Drop for Front {
     fn drop(&mut self) {
-        self.0.abort();
+        match self {
+            Self::Port(task) => task.abort(),
+            Self::Host {
+                hosts,
+                target,
+                router,
+            } => hosts.remove(target, router),
+        }
     }
 }
 
 /// 띄운 서비스들과 그 앞의 router.
 struct Launched {
     services: Vec<LiveService>,
-    router: RouterTask,
+    router: Front,
     /// router 의 바깥 주소.
     origin: String,
+}
+
+/// 하위 도메인을 쓰는 레이어의 자리. 주소 하나를 듣고 `Host` 로 인스턴스를 가른다.
+struct Hosted {
+    hosts: Arc<Hosts>,
+    address: SocketAddr,
+    base: BaseDomain,
+    scheme: Scheme,
+    _task: JoinHandle<std::io::Result<()>>,
+}
+
+impl Drop for Hosted {
+    fn drop(&mut self) {
+        self._task.abort();
+    }
+}
+
+/// 서버 서비스의 프로세스를 띄우는 것. router 가 자는 서비스를 깨울 때도 부른다.
+struct ServiceStarter {
+    runner: Arc<dyn Runner>,
+    folder: PathBuf,
+    command: String,
+    env: Vec<(String, String)>,
+    log: PathBuf,
+    wake_timeout: Duration,
+}
+
+impl Starter for ServiceStarter {
+    fn start(&self, port: u16) -> Result<Box<dyn Running>, WakeFailure> {
+        let mut env = vec![("PORT".to_owned(), port.to_string())];
+        env.extend(self.env.iter().cloned());
+        let mut process = self
+            .runner
+            .start(&Job {
+                folder: &self.folder,
+                command: &self.command,
+                env: &env,
+                log: &self.log,
+            })
+            .map_err(|_| WakeFailure::Refused)?;
+        // 포트가 열리기를 기다린다. 그 전에 프로세스가 끝나면 더 기다리지 않는다
+        let deadline = Instant::now() + self.wake_timeout;
+        loop {
+            if wait_for_port(port, Duration::from_millis(100)) {
+                if process.alive() {
+                    return Ok(process);
+                }
+                return Err(WakeFailure::Exited);
+            }
+            if !process.alive() {
+                process.stop();
+                return Err(WakeFailure::Exited);
+            }
+            if Instant::now() >= deadline {
+                process.stop();
+                return Err(WakeFailure::TimedOut);
+            }
+        }
+    }
 }
 
 /// 띄울 자리. 미리보기와 운영이 이름 · 비밀 · 서명의 열쇠를 따로 갖는다.
@@ -162,8 +241,8 @@ struct Stand<'a> {
 
 impl Drop for LiveService {
     fn drop(&mut self) {
-        if let Some(mut process) = self.process.take() {
-            process.stop();
+        if let Some(server) = self.server.take() {
+            server.close();
         }
         if let Some(proxy) = self.proxy.take() {
             proxy.abort();
@@ -181,7 +260,7 @@ struct Live {
     /// 미리보기의 씨앗 사용자. 운영에는 없다.
     seed_users: Vec<String>,
     services: Vec<LiveService>,
-    _router: RouterTask,
+    _router: Front,
 }
 
 /// 운영에 올리려는 release 하나와 그것이 설 자리.
@@ -283,6 +362,22 @@ pub struct Options {
     pub dev_mailbox: bool,
     /// Resend 와 Google 의 주소. 테스트가 가짜 서버로 갈아 끼운다.
     pub endpoints: Endpoints,
+    /// 마지막 요청이 끝난 뒤 이만큼 요청이 없으면 서버 서비스의 프로세스를 내린다(`ORBITAL_SLEEP_AFTER`, 기본 5분).
+    pub sleep_after: Duration,
+    /// 서버 서비스를 띄우고 포트가 열리기를 기다리는 시간. 넘으면 띄우지 못한 것이다(기본 30초).
+    pub wake_timeout: Duration,
+    /// 인스턴스마다의 하위 도메인. 없으면 인스턴스마다 포트 하나를 낸다(개발과 지금의 테스트).
+    pub hosting: Option<Hosting>,
+}
+
+/// 하위 도메인으로 인스턴스를 가르는 레이어의 설정.
+pub struct Hosting {
+    /// 모든 인스턴스의 요청을 받는 주소(`ORBITAL_ROUTER_LISTEN`).
+    pub listen: String,
+    /// 기준 도메인(`ORBITAL_BASE_DOMAIN`). `<인스턴스>.<기준 도메인>` 이 운영, `<인스턴스>-preview.<기준 도메인>` 이 미리보기다.
+    pub base: BaseDomain,
+    /// 바깥의 스킴(`ORBITAL_PUBLIC_SCHEME`). TLS 는 레이어 앞에서 끝난다고 본다.
+    pub scheme: Scheme,
 }
 
 impl Options {
@@ -302,6 +397,9 @@ impl Options {
             public_url: "http://127.0.0.1:7400".to_owned(),
             dev_mailbox: false,
             endpoints: Endpoints::default(),
+            sleep_after: Duration::from_secs(5 * 60),
+            wake_timeout: Duration::from_secs(30),
+            hosting: None,
         }
     }
 }
@@ -320,7 +418,11 @@ pub struct Layer {
     documents: Arc<dyn DocumentFetcher>,
     upstream: String,
     sources: SourceStore,
-    runner: Box<dyn Runner>,
+    runner: Arc<dyn Runner>,
+    sleep_after: Duration,
+    wake_timeout: Duration,
+    /// 하위 도메인을 쓸 때만 있다.
+    hosted: Option<Hosted>,
     runtime: Runtime,
     token_key: Vec<u8>,
     service_keys: Vec<([u8; 32], String)>,
@@ -432,7 +534,29 @@ impl Layer {
         };
 
         let settings = Settings::open(options.home.join(SETTINGS), options.seal_key)?;
-        Ok(Self {
+        let runtime =
+            Runtime::new().map_err(|_| "proxy 의 런타임을 띄우지 못했습니다".to_owned())?;
+        let hosted = match options.hosting {
+            None => None,
+            Some(hosting) => {
+                let listener = runtime
+                    .block_on(TcpListener::bind(&hosting.listen))
+                    .map_err(|_| format!("`{}` 에서 듣지 못했습니다", hosting.listen))?;
+                let address = listener
+                    .local_addr()
+                    .map_err(|_| "router 의 주소를 읽지 못했습니다".to_owned())?;
+                let hosts = Hosts::new(hosting.base.clone());
+                let task = runtime.spawn(serve_hosts(listener, Arc::clone(&hosts)));
+                Some(Hosted {
+                    hosts,
+                    address,
+                    base: hosting.base,
+                    scheme: hosting.scheme,
+                    _task: task,
+                })
+            }
+        };
+        let layer = Self {
             sources: SourceStore::new(options.home.join("sources")),
             settings: Arc::new(settings),
             outbox: options
@@ -443,9 +567,11 @@ impl Layer {
             documents: Arc::new(HttpsFetcher),
             pg_url: options.pg_url,
             upstream,
-            runner: options.runner,
-            runtime: Runtime::new()
-                .map_err(|_| "proxy 의 런타임을 띄우지 못했습니다".to_owned())?,
+            runner: Arc::from(options.runner),
+            sleep_after: options.sleep_after,
+            wake_timeout: options.wake_timeout,
+            hosted,
+            runtime,
             token_key,
             service_keys: options
                 .service_keys
@@ -458,6 +584,107 @@ impl Layer {
                 live: BTreeMap::new(),
             }),
             home: options.home,
+        };
+        layer.restore();
+        Ok(layer)
+    }
+
+    /// 하위 도메인을 쓰는 레이어가 모든 인스턴스의 요청을 받는 주소. 포트마다 주소를 내는 레이어에는 없다.
+    pub fn router_address(&self) -> Option<SocketAddr> {
+        self.hosted.as_ref().map(|hosted| hosted.address)
+    }
+
+    /// 관리 서버가 다시 떴을 때 기록에서 운영 중인 인스턴스의 router 를 「자는」 상태로 다시 세운다. 첫 요청에 깬다.
+    ///
+    /// 기록(`registry.json`)의 운영 release · 서명의 열쇠 · 레이어가 만든 비밀과, 레이어가 빌드한 폴더를 믿는다.
+    /// 빌드한 폴더가 없으면 그 commit 에서 다시 빌드한다. 미리보기는 되살리지 않는다(다시 세우면 된다).
+    /// 되살리지 못한 인스턴스는 건너뛰고 식별자와 갈래만 알린다.
+    fn restore(&self) {
+        let mut inner = self.lock();
+        let records: Vec<(String, InstanceRecord)> = inner
+            .registry
+            .state
+            .instances
+            .iter()
+            .filter(|(_, record)| record.production.is_some())
+            .map(|(id, record)| (id.clone(), record.clone()))
+            .collect();
+        // 미리보기는 되살리지 않는다. 앞의 관리 서버가 세워 둔 미리보기의 database 를 걷는다
+        let previews: Vec<(String, String)> = inner
+            .registry
+            .state
+            .instances
+            .iter()
+            .filter_map(|(id, record)| record.preview.clone().map(|preview| (id.clone(), preview)))
+            .collect();
+        for (id, preview) in previews {
+            let destroyed = InstanceId::parse(&preview)
+                .map_err(internal)
+                .and_then(|preview| inner.admin.destroy(&Names::new(preview)).map_err(internal));
+            match destroyed {
+                Ok(()) => {
+                    if let Some(record) = inner.registry.state.instances.get_mut(&id) {
+                        record.preview = None;
+                    }
+                }
+                Err(_) => eprintln!("orbitald: {id} 의 앞 미리보기 database 를 걷지 못했습니다"),
+            }
+        }
+        if inner.registry.save().is_err() {
+            eprintln!("orbitald: 레이어의 기록을 적지 못했습니다");
+        }
+        for (id, record) in records {
+            let Ok(instance) = InstanceId::parse(&id) else {
+                continue;
+            };
+            match self.revive(&instance, &record) {
+                Ok(live) => {
+                    inner.live.insert((id, Stage::Production), live);
+                }
+                Err(failure) => {
+                    let kind = match failure {
+                        Failure::BuildFailed { .. } => "build_failed",
+                        Failure::StartFailed { .. } => "start_failed",
+                        _ => "internal",
+                    };
+                    eprintln!("orbitald: 운영 {id} 를 되살리지 못했습니다({kind})");
+                }
+            }
+        }
+    }
+
+    fn revive(&self, instance: &InstanceId, record: &InstanceRecord) -> Outcome<Live> {
+        let production = record
+            .production
+            .as_ref()
+            .ok_or_else(|| internal("운영의 기록이 없습니다"))?;
+        let commit = record
+            .releases
+            .get(&production.release)
+            .and_then(|release| Commit::parse(&release.commit))
+            .ok_or_else(|| internal("운영의 release 를 찾지 못했습니다"))?;
+        let assembled = self.assembled(instance, &commit)?;
+        let folder = self.build(instance, &assembled)?;
+        let names = Names::new(instance.clone());
+        let identity_key = token::unhex(&production.identity_key)
+            .ok_or_else(|| internal("서명의 열쇠를 읽지 못했습니다"))?;
+        let stand = Stand {
+            names: &names,
+            generated: &production.generated,
+            identity_key: &identity_key,
+            stage: Stage::Production,
+            organization: &record.organization,
+            app: &record.app,
+        };
+        let launched = self.launch(instance, &assembled, &folder, &stand, false)?;
+        Ok(Live {
+            release: production.release.clone(),
+            origin: launched.origin,
+            names,
+            manifest: assembled.manifest.clone(),
+            seed_users: Vec::new(),
+            services: launched.services,
+            _router: launched.router,
         })
     }
 }
@@ -686,22 +913,40 @@ impl Layer {
 
     /// 빌드한 것을 띄운다. 서버 서비스마다 proxy 를 하나 세우고, 앱에는 그 주소와 레이어가 만든 비밀만 건넨다.
     /// 서비스들 앞에 router 를 세운다. 밖에서는 router 의 주소로만 닿는다.
+    ///
+    /// `wake` 면 서버 서비스를 지금 띄워 실제로 뜨는지 확인한다(미리보기와 승격). 아니면 자는 채로 세워 첫 요청에 깨운다
+    /// (관리 서버가 다시 떴을 때). 어느 쪽이든 요청이 없으면 정한 시간 뒤에 잔다.
     fn launch(
         &self,
         instance: &InstanceId,
         assembled: &Assembled,
         folder: &Path,
         stand: &Stand<'_>,
+        wake: bool,
     ) -> Outcome<Launched> {
         let (names, generated, stage) = (stand.names, stand.generated, stand.stage);
-        let listener = self
-            .runtime
-            .block_on(TcpListener::bind("127.0.0.1:0"))
-            .map_err(internal)?;
-        let origin = format!(
-            "http://127.0.0.1:{}",
-            listener.local_addr().map_err(internal)?.port()
-        );
+        // 하위 도메인을 쓰면 레이어의 주소 하나가 받고, 아니면 인스턴스마다 포트 하나를 듣는다
+        let (listener, origin, host) = match &self.hosted {
+            Some(hosted) => {
+                let target = match stage {
+                    Stage::Preview => HostTarget::Preview(instance.clone()),
+                    Stage::Production => HostTarget::Production(instance.clone()),
+                };
+                let origin = host_origin(hosted.scheme, &hosted.base, &target);
+                (None, origin, Some(target))
+            }
+            None => {
+                let listener = self
+                    .runtime
+                    .block_on(TcpListener::bind("127.0.0.1:0"))
+                    .map_err(internal)?;
+                let origin = format!(
+                    "http://127.0.0.1:{}",
+                    listener.local_addr().map_err(internal)?.port()
+                );
+                (Some(listener), origin, None)
+            }
+        };
         let url = |path: &str| format!("{origin}{}", path.trim_end_matches('/'));
         let mut services = Vec::new();
         let mut targets = BTreeMap::new();
@@ -722,15 +967,14 @@ impl Layer {
                     name: service.name.to_string(),
                     kind: service.kind,
                     url: url(&service.path),
-                    process: None,
+                    server: None,
                     proxy: None,
                 });
                 continue;
             }
 
-            let port = free_port().ok_or_else(|| internal("빈 포트를 찾지 못했습니다"))?;
+            // 포트(`PORT`)는 띄울 때마다 새로 받는다. 자고 깨면 바뀐다
             let mut env = vec![
-                ("PORT".to_owned(), port.to_string()),
                 ("HOST".to_owned(), "127.0.0.1".to_owned()),
                 // 미리보기에서 메일을 보내지 않는 것처럼, 앱이 어디에 섰는지에 따라 달리 굴 일이 있다
                 (
@@ -781,42 +1025,37 @@ impl Layer {
                 &assembled.release,
                 &format!("{label}-{}", service.name),
             );
-            let command = service.start.as_deref().unwrap_or_default();
-            let failed = |log: &Path| Failure::StartFailed {
-                service: service.name.to_string(),
-                log: tail(log),
-            };
-            let mut live = LiveService {
+            let starter = Arc::new(ServiceStarter {
+                runner: Arc::clone(&self.runner),
+                folder: folder.to_path_buf(),
+                command: service.start.clone().unwrap_or_default(),
+                env,
+                log: log.clone(),
+                wake_timeout: self.wake_timeout,
+            });
+            let server = AppServer::new(
+                service.name.as_str(),
+                Arc::clone(&starter) as Arc<dyn Starter>,
+                self.sleep_after,
+                self.wake_timeout,
+                self.runtime.handle().clone(),
+            );
+            let live = LiveService {
                 name: service.name.to_string(),
                 kind: service.kind,
                 url: url(&service.path),
-                process: None,
+                server: Some(Arc::clone(&server)),
                 proxy,
             };
-            let mut process = self
-                .runner
-                .start(&Job {
-                    folder,
-                    command,
-                    env: &env,
-                    log: &log,
-                })
-                .map_err(|_| failed(&log))?;
-            // 포트가 열리기를 기다린다. 그 전에 프로세스가 끝나면 더 기다리지 않는다
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            let up = loop {
-                if wait_for_port(port, Duration::from_millis(100)) {
-                    break process.alive();
-                }
-                if !process.alive() || std::time::Instant::now() >= deadline {
-                    break false;
-                }
-            };
-            live.process = Some(process);
-            if !up {
-                return Err(failed(&log));
+            if wake {
+                let port = free_port().ok_or_else(|| internal("빈 포트를 찾지 못했습니다"))?;
+                let process = starter.start(port).map_err(|_| Failure::StartFailed {
+                    service: service.name.to_string(),
+                    log: tail(&log),
+                })?;
+                server.adopt(process, port);
             }
-            targets.insert(service.name.to_string(), RouterTarget::Server { port });
+            targets.insert(service.name.to_string(), RouterTarget::Server(server));
             services.push(live);
         }
 
@@ -878,7 +1117,21 @@ impl Layer {
             log: Some(log),
             documents: Arc::clone(&self.documents),
         };
-        let router = RouterTask(self.runtime.spawn(serve_router(listener, config)));
+        let router = match (listener, host, &self.hosted) {
+            (Some(listener), _, _) => {
+                Front::Port(self.runtime.spawn(serve_router(listener, config)))
+            }
+            (None, Some(target), Some(hosted)) => {
+                let router = Router::new(config);
+                hosted.hosts.insert(target.clone(), &router);
+                Front::Host {
+                    hosts: Arc::clone(&hosted.hosts),
+                    target,
+                    router,
+                }
+            }
+            _ => return Err(internal("router 를 세울 자리가 없습니다")),
+        };
         Ok(Launched {
             services,
             router,
@@ -959,6 +1212,8 @@ impl Layer {
         }
 
         let names = Names::new(fresh_id('p')?);
+        // 세우기 전에 적어 둔다. 도중에 관리 서버가 내려가도 다시 뜰 때 이 database 를 걷는다
+        Self::note_preview(&mut inner, instance, Some(&names))?;
         let identity_key = random(32)?;
         let prepared =
             self.prepare_preview_database(&mut inner.admin, &names, &assembled, &identity_key);
@@ -978,7 +1233,7 @@ impl Layer {
             organization: &record.organization,
             app: &record.app,
         };
-        let launched = match self.launch(instance, &assembled, &folder, &stand) {
+        let launched = match self.launch(instance, &assembled, &folder, &stand, true) {
             Ok(launched) => launched,
             Err(failure) => {
                 let _ = inner.admin.destroy(&names);
@@ -1064,6 +1319,19 @@ impl Layer {
             },
         );
         Ok(report)
+    }
+
+    /// 미리보기의 database 를 기록에 적거나 지운다.
+    fn note_preview(
+        inner: &mut Inner,
+        instance: &InstanceId,
+        names: Option<&Names>,
+    ) -> Outcome<()> {
+        if let Some(record) = inner.registry.state.instances.get_mut(instance.as_str()) {
+            record.preview = names.map(|names| names.instance().as_str().to_owned());
+            inner.registry.save().map_err(Failure::Internal)?;
+        }
+        Ok(())
     }
 
     fn prepare_preview_database(
@@ -1162,7 +1430,7 @@ impl Layer {
             drop(old);
             inner.admin.destroy(&names).map_err(internal)?;
         }
-        Ok(())
+        Self::note_preview(&mut inner, instance, None)
     }
 
     /// 운영 DB 의 사본에 아직 돌지 않은 마이그레이션을 미리 돌려 본다. 숫자만 돌아온다.
@@ -1495,7 +1763,7 @@ impl Layer {
             app: target.app,
         };
         let launched = self
-            .launch(target.instance, assembled, target.folder, &stand)
+            .launch(target.instance, assembled, target.folder, &stand, true)
             .map_err(|failure| (failure, migrated))?;
         Ok((launched, ran))
     }
@@ -1569,7 +1837,7 @@ impl Layer {
             organization: &prior.record.organization,
             app: &prior.record.app,
         };
-        if let Ok(launched) = self.launch(prior.instance, &assembled, &folder, &stand) {
+        if let Ok(launched) = self.launch(prior.instance, &assembled, &folder, &stand, true) {
             inner.live.insert(
                 (prior.instance.as_str().to_owned(), Stage::Production),
                 Live {

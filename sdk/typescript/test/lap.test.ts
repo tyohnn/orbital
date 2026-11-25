@@ -74,6 +74,7 @@ function cookiePair(response: Response, name: string): string
  */
 async function signIn(live: string, email: string): Promise<string>
 {
+    const before = linksTo(email).length;
     const asked = await fetch(`${live}/_orbital/auth/email-link`, {
         method: "POST",
         headers: { origin: live, "content-type": "application/json" },
@@ -81,14 +82,37 @@ async function signIn(live: string, email: string): Promise<string>
     });
     assert.equal(asked.status, 202);
     const browser = cookiePair(asked, "__Host-orbital-browser");
-    const mails = readFileSync(join(scratch, "home", "outbox.jsonl"), "utf8")
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line) as { to: string; link: string });
-    const link = mails.filter((mail) => mail.to === email).at(-1)?.link ?? "";
+    // 메일은 레이어가 답을 보낸 뒤에 뒤에서 쌓는다
+    const deadline = Date.now() + 10_000;
+    while (linksTo(email).length <= before && Date.now() < deadline)
+    {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const link = linksTo(email).at(-1) ?? "";
     const opened = await fetch(link, { headers: { cookie: browser }, redirect: "manual" });
     assert.equal(opened.status, 302);
     return cookiePair(opened, "__Host-orbital-session");
+}
+
+/** 개발용 메일함에 그 이메일로 쌓인 링크. 파일이 아직 없으면 빈 목록이다. */
+function linksTo(email: string): string[]
+{
+    let text = "";
+    try
+    {
+        text = readFileSync(join(scratch, "home", "outbox.jsonl"), "utf8");
+    }
+    catch
+    {
+        return [];
+    }
+    return text
+        .trim()
+        .split("\n")
+        .filter((line) => line !== "")
+        .map((line) => JSON.parse(line) as { to: string; link: string })
+        .filter((mail) => mail.to === email)
+        .map((mail) => mail.link);
 }
 
 async function rejection(work: Promise<unknown>): Promise<OrbitalError>

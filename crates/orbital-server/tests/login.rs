@@ -438,6 +438,18 @@ impl Bench {
         Outbox::read(&self.home.join(OUTBOX))
     }
 
+    /// 그 이메일로 `count` 통이 쌓일 때까지 기다렸다가 돌려준다. 메일은 링크 요청의 답을 보낸 뒤에 뒤에서 나간다.
+    fn wait_mails_to(&self, email: &str, count: usize) -> Vec<Mail> {
+        let started = std::time::Instant::now();
+        loop {
+            let mails = self.mails_to(email);
+            if mails.len() >= count || started.elapsed() > Duration::from_secs(10) {
+                return mails;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn mails_to(&self, email: &str) -> Vec<Mail> {
         self.mails()
             .into_iter()
@@ -447,6 +459,7 @@ impl Bench {
 
     /// 사람이 하듯이 들어온다. 링크를 요청하고, 메일함에서 링크를 꺼내 같은 브라우저로 연다. 세션 쿠키(`이름=값`)를 돌려준다.
     fn sign_in(&self, origin: &str, email: &str) -> String {
+        let before = self.mails_to(email).len();
         let asked = http(
             "POST",
             origin,
@@ -457,7 +470,7 @@ impl Bench {
         assert_eq!(asked.status, 202, "{}", asked.body);
         let browser = asked.cookie("__Host-orbital-browser");
         let link = self
-            .mails_to(email)
+            .wait_mails_to(email, before + 1)
             .pop()
             .expect("메일함에 링크가 없습니다")
             .link;
@@ -643,8 +656,8 @@ fn 초대받지_않은_이메일과_초대받은_이메일에_같은_답이_가�
         (stranger.status, strip(&stranger), &stranger.body)
     );
 
-    assert_eq!(bench.mails_to("kim@example.com").len(), 1);
-    assert_eq!(bench.mails_to("lee@example.com").len(), 1);
+    assert_eq!(bench.wait_mails_to("kim@example.com", 1).len(), 1);
+    assert_eq!(bench.wait_mails_to("lee@example.com", 1).len(), 1);
     assert!(bench.mails_to("stranger@example.com").is_empty());
     assert!(bench.mails_to("nobody@example.com").is_empty());
 }
@@ -915,7 +928,11 @@ fn 세션_토큰은_답과_로그와_오류_어디에도_없고_링크의_토큰
     );
     let browser = asked.cookie("__Host-orbital-browser");
     replies.push(asked);
-    let link = bench.mails_to("kim@example.com").pop().unwrap().link;
+    let link = bench
+        .wait_mails_to("kim@example.com", 1)
+        .pop()
+        .unwrap()
+        .link;
     let link_token = link.split("token=").nth(1).unwrap().to_owned();
     let path = link.strip_prefix(&live).unwrap().to_owned();
     let opened = http("GET", &live, &path, &[("Cookie", &browser)], "");

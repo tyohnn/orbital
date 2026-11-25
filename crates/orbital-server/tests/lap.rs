@@ -311,6 +311,14 @@ fn cookie_pair(response: &ureq::Response, name: &str) -> String {
 
 /// 운영의 사람이 하듯이 들어온다. 로그인 링크를 요청하고, 메일함에서 링크를 꺼내 같은 브라우저로 연다. 세션 쿠키를 돌려준다.
 fn sign_in(bench: &Bench, origin: &str, email: &str) -> String {
+    let outbox = bench.scratch.path("home").join(OUTBOX);
+    let sent = || {
+        Outbox::read(&outbox)
+            .into_iter()
+            .filter(|mail| mail.to == email)
+            .collect::<Vec<_>>()
+    };
+    let before = sent().len();
     let agent = ureq::AgentBuilder::new().redirects(0).build();
     let asked = agent
         .post(&format!("{origin}/_orbital/auth/email-link"))
@@ -319,12 +327,16 @@ fn sign_in(bench: &Bench, origin: &str, email: &str) -> String {
         .unwrap();
     assert_eq!(asked.status(), 202);
     let browser = cookie_pair(&asked, "__Host-orbital-browser");
-    let link = Outbox::read(&bench.scratch.path("home").join(OUTBOX))
-        .into_iter()
-        .rev()
-        .find(|mail| mail.to == email)
-        .expect("메일함에 링크가 없습니다")
-        .link;
+    // 메일은 링크 요청의 답을 보낸 뒤에 뒤에서 쌓인다. 새 한 통이 올 때까지 기다린다
+    let started = std::time::Instant::now();
+    let mail = loop {
+        let mails = sent();
+        if mails.len() > before || started.elapsed() > std::time::Duration::from_secs(10) {
+            break mails.into_iter().nth(before);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let link = mail.expect("메일함에 링크가 없습니다").link;
     let opened = agent.get(&link).set("Cookie", &browser).call().unwrap();
     assert_eq!(opened.status(), 302);
     cookie_pair(&opened, "__Host-orbital-session")
