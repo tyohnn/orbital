@@ -5,6 +5,7 @@
 //!
 //! 여기에는 개발용 실행기([`LocalRunner`]) 하나가 있다. 이 기계의 프로세스로 돌리고 **격리하지 않는다.** 운영에 쓰지 않는다.
 //! 다만 환경은 비운다. 레이어의 환경 변수(DB 의 관리 주소 같은 것)가 앱에 새지 않고, 앱은 레이어가 건넨 것만 본다.
+//! 빌드에는 레이어의 운영자가 정한 것(레지스트리의 주소, 프록시, CA 묶음 같은 것)을 더 건넨다([`build_env`]). 서버에는 건네지 않는다.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -26,6 +27,46 @@ pub struct Job<'a> {
     pub env: &'a [(String, String)],
     /// 출력을 이어 적을 파일.
     pub log: &'a Path,
+    /// 도구가 캐시와 설정을 쓰는 홈(`HOME`). 빌드는 인스턴스마다의 자리를 받아 인스턴스 사이에 캐시를 나누지 않는다.
+    /// 없으면 꺼내 둔 폴더 안의 `.orbital-home` 이다.
+    pub home: Option<&'a Path>,
+}
+
+/// 빌드의 환경을 정하는 운영자의 목록(`ORBITAL_BUILD_ENV`)을 읽는다. 쉼표로 가른 이름마다 `lookup` 의 값을 가져온다.
+///
+/// 값이 없는 이름은 건너뛴다. 레이어의 설정(`ORBITAL_`)과 DB 의 접속(`PG`), 레이어가 정하는 `PATH` · `HOME` 은 받지 않는다.
+/// 빌드는 에이전트가 쓴 코드를 돌리므로, 여기에 적은 값은 그 코드가 모두 읽는다고 본다.
+pub fn build_env(
+    names: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut env = Vec::new();
+    for name in names
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let shaped = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !name.starts_with(|c: char| c.is_ascii_digit());
+        if !shaped {
+            return Err(format!(
+                "`{name}` 은 환경 변수의 이름이 아닙니다. 영문 · 숫자 · `_` 로 적어 주세요"
+            ));
+        }
+        let upper = name.to_ascii_uppercase();
+        if upper.starts_with("ORBITAL_") || upper.starts_with("PG") {
+            return Err(format!(
+                "`{name}` 은 레이어의 설정이나 DB 의 접속이라 빌드에 넘기지 않습니다. 목록에서 빼 주세요"
+            ));
+        }
+        if upper == "PATH" || upper == "HOME" {
+            return Err(format!("`{name}` 은 레이어가 정합니다. 목록에서 빼 주세요"));
+        }
+        if let Some(value) = lookup(name) {
+            env.push((name.to_owned(), value));
+        }
+    }
+    Ok(env)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,18 +117,21 @@ pub trait Runner: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct LocalRunner {
     pub build_timeout: Duration,
+    /// 빌드에만 더 건네는 것. 운영자가 정한다([`build_env`]). 서버와 적합성 테스트에는 건네지 않는다.
+    pub build_env: Vec<(String, String)>,
 }
 
 impl Default for LocalRunner {
     fn default() -> Self {
         Self {
             build_timeout: Duration::from_secs(600),
+            build_env: Vec::new(),
         }
     }
 }
 
 impl LocalRunner {
-    fn spawn(job: &Job<'_>) -> Result<Child, RunError> {
+    fn spawn(job: &Job<'_>, extra: &[(String, String)]) -> Result<Child, RunError> {
         if let Some(parent) = job.log.parent() {
             fs::create_dir_all(parent).map_err(|_| RunError::Spawn)?;
         }
@@ -98,7 +142,9 @@ impl LocalRunner {
             .map_err(|_| RunError::Spawn)?;
         let errors = log.try_clone().map_err(|_| RunError::Spawn)?;
         // 도구가 캐시와 설정을 쓰는 자리. 이 기계의 홈을 쓰지 않는다
-        let home = job.folder.join(".orbital-home");
+        let home = job
+            .home
+            .map_or_else(|| job.folder.join(".orbital-home"), Path::to_path_buf);
         fs::create_dir_all(&home).map_err(|_| RunError::Spawn)?;
         let mut command = Command::new("sh");
         command
@@ -108,6 +154,11 @@ impl LocalRunner {
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &home)
+            .envs(
+                extra
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )
             .envs(
                 job.env
                     .iter()
@@ -206,8 +257,8 @@ impl Drop for LocalProcess {
 }
 
 impl LocalRunner {
-    fn finish(job: &Job<'_>, limit: Duration) -> Result<(), RunError> {
-        let mut child = Self::spawn(job)?;
+    fn finish(job: &Job<'_>, extra: &[(String, String)], limit: Duration) -> Result<(), RunError> {
+        let mut child = Self::spawn(job, extra)?;
         match wait_until(&mut child, limit) {
             Some(status) if status.success() => Ok(()),
             Some(status) => Err(RunError::Failed {
@@ -223,15 +274,15 @@ impl LocalRunner {
 
 impl Runner for LocalRunner {
     fn build(&self, job: &Job<'_>) -> Result<(), RunError> {
-        Self::finish(job, self.build_timeout)
+        Self::finish(job, &self.build_env, self.build_timeout)
     }
 
     fn check(&self, job: &Job<'_>, limit: Duration) -> Result<(), RunError> {
-        Self::finish(job, limit)
+        Self::finish(job, &[], limit)
     }
 
     fn start(&self, job: &Job<'_>) -> Result<Box<dyn Running>, RunError> {
-        Ok(Box::new(LocalProcess(Self::spawn(job)?)))
+        Ok(Box::new(LocalProcess(Self::spawn(job, &[])?)))
     }
 }
 
@@ -296,6 +347,7 @@ mod tests {
                 command,
                 env,
                 log,
+                home: None,
             }
         }
     }
@@ -309,6 +361,7 @@ mod tests {
     fn runner() -> LocalRunner {
         LocalRunner {
             build_timeout: Duration::from_secs(20),
+            build_env: Vec::new(),
         }
     }
 
@@ -341,6 +394,7 @@ mod tests {
         let log = scratch.log();
         let quick = LocalRunner {
             build_timeout: Duration::from_millis(300),
+            build_env: Vec::new(),
         };
         let started = Instant::now();
         assert_eq!(
@@ -369,6 +423,122 @@ mod tests {
             "HOME={}",
             scratch.0.join(".orbital-home").display()
         )));
+    }
+
+    /// 운영자의 환경을 흉내 낸 것. 목록에 적은 이름과 적지 않은 이름이 섞여 있다.
+    fn operator(name: &str) -> Option<String> {
+        match name {
+            "HTTPS_PROXY" => Some("http://proxy.example.invalid:3128".to_owned()),
+            "NODE_EXTRA_CA_CERTS" => Some("/etc/orbital/ca.crt".to_owned()),
+            "SECRET_TOKEN" => Some("나가면_안_되는_값".to_owned()),
+            _ => None,
+        }
+    }
+
+    fn builder() -> LocalRunner {
+        LocalRunner {
+            build_env: build_env(
+                "HTTPS_PROXY, NODE_EXTRA_CA_CERTS,NPM_CONFIG_REGISTRY",
+                operator,
+            )
+            .unwrap(),
+            ..runner()
+        }
+    }
+
+    #[test]
+    fn 빌드에_건넬_환경은_운영자가_적은_이름만_넘긴다() {
+        let scratch = Scratch::new();
+        let log = scratch.log();
+        builder()
+            .build(&scratch.job("env > env.txt", &[], &log))
+            .unwrap();
+        let seen = fs::read_to_string(scratch.0.join("env.txt")).unwrap();
+        assert!(
+            seen.contains("HTTPS_PROXY=http://proxy.example.invalid:3128"),
+            "{seen}"
+        );
+        assert!(
+            seen.contains("NODE_EXTRA_CA_CERTS=/etc/orbital/ca.crt"),
+            "{seen}"
+        );
+        // 목록에 없는 이름은 운영자의 환경에 있어도 넘기지 않고, 목록에 있어도 값이 없으면 빈 값으로 만들지 않는다
+        assert!(!seen.contains("SECRET_TOKEN"), "{seen}");
+        assert!(!seen.contains("NPM_CONFIG_REGISTRY"), "{seen}");
+    }
+
+    #[test]
+    fn 서버를_띄울_때는_빌드의_환경을_넘기지_않는다() {
+        let scratch = Scratch::new();
+        let log = scratch.log();
+        let port = free_port().unwrap();
+        let env = [("PORT".to_owned(), port.to_string())];
+        let command = "env > env.txt && node -e \"require('http').createServer((q, s) => s.end('ok')).listen(process.env.PORT, '127.0.0.1')\"";
+        let mut server = builder().start(&scratch.job(command, &env, &log)).unwrap();
+        assert!(wait_for_port(port, Duration::from_secs(10)));
+        server.stop();
+        let seen = fs::read_to_string(scratch.0.join("env.txt")).unwrap();
+        assert!(seen.contains(&format!("PORT={port}")), "{seen}");
+        assert!(!seen.contains("HTTPS_PROXY"), "{seen}");
+        assert!(!seen.contains("NODE_EXTRA_CA_CERTS"), "{seen}");
+    }
+
+    #[test]
+    fn 적합성_테스트에도_빌드의_환경을_넘기지_않는다() {
+        let scratch = Scratch::new();
+        let log = scratch.log();
+        builder()
+            .check(
+                &scratch.job("env > env.txt", &[], &log),
+                Duration::from_secs(20),
+            )
+            .unwrap();
+        let seen = fs::read_to_string(scratch.0.join("env.txt")).unwrap();
+        assert!(!seen.contains("HTTPS_PROXY"), "{seen}");
+    }
+
+    #[test]
+    fn 레이어의_설정과_db_의_접속은_빌드의_환경_목록에_적지_못한다() {
+        for names in [
+            "ORBITAL_PG",
+            "HTTPS_PROXY,orbital_seal_key",
+            "PGPASSWORD",
+            "PGHOST",
+            "PATH",
+            "HOME",
+        ] {
+            let refused = build_env(names, |_| Some("값".to_owned()));
+            assert!(refused.is_err(), "{names}");
+            assert!(!refused.unwrap_err().contains("값"), "{names}");
+        }
+        assert!(build_env("HTTPS PROXY", |_| None).is_err());
+        assert_eq!(build_env("", |_| Some("값".to_owned())), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn 홈을_받은_명령은_그_자리를_홈으로_쓰고_받지_않은_명령은_꺼내_둔_폴더_안을_쓴다() {
+        let scratch = Scratch::new();
+        let log = scratch.log();
+        let cache = scratch.0.join("caches/k3f9x2ab");
+        let mut job = scratch.job("echo \"$HOME\" > home.txt", &[], &log);
+        job.home = Some(&cache);
+        runner().build(&job).unwrap();
+        assert_eq!(
+            fs::read_to_string(scratch.0.join("home.txt"))
+                .unwrap()
+                .trim(),
+            cache.display().to_string()
+        );
+        assert!(cache.is_dir());
+        runner()
+            .build(&scratch.job("echo \"$HOME\" > home.txt", &[], &log))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(scratch.0.join("home.txt"))
+                .unwrap()
+                .trim(),
+            scratch.0.join(".orbital-home").display().to_string()
+        );
     }
 
     #[test]

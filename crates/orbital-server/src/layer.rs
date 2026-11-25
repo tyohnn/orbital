@@ -129,10 +129,27 @@ fn fresh_id(lead: char) -> Outcome<InstanceId> {
     InstanceId::parse(&text).map_err(internal)
 }
 
-fn tail(log: &Path) -> String {
-    let text = fs::read_to_string(log).unwrap_or_default();
+/// 글에서 레이어의 폴더 경로를 `<레이어>` 로 가린다.
+fn masked(text: &str, home: &Path) -> String {
+    let mut text = text.to_owned();
+    let mut homes = vec![home.display().to_string()];
+    if let Ok(real) = fs::canonicalize(home) {
+        homes.push(real.display().to_string());
+    }
+    // 긴 것부터 바꿔 한쪽이 다른 쪽의 머리일 때도 남김없이 가린다
+    homes.sort_by_key(|path| std::cmp::Reverse(path.len()));
+    for path in homes.iter().filter(|path| path.len() > 1) {
+        text = text.replace(path.as_str(), "<레이어>");
+    }
+    text
+}
+
+/// 로그의 끝 `count` 줄. 레이어의 폴더 경로(빌드의 홈 · 빌드 폴더가 그 아래에 있다)는 `<레이어>` 로 가린다.
+/// 에이전트에게 가는 글이라 이 기계의 배치를 싣지 않는다. 격리하는 실행기로 바꾸면 경로도 바뀐다.
+fn tail(log: &Path, home: &Path, count: usize) -> String {
+    let text = masked(&fs::read_to_string(log).unwrap_or_default(), home);
     let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(40)..].join("\n")
+    lines[lines.len().saturating_sub(count)..].join("\n")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -261,6 +278,7 @@ impl Starter for ServiceStarter {
                 command: &self.command,
                 env: &env,
                 log: &self.log,
+                home: None,
             })
             .map_err(|_| WakeFailure::Refused)?;
         // 포트가 열리기를 기다린다. 그 전에 프로세스가 끝나면 더 기다리지 않는다
@@ -562,6 +580,8 @@ pub struct Layer {
     service_keys: Vec<([u8; 32], String)>,
     /// 백업을 켠 레이어에만 있다.
     backup: Option<Backup>,
+    /// 인스턴스마다의 빌드 자물쇠. 빌드는 레이어의 자물쇠(`inner`) 밖에서 돌고, 같은 인스턴스의 빌드와 빌드 폴더 걷기만 한 줄로 세운다.
+    building: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     inner: Mutex<Inner>,
 }
 
@@ -779,6 +799,7 @@ impl Layer {
                 .iter()
                 .map(|(key, organization)| (digest(key), organization.clone()))
                 .collect(),
+            building: Mutex::new(BTreeMap::new()),
             inner: Mutex::new(Inner {
                 admin,
                 registry: Registry::open(options.home.join("registry.json"))?,
@@ -1162,12 +1183,8 @@ impl Layer {
                 names.push(format!("preview-{}", service.name));
             }
             for name in names {
-                let text = fs::read_to_string(self.log(instance, &id, &name)).unwrap_or_default();
-                let lines: Vec<&str> = text.lines().collect();
-                logs.push(LogReport {
-                    name,
-                    text: lines[lines.len().saturating_sub(200)..].join("\n"),
-                });
+                let text = tail(&self.log(instance, &id, &name), &self.home, 200);
+                logs.push(LogReport { name, text });
             }
         }
         Ok(PreviewLogs { release, logs })
@@ -1192,13 +1209,65 @@ impl Layer {
             .join(format!("{name}.log"))
     }
 
+    /// 인스턴스의 빌드 폴더들이 사는 곳. release 마다 그 아래에 폴더 하나다.
+    fn builds_folder(&self, instance: &InstanceId) -> PathBuf {
+        self.home.join("builds").join(instance.as_str())
+    }
+
+    /// 인스턴스의 빌드가 홈으로 쓰는 곳. 도구의 캐시가 여기에 쌓이고 다른 인스턴스와 나누지 않는다.
+    fn cache_folder(&self, instance: &InstanceId) -> PathBuf {
+        self.home.join("caches").join(instance.as_str())
+    }
+
+    /// 인스턴스의 빌드 자물쇠.
+    fn build_gate(&self, instance: &InstanceId) -> Arc<Mutex<()>> {
+        let mut gates = self
+            .building
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(gates.entry(instance.as_str().to_owned()).or_default())
+    }
+
+    /// 떠 있지 않은 release 의 빌드 폴더를 걷는다. 프리뷰와 운영에 떠 있는 것과 기록의 운영 release 만 남긴다.
+    /// 빌드 폴더마다 의존성(`node_modules`)이 들어 수백 MB 가 되므로, 남겨 두면 commit 마다 쌓인다.
+    /// 걷은 release 가 다시 필요하면(되돌리기 · 관리 서버의 재시작) [`Self::build`] 가 그 commit 에서 다시 빌드한다.
+    fn prune_builds(&self, inner: &Inner, instance: &InstanceId) {
+        let mut keep: Vec<&str> = [Stage::Preview, Stage::Production]
+            .iter()
+            .filter_map(|stage| inner.live.get(&(instance.as_str().to_owned(), *stage)))
+            .map(|live| live.release.as_str())
+            .collect();
+        if let Some(production) = inner
+            .registry
+            .state
+            .instances
+            .get(instance.as_str())
+            .and_then(|record| record.production.as_ref())
+        {
+            keep.push(&production.release);
+        }
+        // 같은 인스턴스의 빌드가 돌고 있으면 그 폴더를 걷지 않게 이번에는 건너뛴다. 다음 프리뷰나 승격이 걷는다
+        let gate = self.build_gate(instance);
+        let Ok(_building) = gate.try_lock() else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(self.builds_folder(instance)) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if !keep.iter().any(|release| entry.file_name() == **release) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
     /// release 를 그 commit 에서 직접 빌드한다. 이미 빌드했으면 그것을 쓴다.
     fn build(&self, instance: &InstanceId, assembled: &Assembled) -> Outcome<PathBuf> {
-        let folder = self
-            .home
-            .join("builds")
-            .join(instance.as_str())
-            .join(&assembled.release.0);
+        let gate = self.build_gate(instance);
+        let _building = gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let folder = self.builds_folder(instance).join(&assembled.release.0);
         let marker = folder.join(".orbital-built");
         if marker.is_file() {
             return Ok(folder);
@@ -1207,21 +1276,24 @@ impl Layer {
         self.sources
             .export(instance, &assembled.commit, &folder)
             .map_err(internal)?;
+        let cache = self.cache_folder(instance);
         for service in &assembled.manifest.get().services {
             let log = self.log(
                 instance,
                 &assembled.release,
                 &format!("build-{}", service.name),
             );
+            // 도구의 캐시(npm 의 `~/.npm` 같은 것)는 인스턴스마다 따로 둔다. 다른 인스턴스의 빌드가 건드리지 못하게 나누지 않는다
             let job = Job {
                 folder: &folder,
                 command: &service.build,
                 env: &[],
                 log: &log,
+                home: Some(&cache),
             };
             self.runner.build(&job).map_err(|_| Failure::BuildFailed {
                 service: service.name.to_string(),
-                log: tail(&log),
+                log: tail(&log, &self.home, 40),
             })?;
         }
         fs::write(&marker, assembled.commit.as_str())
@@ -1376,7 +1448,7 @@ impl Layer {
                 let port = free_port().ok_or_else(|| internal("빈 포트를 찾지 못했습니다"))?;
                 let process = starter.start(port).map_err(|_| Failure::StartFailed {
                     service: service.name.to_string(),
-                    log: tail(&log),
+                    log: tail(&log, &self.home, 40),
                 })?;
                 server.adopt(process, port);
             }
@@ -1534,7 +1606,25 @@ impl Layer {
 
     /// commit 하나의 프리뷰를 세운다. 그 commit 에서 직접 빌드하고, 씨앗 데이터만 든 DB 를 새로 만들어 역할과 권한을 세우고, 권한 검사를 돌린다.
     pub fn preview(&self, instance: &InstanceId, commit: Option<Commit>) -> Outcome<PreviewReport> {
+        if !self
+            .lock()
+            .registry
+            .state
+            .instances
+            .contains_key(instance.as_str())
+        {
+            return Err(Failure::NotFound);
+        }
+        let commit = match commit {
+            Some(commit) => commit,
+            None => self.sources.head(instance).map_err(internal)?,
+        };
+        let assembled = self.assembled(instance, &commit)?;
+        // 빌드(npm ci 와 프레임워크의 빌드)는 분 단위로 걸린다. 레이어의 자물쇠를 쥐지 않고 돌려 다른 인스턴스의 일을 막지 않는다
+        let folder = self.build(instance, &assembled)?;
+
         let mut inner = self.lock();
+        // 빌드하는 동안 인스턴스가 지워졌거나 운영이 바뀌었을 수 있다. 기록은 자물쇠를 쥔 뒤에 다시 읽는다
         let record = inner
             .registry
             .state
@@ -1542,12 +1632,6 @@ impl Layer {
             .get(instance.as_str())
             .cloned()
             .ok_or(Failure::NotFound)?;
-        let commit = match commit {
-            Some(commit) => commit,
-            None => self.sources.head(instance).map_err(internal)?,
-        };
-        let assembled = self.assembled(instance, &commit)?;
-        let folder = self.build(instance, &assembled)?;
 
         // 앞의 프리뷰를 걷는다. 인스턴스마다 프리뷰는 하나다
         if let Some(old) = inner
@@ -1716,6 +1800,7 @@ impl Layer {
                 _router: launched.router,
             },
         );
+        self.prune_builds(&inner, instance);
         Ok(report)
     }
 
@@ -2143,6 +2228,7 @@ impl Layer {
                 _router: launched.router,
             },
         );
+        self.prune_builds(&inner, instance);
         Ok(report)
     }
 
@@ -2514,6 +2600,18 @@ impl Layer {
             .map_err(internal)?;
         self.sources.destroy(instance).map_err(internal)?;
         self.vault.forget(instance).map_err(vault_failure)?;
+        // 빌드 폴더(node_modules 가 든다) · 빌드의 캐시 · 기록도 걷는다. 남겨 두면 지운 인스턴스의 것이 디스크에 쌓인다
+        for folder in [
+            self.builds_folder(instance),
+            self.cache_folder(instance),
+            self.home.join("logs").join(instance.as_str()),
+            self.home.join("conformance").join(instance.as_str()),
+        ] {
+            if folder.exists() {
+                fs::remove_dir_all(&folder)
+                    .map_err(|_| internal("인스턴스의 빌드 폴더를 걷지 못했습니다"))?;
+            }
+        }
         inner.registry.state.instances.remove(instance.as_str());
         inner.registry.save().map_err(Failure::Internal)
     }

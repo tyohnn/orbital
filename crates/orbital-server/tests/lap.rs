@@ -1040,3 +1040,185 @@ fn 올리지_않은_commit_과_모르는_release_로는_아무것도_서지_않�
         409
     );
 }
+
+#[test]
+fn 빌드는_인스턴스마다의_홈에서_돌고_다른_인스턴스와_캐시의_자리를_나누지_않는다() {
+    let mut bench = bench!();
+    let home = bench.scratch.path("home");
+    let mut seen = Vec::new();
+    for name in ["a", "b"] {
+        let instance = bench.instance();
+        let token = bench.token(&instance, &ALL);
+        // 빌드 명령이 받은 홈을 적게 한다
+        let work = bench.clone(&instance, &token, &format!("home-{name}"));
+        let manifest = fs::read_to_string(work.join("orbital.toml"))
+            .unwrap()
+            .replace(
+                "build = \"node --check server.js\"",
+                "build = \"node --check server.js && echo \\\"$HOME\\\" > build-home.txt\"",
+            );
+        fs::write(work.join("orbital.toml"), manifest).unwrap();
+        assert_eq!(bench.push(&instance, &token, &work, "홈을 적는다").0, 200);
+        let (status, preview) = bench.preview(&instance, &token);
+        assert_eq!(status, 200, "{preview}");
+        let release = preview["release"].as_str().unwrap();
+        let built = home.join("builds").join(&instance).join(release);
+        let build_home = fs::read_to_string(built.join("build-home.txt")).unwrap();
+        seen.push((instance, PathBuf::from(build_home.trim()), built));
+    }
+    let [(a, a_home, a_built), (b, b_home, b_built)] = <[_; 2]>::try_from(seen).unwrap();
+    assert_eq!(a_home, home.join("caches").join(&a));
+    assert_eq!(b_home, home.join("caches").join(&b));
+    // 캐시는 빌드 폴더 밖이다. 서버로 뜨는 폴더에 빌드의 캐시가 실리지 않는다
+    for (cache, built) in [(&a_home, &a_built), (&b_home, &b_built)] {
+        assert!(!cache.starts_with(built) && !built.starts_with(cache));
+    }
+    assert!(!a_home.starts_with(&b_home) && !b_home.starts_with(&a_home));
+}
+
+#[test]
+fn 인스턴스를_지우면_빌드_폴더와_빌드의_캐시와_기록도_걷는다() {
+    let mut bench = bench!();
+    let instance = bench.instance();
+    let token = bench.token(&instance, &ALL);
+    assert_eq!(bench.preview(&instance, &token).0, 200);
+    let home = bench.scratch.path("home");
+    let left = |instance: &str| -> Vec<PathBuf> {
+        ["builds", "caches", "logs"]
+            .iter()
+            .map(|place| home.join(place).join(instance))
+            .filter(|folder| folder.exists())
+            .collect()
+    };
+    assert_eq!(left(&instance).len(), 3, "프리뷰가 세 자리를 모두 만든다");
+    let (status, body) = bench.call(
+        "DELETE",
+        &format!("/v1/instances/{instance}"),
+        Some(FACTORY),
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    bench.instances.retain(|known| *known != instance);
+    assert_eq!(left(&instance), Vec::<PathBuf>::new());
+}
+
+#[test]
+fn 프리뷰를_새로_세우면_프리뷰와_운영에_떠_있지_않은_release_의_빌드_폴더를_걷는다() {
+    let mut bench = bench!();
+    let instance = bench.instance();
+    let token = bench.token(&instance, &ALL);
+    let builds = bench.scratch.path("home").join("builds").join(&instance);
+    let releases = || -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&builds)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let sorted = |mut list: Vec<String>| {
+        list.sort();
+        list
+    };
+    let release = |preview: &Value| preview["release"].as_str().unwrap().to_owned();
+    let (_, first) = bench.preview(&instance, &token);
+    let work = bench.clone(&instance, &token, "prune");
+    let next = |message: &str| {
+        fs::write(work.join("note.txt"), message).unwrap();
+        assert_eq!(bench.push(&instance, &token, &work, message).0, 200);
+        let (status, preview) = bench.preview(&instance, &token);
+        assert_eq!(status, 200, "{preview}");
+        preview
+    };
+    // 운영이 없으면 떠 있는 프리뷰의 것만 남는다
+    let second = next("둘째");
+    assert_eq!(releases(), vec![release(&second)]);
+    assert_ne!(release(&first), release(&second));
+    // 운영에 오른 release 의 폴더는 운영이 쓰므로 남는다
+    assert_eq!(
+        bench
+            .post(
+                &format!("/v1/instances/{instance}/promotion-requests"),
+                &token,
+                json!({ "release": release(&second) })
+            )
+            .0,
+        200
+    );
+    assert_eq!(
+        bench.promote(&instance, &release(&second), "customer").0,
+        200
+    );
+    let third = next("셋째");
+    let fourth = next("넷째");
+    assert_eq!(releases(), sorted(vec![release(&second), release(&fourth)]));
+    assert_ne!(release(&third), release(&fourth));
+}
+
+#[test]
+fn 한_인스턴스의_빌드가_도는_동안에도_다른_요청은_빌드를_기다리지_않는다() {
+    let mut bench = bench!();
+    let slow = bench.instance();
+    let other = bench.instance();
+    let token = bench.token(&slow, &ALL);
+    // 빌드가 4초 걸리는 commit 을 올린다(npm ci 와 프레임워크의 빌드를 흉내 낸다)
+    let work = bench.clone(&slow, &token, "slow");
+    let manifest = fs::read_to_string(work.join("orbital.toml"))
+        .unwrap()
+        .replace(
+            "build = \"node --check server.js\"",
+            "build = \"sleep 4 && node --check server.js\"",
+        );
+    fs::write(work.join("orbital.toml"), manifest).unwrap();
+    assert_eq!(bench.push(&slow, &token, &work, "느린 빌드").0, 200);
+    let bench = &bench;
+    std::thread::scope(|scope| {
+        let building = scope.spawn(|| bench.preview(&slow, &token));
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        // 다른 인스턴스의 일과 레이어 전체의 일이 빌드가 끝나기를 기다리지 않는다
+        let started = std::time::Instant::now();
+        let other_token = bench.token(&other, &ALL);
+        let (status, _) = bench.call(
+            "GET",
+            &format!("/v1/instances/{other}/secrets"),
+            Some(&other_token),
+            &[],
+        );
+        assert_eq!(status, 200);
+        let waited = started.elapsed();
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "빌드가 도는 동안 {waited:?} 기다렸습니다"
+        );
+        let (status, preview) = building.join().unwrap();
+        assert_eq!(status, 200, "{preview}");
+    });
+}
+
+#[test]
+fn 빌드가_실패하면_로그의_끝을_돌려주되_레이어의_폴더_경로는_가린다() {
+    let mut bench = bench!();
+    let instance = bench.instance();
+    let token = bench.token(&instance, &ALL);
+    let work = bench.clone(&instance, &token, "broken");
+    // npm 의 오류처럼 홈과 작업 폴더의 경로를 찍고 실패한다
+    let manifest = fs::read_to_string(work.join("orbital.toml"))
+        .unwrap()
+        .replace(
+            "build = \"node --check server.js\"",
+            "build = \"echo 홈은 $HOME && echo 폴더는 $(pwd) && exit 3\"",
+        );
+    fs::write(work.join("orbital.toml"), manifest).unwrap();
+    assert_eq!(bench.push(&instance, &token, &work, "깨진 빌드").0, 200);
+    let (status, body) = bench.preview(&instance, &token);
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (422, Some("build_failed"))
+    );
+    let log = body["details"][0].as_str().unwrap();
+    assert!(log.contains("홈은") && log.contains("폴더는"), "{log}");
+    let home = fs::canonicalize(bench.scratch.path("home")).unwrap();
+    for hidden in [bench.scratch.path("home"), home] {
+        assert!(!log.contains(&hidden.display().to_string()), "{log}");
+    }
+}

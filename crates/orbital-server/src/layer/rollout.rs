@@ -147,8 +147,9 @@ fn wave_text(problem: &WaveProblem) -> String {
 }
 
 /// 출력의 끝부분. 글자의 경계에서 자른다.
-fn output_tail(log: &Path) -> String {
-    let text = fs::read_to_string(log).unwrap_or_default();
+fn output_tail(log: &Path, home: &Path) -> String {
+    // 레이어의 폴더 경로는 가린다(빌드의 로그와 같다)
+    let text = super::masked(&fs::read_to_string(log).unwrap_or_default(), home);
     let count = text.chars().count();
     text.chars()
         .skip(count.saturating_sub(OUTPUT_LIMIT))
@@ -243,7 +244,7 @@ impl Layer {
             passed: outcome == Conformed::Passed,
             outcome,
             millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            output: output_tail(&log),
+            output: output_tail(&log, &self.home),
             upstream: upstream.to_string(),
         })
     }
@@ -279,6 +280,7 @@ impl Layer {
             command: run,
             env: &env,
             log,
+            home: None,
         };
         match self.runner.check(&job, self.conformance_timeout) {
             Ok(()) => Conformed::Passed,

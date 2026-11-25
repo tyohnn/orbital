@@ -26,6 +26,10 @@
 //! - `ORBITAL_DRILL_EVERY`: 복구 훈련을 돌리는 주기(초, 기본 604800 = 7일). 결과는 `ORBITAL_HOME/drills.jsonl` 에 쌓는다
 //! - `ORBITAL_REQUIRE_DRILL`: `1` 이면 마지막으로 통과한 훈련이 여드레를 넘겼거나 한 번도 통과하지 않은 동안 새 인스턴스를 받지 않는다.
 //!   이미 선 인스턴스의 프리뷰와 승격은 막지 않는다
+//! - `ORBITAL_BUILD_ENV`: 빌드에만 건넬 환경 변수의 이름을 쉼표로 가른 것(`HTTPS_PROXY,NODE_EXTRA_CA_CERTS,npm_config_registry` 같은 것).
+//!   값은 이 프로세스의 환경에서 읽는다. 빌드는 그 밖의 환경을 받지 못해 레지스트리에 닿으려면 프록시와 CA 묶음을 여기에 적는다.
+//!   빌드는 에이전트가 쓴 코드를 돌리므로 여기에 적은 값은 그 코드가 읽는다. `ORBITAL_` · `PG` 로 시작하는 이름과 `PATH` · `HOME` 은 받지 않는다.
+//!   서버를 띄울 때와 적합성 테스트에는 건네지 않는다
 //!
 //! `orbitald drill` 은 복구 훈련을 한 번만 돌리고 끝난다. 관리 서버가 떠 있어도 함께 돌 수 있다(`ORBITAL_HOME` · `ORBITAL_PG` ·
 //! `ORBITAL_BACKUP_DIR` 만 읽는다). 훈련이 실패하면 0 이 아닌 코드로 끝나고, 기록 한 줄(이름과 숫자만)을 찍는다.
@@ -176,6 +180,11 @@ fn start() -> Result<(), String> {
     let backup = backup_options()?;
     let backup_every = seconds("ORBITAL_BACKUP_EVERY", 24 * 60 * 60)?;
     let drill_every = seconds("ORBITAL_DRILL_EVERY", 7 * 24 * 60 * 60)?;
+    let build_env = orbital_run::build_env(
+        &std::env::var("ORBITAL_BUILD_ENV").unwrap_or_default(),
+        |name| std::env::var(name).ok(),
+    )
+    .map_err(|problem| format!("`ORBITAL_BUILD_ENV`: {problem}"))?;
     let tending = backup.is_some();
     let layer = Layer::open(Options {
         backup,
@@ -188,7 +197,10 @@ fn start() -> Result<(), String> {
             setting("ORBITAL_HOME")?.into(),
             setting("ORBITAL_PG")?,
             service_keys,
-            Box::new(LocalRunner::default()),
+            Box::new(LocalRunner {
+                build_env,
+                ..LocalRunner::default()
+            }),
         )
     })?;
     let server =

@@ -878,6 +878,12 @@ fn 적합성_테스트의_자리에는_위쪽의_폴더만_놓이고_포크의_�
         "{output}"
     );
     assert!(!output.contains("planted"), "{output}");
+    // 에이전트에게 가는 글이라 레이어의 폴더 경로(테스트의 홈이 그 아래에 있다)는 가린다
+    assert!(output.contains("<레이어>"), "{output}");
+    assert!(
+        !output.contains(&lab.home.display().to_string()),
+        "{output}"
+    );
 }
 
 #[test]
