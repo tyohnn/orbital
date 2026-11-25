@@ -149,6 +149,51 @@ export interface SecretEntry
     expiresAt: number;
 }
 
+/** 레이어의 마지막 복구 훈련. 숫자와 참 · 거짓만 있다. */
+export interface DrillSummary
+{
+    passed: boolean;
+    /** 훈련을 시작한 때(Unix 초). */
+    at: number;
+    /** 옆에 클러스터를 되살리는 데 걸린 시간(밀리초). */
+    recoveryMillis: number;
+    /** 훈련 전체에 걸린 시간(밀리초). */
+    drillMillis: number;
+    /** 잃을 수 있는 구간(초). 훈련을 시작한 때 − 마지막으로 보관된 WAL 의 시각. 보관된 것이 없었으면 `null` 이다. */
+    exposureSeconds: number | null;
+    /** 견준 인스턴스의 수. */
+    instances: number;
+    checks: number;
+    failedChecks: number;
+}
+
+/**
+ * 레이어의 백업과 복구 훈련의 모습. 마지막으로 통과한 훈련이 여드레 안이면 `fresh` 이다.
+ * 훈련이 통과한 뒤에만 새 고객의 데이터를 받는다. 이 규칙을 켠 레이어는 낡은 동안 새 인스턴스를 409 로 거절한다.
+ */
+export interface Backup
+{
+    fresh: boolean;
+    /** 마지막으로 통과한 훈련의 때(Unix 초). 한 번도 통과하지 않았으면 `null` 이다. */
+    lastPassedAt: number | null;
+    /** 마지막 훈련. 돈 적이 없으면 `null` 이다. */
+    lastDrill: DrillSummary | null;
+}
+
+/** 인스턴스 하나를 지난 시점으로 되살린 결과. 이름과 숫자만 있다. */
+export interface Restored
+{
+    instance: string;
+    /** 되살린 시점(Unix 초). */
+    at: number;
+    /** 걸린 시간(밀리초). 그동안 그 인스턴스의 서버는 내려가 있다. */
+    millis: number;
+    /** 되살린 DB 의 표의 수. */
+    tables: number;
+    /** 되살리기 직전의 운영 DB 를 떠 둔 되돌릴 지점(database 의 이름). */
+    restorePoint: string;
+}
+
 /** 관리 서버가 받지 않은 요청. `code` 로 갈라 다루고 `message` 와 `details` 는 사람과 에이전트에게 보여 준다. */
 export class OrbitalError extends Error
 {
@@ -213,6 +258,15 @@ export interface Orbital
         create(input: { app: string; from: string }): Promise<{ id: string }>;
         /** 인스턴스를 걷는다. DB 와 코드 저장소가 지워지고 되돌릴 수 없다. */
         destroy(instance: string): Promise<void>;
+        /**
+         * 운영 중인 인스턴스의 DB 를 지난 시점(Unix 초)으로 되살린다. 코드(release)와 비밀은 그대로다.
+         * 되살리기 직전의 DB 는 되돌릴 지점으로 남는다. 그 시점을 덮는 기반 백업이 없거나 보관한 WAL 이 닿지 않으면 409 다.
+         */
+        restore(instance: string, input: { at: number }): Promise<Restored>;
+    };
+    backup: {
+        /** 레이어의 복구 훈련이 통과했는지와 숫자. */
+        get(): Promise<Backup>;
     };
     sessions: {
         /** 에이전트의 작업을 열 때: 팩토리가 판정한 범위로 토큰을 받는다. */
@@ -300,6 +354,11 @@ function isRecord(value: unknown): value is Record<string, unknown>
 function text(value: unknown): string
 {
     return typeof value === "string" ? value : "";
+}
+
+function number(value: unknown): number
+{
+    return typeof value === "number" ? value : 0;
 }
 
 function texts(value: unknown): string[]
@@ -455,6 +514,42 @@ export function createOrbital(options: OrbitalOptions): Orbital
             async destroy(instance)
             {
                 await call("DELETE", at(instance, ""));
+            },
+            async restore(instance, { at: moment })
+            {
+                const reply = await call("POST", at(instance, "/restore"), { at: moment });
+                const record = isRecord(reply) ? reply : {};
+                return {
+                    instance: text(record.instance),
+                    at: number(record.at),
+                    millis: number(record.millis),
+                    tables: number(record.tables),
+                    restorePoint: text(record.restore_point),
+                };
+            },
+        },
+        backup: {
+            async get()
+            {
+                const reply = await call("GET", "backup");
+                const record = isRecord(reply) ? reply : {};
+                const last = isRecord(record.last_drill) ? record.last_drill : null;
+                return {
+                    fresh: record.fresh === true,
+                    lastPassedAt: typeof record.last_passed_at === "number" ? record.last_passed_at : null,
+                    lastDrill: last === null
+                        ? null
+                        : {
+                            passed: last.passed === true,
+                            at: number(last.at),
+                            recoveryMillis: number(last.recovery_millis),
+                            drillMillis: number(last.drill_millis),
+                            exposureSeconds: typeof last.exposure_seconds === "number" ? last.exposure_seconds : null,
+                            instances: number(last.instances),
+                            checks: number(last.checks),
+                            failedChecks: number(last.failed_checks),
+                        },
+                };
             },
         },
         sessions: {
