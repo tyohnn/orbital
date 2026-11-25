@@ -502,9 +502,9 @@ fn 지문에는_이름과_숫자만_있고_행의_값이_없다() {
 fn 백업의_묶음에는_봉인의_열쇠와_service_key_가_들어가지_않는다() {
     let bench = bench!();
     let home = bench.home();
-    let seal_key = "seal_key_Zt71pQ0xv";
-    let service_key = "sk_live_service_Rm40aC9w";
-    let token_key = "token_key_Lj29dE8u";
+    let seal_key = "not-a-real-seal-key";
+    let service_key = "not-a-real-service-key";
+    let token_key = "not-a-real-token-key";
     fs::write(home.join("registry.json"), r#"{"instances":{}}"#).unwrap();
     fs::write(home.join("settings.json"), r#"{"sealed":"AAAA"}"#).unwrap();
     fs::write(home.join("vault.json"), r#"{"sealed":"BBBB"}"#).unwrap();
