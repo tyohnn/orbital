@@ -1,6 +1,8 @@
 //! HTTP API. CLI(에이전트)와 SDK(팩토리의 서버)가 모두 이것을 부른다.
 //!
 //! 요청마다 `Authorization: Bearer …` 를 본다. `orb1.` 로 시작하면 에이전트의 토큰이고, 아니면 팩토리의 service key 다.
+//! `/v1/admin/…` 은 운영자 키(`ORBITAL_ADMIN_KEY`)만 받는다. 조직을 만들고 첫 키를 내며, 대시보드가 가입을 받을 때 부른다.
+//! 팩토리는 제 service key 로 `/v1/keys` 에서 키를 보고 · 만들고 · 폐기한다.
 //! 토큰으로 되는 일과 service key 로 되는 일은 길이 다르다. 운영을 바꾸는 길은 service key 쪽에만 있다.
 //! 열쇠 없이 오는 길은 Google 의 콜백(`GET /v1/auth/google/callback`) 하나다. 무엇을 할지는 레이어가 서명한 `state` 가 정한다.
 //! 팩토리의 로그인 설정(`/v1/settings/auth`)은 service key 에만 있고, 넣은 비밀은 어떤 답에도 싣지 않는다.
@@ -215,6 +217,62 @@ fn entry(layer: &Layer, method: &str, ticket: &str, body: &[u8]) -> Reply {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewOrganization {
+    id: String,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct NewKey {
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// 빈 본문은 기본값으로 읽는다(`POST /v1/keys` 는 이름 없이 불러도 된다).
+fn parse_or_default<'a, T: Deserialize<'a> + Default>(body: &'a [u8]) -> Result<T, Failure> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(T::default());
+    }
+    parse(body)
+}
+
+fn created(value: Value) -> Reply {
+    Reply {
+        status: 201,
+        ..ok(value)
+    }
+}
+
+/// 운영자 키로 하는 일. 조직을 만들고, 키를 모두 잃은 조직을 되살린다. 살아 있는 조직의 인스턴스에는 닿지 않는다.
+fn with_operator(
+    layer: &Layer,
+    method: &str,
+    path: &[&str],
+    body: &[u8],
+) -> Result<Reply, Failure> {
+    match (method, path) {
+        ("POST", ["organizations"]) => {
+            let request: NewOrganization = parse(body)?;
+            let (organization, key) = layer.create_organization(&request.id, request.label)?;
+            Ok(created(json!({ "organization": organization, "key": key })))
+        }
+        ("POST", ["organizations", organization, "keys"]) => {
+            let request: NewKey = parse_or_default(body)?;
+            Ok(created(json!(
+                layer.operator_issue_key(organization, request.label)?
+            )))
+        }
+        ("POST", ["organizations", organization, "reset-keys"]) => {
+            Ok(created(json!(layer.operator_reset_keys(organization)?)))
+        }
+        _ => Err(Failure::NotFound),
+    }
+}
+
+#[derive(Deserialize)]
 struct NewInstance {
     app: String,
     version: String,
@@ -386,6 +444,15 @@ fn with_service_key(
 ) -> Result<Reply, Failure> {
     let organization = layer.organization(key)?;
     match (method, path) {
+        // 제 조직의 키. 목록에는 비밀이 없고, 만든 키의 비밀은 이 답에서 한 번만 보인다
+        ("GET", ["keys"]) => Ok(ok(json!({ "keys": layer.keys(&organization) }))),
+        ("POST", ["keys"]) => {
+            let request: NewKey = parse_or_default(body)?;
+            Ok(created(json!(
+                layer.create_key(&organization, request.label)?
+            )))
+        }
+        ("POST", ["keys", id, "revoke"]) => Ok(ok(json!(layer.revoke_key(&organization, id)?))),
         // 팩토리마다 한 벌. 비밀은 답에 싣지 않는다
         ("GET", ["settings", "auth"]) => Ok(ok(layer.auth_settings(&organization))),
         ("PUT", ["settings", "auth"]) => {
@@ -572,7 +639,12 @@ pub fn handle(layer: &Layer, method: &str, path: &str, bearer: Option<&str>, bod
     let Some(bearer) = bearer else {
         return failure(Failure::Unauthorized);
     };
-    let result = if bearer.starts_with("orb1.") {
+    let result = if let ["admin", tail @ ..] = rest {
+        // 운영자 키가 아니면(service key · 토큰이어도) 이 길은 없다
+        layer
+            .operator(bearer)
+            .and_then(|()| with_operator(layer, method, tail, body))
+    } else if bearer.starts_with("orb1.") {
         match rest {
             ["instances", tail @ ..] => with_token(layer, method, tail, bearer, body),
             // rollout 을 만들고 · 합치고 · 다시 열고 · 거두는 길을 토큰으로 두드리면 core 가 「service key 로만」이라고 답한다

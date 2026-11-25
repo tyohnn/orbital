@@ -3,7 +3,9 @@
 //! 설정은 환경 변수로 받는다.
 //! - `ORBITAL_HOME`: 레이어가 저장소 · 빌드 · 기록을 두는 폴더
 //! - `ORBITAL_PG`: DB 의 관리 주소
-//! - `ORBITAL_SERVICE_KEYS`: `조직=열쇠,조직=열쇠`. 팩토리의 서버가 쓰는 service key
+//! - `ORBITAL_SERVICE_KEYS`: `조직=열쇠,조직=열쇠`. 부트스트랩의 service key. 조직이 API 로 만든 키는 기록에 있다
+//! - `ORBITAL_ADMIN_KEY`: 운영자 키(32바이트 이상). 조직을 만들고 첫 키를 낸다(`/v1/admin/…`). 대시보드가 가입을 받을 때 쓴다.
+//!   `ORBITAL_SERVICE_KEYS` 와 이것 가운데 하나는 있어야 한다
 //! - `ORBITAL_LISTEN`: 듣는 주소(기본 `127.0.0.1:7400`)
 //! - `ORBITAL_PUBLIC_URL`: 레이어의 바깥 주소(기본 `http://<ORBITAL_LISTEN>`). Google 의 콜백이 `<바깥 주소>/v1/auth/google/callback` 에 서고,
 //!   팩토리는 이 주소 하나를 Google 콘솔에 등록한다
@@ -117,13 +119,22 @@ fn drill_once() -> Result<bool, String> {
 }
 
 fn start() -> Result<(), String> {
-    let service_keys = setting("ORBITAL_SERVICE_KEYS")?
+    let admin_key = std::env::var("ORBITAL_ADMIN_KEY").ok();
+    if admin_key.as_ref().is_some_and(|key| key.len() < 32) {
+        return Err(
+            "`ORBITAL_ADMIN_KEY` 는 32바이트 이상이어야 합니다. `openssl rand -hex 32` 로 만들어 주세요".to_owned(),
+        );
+    }
+    let service_keys = std::env::var("ORBITAL_SERVICE_KEYS")
+        .unwrap_or_default()
         .split(',')
         .filter_map(|pair| pair.split_once('='))
         .map(|(organization, key)| (key.trim().to_owned(), organization.trim().to_owned()))
         .collect::<Vec<_>>();
-    if service_keys.is_empty() {
-        return Err("`ORBITAL_SERVICE_KEYS` 를 `조직=열쇠` 모양으로 적어 주세요".to_owned());
+    if service_keys.is_empty() && admin_key.is_none() {
+        return Err(
+            "`ORBITAL_SERVICE_KEYS` 를 `조직=열쇠` 모양으로 적거나 `ORBITAL_ADMIN_KEY` 를 적어 주세요".to_owned(),
+        );
     }
     let listen = std::env::var("ORBITAL_LISTEN").unwrap_or_else(|_| "127.0.0.1:7400".to_owned());
     let seal_key = match std::env::var("ORBITAL_SEAL_KEY") {
@@ -178,6 +189,7 @@ fn start() -> Result<(), String> {
     let drill_every = seconds("ORBITAL_DRILL_EVERY", 7 * 24 * 60 * 60)?;
     let tending = backup.is_some();
     let layer = Layer::open(Options {
+        admin_key,
         backup,
         seal_key,
         public_url,
