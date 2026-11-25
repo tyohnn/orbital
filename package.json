@@ -6,7 +6,8 @@
         "node": ">=26"
     },
     "workspaces": [
-        "sdk/typescript"
+        "sdk/typescript",
+        "examples/factory-todo"
     ],
     "scripts": {
         "check:layers": "node scripts/check-layers.mjs",
@@ -14,6 +15,7 @@
         "check": "npm run check:layers && npm run check:claude-md",
         "typecheck": "npm run typecheck --workspaces --if-present",
         "test:sdk": "cargo build -p orbital-server -p orbital-cli && npm test -w @harmony/orbital",
-        "pr:check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && npm run check && npm run typecheck && npm run test:sdk"
+        "pr:check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && npm run check && npm run typecheck && npm run test:sdk && npm run test:factory",
+        "test:factory": "cargo build -p orbital-server -p orbital-cli && npm test -w @harmony/factory-todo"
     }
 }
