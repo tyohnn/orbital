@@ -566,6 +566,112 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
 }
 
 #[test]
+fn 운영에서만_뜨지_않는_release_는_앞의_release_와_앞의_db_로_돌아간다() {
+    let mut bench = bench!();
+    let instance = bench.instance();
+    let token = bench.token(&instance, &ALL);
+    let path = |tail: &str| format!("/v1/instances/{instance}/{tail}");
+    // 미리보기 → (예행연습) → 승격 요청 → 승인받은 승격
+    let ship = |bench: &Bench| -> (String, u16, Value) {
+        let (status, preview) = bench.preview(&instance, &token);
+        assert_eq!(status, 200, "{preview}");
+        let release = preview["release"].as_str().unwrap().to_owned();
+        let (status, rehearsal) =
+            bench.post(&path("rehearsals"), &token, json!({ "release": release }));
+        assert_eq!(status, 200, "{rehearsal}");
+        let (status, body) = bench.post(
+            &path("promotion-requests"),
+            &token,
+            json!({ "release": release }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = bench.promote(&instance, &release, "customer");
+        (release, status, body)
+    };
+
+    // 첫 release 가 운영에 서고 사람이 카드를 하나 적는다
+    let (first, status, production) = ship(&bench);
+    assert_eq!(status, 200, "{production}");
+    let (_, identity) = bench.post(
+        &path("production/identities"),
+        FACTORY,
+        json!({ "subject": "u9" }),
+    );
+    let u9 = identity["identity"].as_str().unwrap().to_owned();
+    assert_eq!(
+        app(
+            "POST",
+            &format!("{}/cards", url(&production)),
+            Some(&u9),
+            "남을 일"
+        )
+        .0,
+        201
+    );
+
+    // 열을 더하는 마이그레이션과, 운영에서만 뜨지 않는 서버를 올린다
+    let work = bench.clone(&instance, &token, "work");
+    fs::write(
+        work.join("db/migrations/002_done.sql"),
+        "ALTER TABLE todo.card ADD COLUMN done boolean NOT NULL DEFAULT false;\n",
+    )
+    .unwrap();
+    let original = fs::read_to_string(work.join("server.js")).unwrap();
+    let broken = format!(
+        "if (process.env.ORBITAL_STAGE === \"production\") process.exit(1);\n{}",
+        original.replace("version: 1", "version: 2")
+    );
+    fs::write(work.join("server.js"), broken).unwrap();
+    assert_eq!(
+        bench
+            .push(&instance, &token, &work, "운영에서 뜨지 않는다")
+            .0,
+        200
+    );
+    // 미리보기와 예행연습은 통과한다. 깨지는 것은 운영에 올린 뒤다
+    let (second, status, body) = ship(&bench);
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (422, Some("start_failed")),
+        "{body}"
+    );
+
+    // 운영은 앞의 release 로 돌고, 앞의 데이터가 그대로 있다
+    let (_, production) = bench.call("GET", &path("production"), Some(FACTORY), &[]);
+    assert_eq!(production["release"], first);
+    assert_ne!(first, second);
+    let live = url(&production);
+    assert_eq!(
+        app("GET", &format!("{live}/health"), None, "").1["version"],
+        1
+    );
+    assert_eq!(
+        titles(&app("GET", &format!("{live}/cards"), Some(&u9), "").1),
+        vec!["남을 일"]
+    );
+
+    // 고쳐서 다시 올리면 같은 마이그레이션이 다시 돈다. 실패한 승격이 돌린 것이 DB 에 남지 않았다
+    fs::write(
+        work.join("server.js"),
+        original.replace("version: 1", "version: 3"),
+    )
+    .unwrap();
+    assert_eq!(bench.push(&instance, &token, &work, "고친다").0, 200);
+    let (_, status, production) = ship(&bench);
+    assert_eq!(status, 200, "{production}");
+    assert_eq!(production["migrations"], json!(["002_done.sql"]));
+    let live = url(&production);
+    assert_eq!(
+        app("GET", &format!("{live}/health"), None, "").1["version"],
+        3
+    );
+    assert_eq!(
+        titles(&app("GET", &format!("{live}/cards"), Some(&u9), "").1),
+        vec!["남을 일"]
+    );
+}
+
+#[test]
 fn 토큰은_발급받은_인스턴스에서_받은_능력만큼만_쓴다() {
     let mut bench = bench!();
     let ours = bench.instance();
