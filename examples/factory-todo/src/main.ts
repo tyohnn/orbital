@@ -4,7 +4,7 @@
 //
 // | 환경 변수 | 무엇 |
 // |---|---|
-// | `ORBITAL_URL` | 레이어(`orbitald`)의 주소. 에이전트도 이 주소로 붙는다 |
+// | `ORBITAL_URL` | 레이어(`orbitald`)의 주소. 이 서버만 붙는다. 에이전트에게는 알리지 않는다 |
 // | `ORBITAL_SERVICE_KEY` | 팩토리의 service key. 이 프로세스 밖으로 나가지 않는다 |
 // | `ORBITAL_PUBLIC_URL` | 레이어의 바깥 주소(레이어의 `ORBITAL_PUBLIC_URL` 과 같은 것). 비밀 입력 카드가 값을 이리로 바로 보낸다. 기본 `ORBITAL_URL` |
 // | `FACTORY_PORT` | 듣는 포트. 기본 3840 |
@@ -22,6 +22,7 @@ import { createOAuth } from "./oauth.ts";
 import { bundleScaffold } from "./scaffold.ts";
 import { serve } from "./server.ts";
 import { createFactory } from "./tools.ts";
+import { createWorks } from "./works.ts";
 
 const APP = "todo";
 const VERSION = "v1";
@@ -67,9 +68,10 @@ for (let attempt = 0; ; attempt += 1)
 }
 log(`[factory-todo] 스캐폴드 ${APP} ${VERSION} 를 올렸습니다`);
 
-const factory = createFactory({ orbital, layerUrl, customers: openCustomers(home), app: APP, version: VERSION, log });
+const works = createWorks(orbital);
+const factory = createFactory({ orbital, customers: openCustomers(home), works, origin, app: APP, version: VERSION, log });
 const layerOrigin = new URL(process.env.ORBITAL_PUBLIC_URL ?? layerUrl).origin;
-const server = serve({ factory, oauth: createOAuth(origin), layerOrigin }, origin);
+const server = serve({ factory, oauth: createOAuth(origin), works, layerOrigin }, origin);
 server.listen(port, "127.0.0.1", () => log(`[factory-todo] ${origin}/mcp`));
 
 const stop = (): void =>

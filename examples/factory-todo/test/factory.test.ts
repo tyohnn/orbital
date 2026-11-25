@@ -1,13 +1,13 @@
 // 팩토리 서버를 플랫폼이 하듯이 부른다. 실제 `orbitald` 와 PostgreSQL 에 붙고, 모델은 부르지 않는다.
 //
 // - 플랫폼(하모니)처럼: OAuth 로 계정을 연결하고(SDK 의 발견 · 등록 · 인가), MCP client 로 도구를 부른다.
-// - 에이전트처럼: 도구가 준 주소 · 인스턴스 · 토큰만 들고 `orbital` CLI 를 실제로 돌린다.
-// - 팩토리와 레이어 사이에 기록하는 중계를 두어, 팩토리가 service key 로 무엇을 보냈는지 본다.
+// - 에이전트처럼: 도구가 준 git 원격과 자격만 들고 실제 `git` 을 돌린다. 레이어의 주소도 토큰도 받지 않는다.
+// - 팩토리와 레이어 사이에 기록하는 중계를 두어, 팩토리가 무엇을 보냈는지(service key 와 작업의 토큰) 본다.
 //
 // `ORBITAL_PG` 가 없으면 레이어가 필요한 테스트는 건너뛰었다고 찍고 통과한다. 실행 파일은 `cargo build` 가 만든 것을 쓴다(`npm run test:factory` 가 먼저 빌드한다).
 
 import assert from "node:assert/strict";
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
@@ -32,11 +32,12 @@ import {
 import type { CallToolResult } from "@modelcontextprotocol/client";
 
 import { createOrbital } from "@harmony/orbital/server";
-import type { Orbital } from "@harmony/orbital/server";
+import type { Orbital, Work } from "@harmony/orbital/server";
 
 import { CARD_META, ENTRY_META } from "../src/card.ts";
 import { packageFiles, zip } from "../src/pack.ts";
 import { CARD_URI, TOOLS } from "../src/tools.ts";
+import { AGENT_CAN, createWorks } from "../src/works.ts";
 
 const here = resolve(import.meta.dirname, "..");
 const root = resolve(here, "../..");
@@ -64,12 +65,16 @@ let origin = "";
 let orbital: Orbital;
 /** 팩토리가 service key 로 레이어에 보낸 요청 */
 const sent: { method: string; path: string; body: unknown }[] = [];
+/** 팩토리가 작업의 토큰으로 레이어에 보낸 요청과 그 토큰 */
+const workCalls: { method: string; path: string; token: string }[] = [];
 /** 플랫폼이 팩토리에게서 받은 답의 날것 */
 const received: string[] = [];
 /** 팩토리 프로세스의 표준 출력과 표준 오류 */
 let logs = "";
 /** 붙인 MCP client. 끝나면 닫는다 */
 const clients: Client[] = [];
+/** 도구를 부른 것과 그 답. 모델이 읽는 것이다 */
+const answers: { name: string; result: CallToolResult }[] = [];
 
 async function freePort(): Promise<number>
 {
@@ -80,59 +85,62 @@ async function freePort(): Promise<number>
     return port;
 }
 
-function git(folder: string, ...args: string[]): string
-{
-    return execFileSync(
-        "git",
-        ["-c", "user.name=agent", "-c", "user.email=agent@example.invalid", "-c", "commit.gpgsign=false", ...args],
-        { cwd: folder, encoding: "utf8" },
-    ).trim();
-}
-
 interface Workspace
 {
-    url: string;
-    instance: string;
-    token: string;
+    remote: string;
+    credential: string;
     expires_at: number;
 }
 
+const GIT_ENV = { PATH: process.env.PATH ?? "", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+
 /**
- * 에이전트의 sandbox 에는 작업을 연 답만 있다.
- * ⚠ 비동기로 부른다. CLI 는 이 프로세스 안의 중계로 붙으므로, 동기로 부르면 중계가 답하지 못해 서로 기다린다.
+ * 실제 `git`. 에이전트의 sandbox 에는 작업을 연 답(원격과 자격)만 있다. `credential` 을 주면 명령 한 번의 머리말로 건넨다.
+ * ⚠ 비동기로 부른다. git 은 팩토리를 거쳐 이 프로세스 안의 중계로 붙으므로, 동기로 부르면 중계가 답하지 못해 서로 기다린다.
  */
-async function agent(folder: string, workspace: Workspace, ...args: string[]): Promise<string>
+async function git(folder: string, credential: string | undefined, ...args: string[]): Promise<string>
 {
-    const { stdout } = await execFileAsync(bin("orbital"), args, {
-        cwd: folder,
-        encoding: "utf8",
-        env: { PATH: process.env.PATH ?? "", ORBITAL_URL: workspace.url, ORBITAL_INSTANCE: workspace.instance, ORBITAL_TOKEN: workspace.token },
-    });
-    return stdout;
+    const auth = credential === undefined ? [] : ["-c", `http.extraHeader=Authorization: Bearer ${credential}`];
+    try
+    {
+        const { stdout } = await execFileAsync(
+            "git",
+            ["-c", "user.name=agent", "-c", "user.email=agent@example.invalid", "-c", "commit.gpgsign=false", ...auth, ...args],
+            { cwd: folder, encoding: "utf8", env: GIT_ENV },
+        );
+        return stdout.trim();
+    }
+    catch (error)
+    {
+        const stderr = typeof error === "object" && error !== null && "stderr" in error ? String(error.stderr) : "";
+        throw new Error(`git ${args[0] ?? ""}: ${stderr}`);
+    }
 }
 
-function wordAfter(text: string, marker: string): string
+/** 에이전트가 작업을 열어 받은 원격으로 고쳐 올리고, 도구로 프리뷰를 세운 뒤 승격을 요청한다. 요청한 release 를 돌려준다 */
+async function shipChange(account: string, folder: string, edit: (source: string) => string, message: string): Promise<string>
 {
-    return text.split(marker)[1]?.trim().split(/\s+/)[0] ?? "";
-}
-
-/** 에이전트가 고쳐 올리고 프리뷰를 세운 뒤 승격을 요청한다. 요청한 release 를 돌려준다 */
-async function shipChange(workspace: Workspace, folder: string, edit: (source: string) => string, message: string): Promise<string>
-{
+    const client = await platform(await connect(account));
+    const workspace = structured<Workspace>(await call(client, "workspace_open"));
     const work = join(scratch, folder);
     try
     {
         readFileSync(join(work, "server.js"));
+        // 앞의 작업의 자격은 끝났을 수 있다. 원격을 새 작업의 것으로 바꾼다
+        await git(work, undefined, "remote", "set-url", "origin", workspace.remote);
     }
     catch
     {
-        await agent(scratch, workspace, "clone", folder);
+        await git(scratch, workspace.credential, "clone", "--quiet", workspace.remote, folder);
     }
     writeFileSync(join(work, "server.js"), edit(readFileSync(join(work, "server.js"), "utf8")));
-    git(work, "commit", "--quiet", "-am", message);
-    await agent(work, workspace, "push");
-    const release = wordAfter(await agent(work, workspace, "preview"), "release ");
-    await agent(work, workspace, "request-promotion", release);
+    await git(work, undefined, "commit", "--quiet", "-am", message);
+    await git(work, workspace.credential, "push", "--quiet", "origin", "main");
+    const shown = await call(client, "preview");
+    assert.equal(shown.isError, undefined, textOf(shown));
+    const { release } = structured<{ release: string }>(shown);
+    const requested = await call(client, "promotion_request", { release });
+    assert.equal(requested.isError, undefined, textOf(requested));
     return release;
 }
 
@@ -218,7 +226,9 @@ async function platform(token: string): Promise<Client>
 
 async function call(client: Client, name: string, args: Record<string, unknown> = {}): Promise<CallToolResult>
 {
-    return (await client.callTool({ name, arguments: args })) as CallToolResult;
+    const result = (await client.callTool({ name, arguments: args })) as CallToolResult;
+    answers.push({ name, result });
+    return result;
 }
 
 function structured<T>(result: CallToolResult): T
@@ -274,6 +284,9 @@ function tokenBody(token: string): { instance: string; can: string[]; expires_at
     return JSON.parse(Buffer.from(hex, "hex").toString("utf8")) as { instance: string; can: string[]; expires_at: number };
 }
 
+/** 모델이 부를 수 있는 도구. 승인하기와 입력 표를 내는 도구는 화면 전용이다 */
+const MODEL_TOOLS = ["preview", "preview_logs", "preview_sign_in", "production_status", "promotion_request", "promotion_show", "rehearse", "secret_request", "workspace_open"];
+
 before(async () =>
 {
     if (pg === undefined)
@@ -315,7 +328,7 @@ before(async () =>
             const body = Buffer.concat(chunks);
             through.push(body.toString("utf8"));
             const headers: Record<string, string> = {};
-            for (const name of ["authorization", "content-type"])
+            for (const name of ["authorization", "content-type", "content-encoding", "accept"])
             {
                 const value = request.headers[name];
                 if (typeof value === "string")
@@ -327,6 +340,10 @@ before(async () =>
             {
                 const json = headers["content-type"] === "application/json";
                 sent.push({ method: request.method ?? "", path: request.url ?? "", body: json ? JSON.parse(body.toString("utf8")) as unknown : null });
+            }
+            if (headers.authorization?.startsWith("Bearer orb1.") === true)
+            {
+                workCalls.push({ method: request.method ?? "", path: request.url ?? "", token: headers.authorization.slice("Bearer ".length) });
             }
             const method = request.method ?? "GET";
             fetch(`http://${listen}${request.url ?? "/"}`, { method, headers, ...(method === "GET" || method === "HEAD" ? {} : { body }) })
@@ -393,7 +410,10 @@ after(async () =>
 // 테스트는 차례로 돈다. 앞의 테스트가 세운 고객(alice · bob)을 뒤의 테스트가 이어 쓴다
 const workspaces = new Map<string, Workspace>();
 
-test("작업을 열면 고객의 인스턴스가 한 번만 서고, 다시 열면 같은 인스턴스의 새 토큰이 온다 — 고객마다 인스턴스는 하나다", { skip }, async () =>
+/** 그 고객의 인스턴스. 팩토리의 파일에서 읽는다(도구의 답에는 레이어의 식별자가 없다) */
+const instanceOf = (account: string): string => pairs()[account] ?? "";
+
+test("작업을 열면 고객의 인스턴스가 한 번만 서고, 다시 열면 같은 인스턴스에 새 자격이 온다 — 고객마다 인스턴스는 하나다", { skip }, async () =>
 {
     const created = (): number => sent.filter((each) => each.method === "POST" && each.path === "/v1/instances").length;
     const before = created();
@@ -403,94 +423,232 @@ test("작업을 열면 고객의 인스턴스가 한 번만 서고, 다시 열�
     const [first, second] = await Promise.all([call(alice, "workspace_open"), call(alice, "workspace_open")]);
     const one = structured<Workspace>(first);
     const two = structured<Workspace>(second);
-    assert.equal(two.instance, one.instance);
     assert.equal(created() - before, 1);
+    const instance = instanceOf("alice");
+    assert.match(instance, /^[a-z0-9]{8,12}$/);
 
-    // 다시 열면 같은 인스턴스의 새 토큰이다. 레이어의 토큰은 (인스턴스, 능력, 만료 초)만 서명해 같은 초에 낸 둘은 글자가 같으므로,
-    // 사람이 다시 여는 때처럼 다음 초로 넘어간 뒤에 연다
-    await new Promise((done) => setTimeout(done, 1000 - (Date.now() % 1000) + 50));
-    const sessions = (): number => sent.filter((each) => each.method === "POST" && each.path === `/v1/instances/${one.instance}/sessions`).length;
+    // 다시 열면 같은 인스턴스에 레이어의 작업이 새로 열리고, 새 원격과 새 자격이 온다
+    const sessions = (): number => sent.filter((each) => each.method === "POST" && each.path === `/v1/instances/${instance}/sessions`).length;
     const opened = sessions();
     const again = structured<Workspace>(await call(alice, "workspace_open"));
-    assert.equal(again.instance, one.instance);
     assert.equal(sessions() - opened, 1);
-    assert.notEqual(again.token, one.token);
-    assert.notEqual(again.token, two.token);
-    assert.ok(again.expires_at > Math.max(one.expires_at, two.expires_at), "새 토큰은 만료가 뒤로 밀려야 합니다");
+    assert.equal(new Set([one.credential, two.credential, again.credential]).size, 3);
+    assert.equal(new Set([one.remote, two.remote, again.remote]).size, 3);
+    assert.ok(again.expires_at >= Math.max(one.expires_at, two.expires_at));
     assert.equal(created() - before, 1);
 
     // 팩토리가 다시 떠도 같은 계정은 같은 인스턴스를 받는다. 짝은 팩토리의 파일에 있다
     await stopFactory();
     await startFactory();
     const reconnected = structured<Workspace>(await call(await platform(await connect("alice")), "workspace_open"));
-    assert.equal(reconnected.instance, one.instance);
     assert.equal(created() - before, 1);
-    assert.deepEqual(JSON.parse(readFileSync(join(home, "customers.json"), "utf8")), { alice: one.instance });
+    assert.deepEqual(JSON.parse(readFileSync(join(home, "customers.json"), "utf8")), { alice: instance });
     workspaces.set("alice", reconnected);
 });
 
-test("작업을 연 답에는 주소 · 인스턴스 · 토큰 · 만료만 있다 — 답은 모델이 읽는다", { skip }, async () =>
+test("작업을 연 답에는 팩토리의 git 원격 · 그 원격의 자격 · 만료만 있다 — 답은 모델이 읽는다", { skip }, async () =>
 {
     const result = await call(await platform(await connect("alice")), "workspace_open");
     const opened = structured<Workspace>(result);
 
-    assert.deepEqual(Object.keys(opened).sort(), ["expires_at", "instance", "token", "url"]);
-    assert.equal(opened.url, layer);
-    assert.equal(opened.instance, workspaces.get("alice")?.instance);
+    assert.deepEqual(Object.keys(opened).sort(), ["credential", "expires_at", "remote"]);
+    assert.match(opened.remote, new RegExp(`^${origin}/git/[0-9a-f]{24}$`));
+    assert.match(opened.credential, /^fgit_[A-Za-z0-9_-]{32}$/);
     assert.equal(typeof opened.expires_at, "number");
     // _meta 에는 카드도 값도 없다. 있는 것은 프로토콜이 모든 답에 찍는 서버의 이름과 버전뿐이다(2026-07-28 의 `io.modelcontextprotocol/serverInfo`)
     const { "io.modelcontextprotocol/serverInfo": stamp, ...meta } = result._meta ?? {};
     assert.deepEqual(meta, {});
     assert.ok(stamp === undefined || JSON.stringify(stamp) === JSON.stringify({ name: "factory-todo", version: "0.1.0" }), JSON.stringify(stamp));
     assert.equal(result.isError, undefined);
-    // 글로도 같은 것만 싣는다. 첫 블록은 쓰는 법의 안내이고 값은 토큰과 만료 시각뿐이다
+    // 글로도 같은 것만 싣는다. 첫 블록은 쓰는 법의 안내이고, 자격은 주소에 넣지 않는 법으로 건넨다
     assert.equal(result.content.length, 2);
     assert.deepEqual(JSON.parse(result.content[1]?.type === "text" ? result.content[1].text : ""), opened);
+    const guide = result.content[0]?.type === "text" ? result.content[0].text : "";
+    assert.match(guide, /http\.extraHeader="Authorization: Bearer <credential>"/);
+    assert.ok(!guide.includes(opened.credential));
+    // 레이어의 주소와 토큰은 없다
+    for (const leak of [layer, direct, "orb1.", SERVICE_KEY])
+    {
+        assert.ok(!JSON.stringify(result).includes(leak), leak);
+    }
     workspaces.set("alice", opened);
 });
 
-test("토큰에는 source · preview · rehearse 만 실리고 두 시간 뒤 만료된다 — 운영을 바꾸는 능력은 토큰에 없다", { skip }, async () =>
+test("작업에는 source · preview · rehearse · secrets_request 만 실리고 두 시간 뒤 만료된다 — 운영을 바꾸는 능력은 작업에 없다", { skip }, async () =>
 {
     const asked = Math.floor(Date.now() / 1000);
     const opened = structured<Workspace>(await call(await platform(await connect("alice")), "workspace_open"));
-    const body = tokenBody(opened.token);
+    const instance = instanceOf("alice");
 
-    assert.deepEqual([...body.can].sort(), ["preview", "rehearse", "source"]);
-    assert.equal(body.instance, opened.instance);
-    assert.equal(body.expires_at, opened.expires_at);
+    // 팩토리가 레이어에 연 작업의 범위
+    const asking = sent.filter((each) => each.path === `/v1/instances/${instance}/sessions`).at(-1);
+    assert.deepEqual(asking?.body, { can: [...AGENT_CAN], ttl_seconds: 7200 });
+    assert.deepEqual([...AGENT_CAN].sort(), ["preview", "rehearse", "secrets_request", "source"]);
     assert.ok(opened.expires_at >= asked + 7200 && opened.expires_at <= asked + 7260, `만료는 두 시간 뒤여야 합니다: ${opened.expires_at - asked}초`);
 
-    // 코드는 받는다
-    await agent(scratch, opened, "clone", "alice-probe");
-    // 운영을 바꾸는 길과 사용자를 초대하는 길은 두드려도 열리지 않는다. 신원을 받아 가는 길은 아예 없다
+    // 코드는 받는다. 그 뒤에서 팩토리가 작업의 토큰으로 레이어에 이어 준다
+    await git(scratch, opened.credential, "clone", "--quiet", opened.remote, "alice-probe");
+    const token = workCalls.filter((each) => each.path.startsWith(`/v1/instances/${instance}/git/`)).at(-1)?.token ?? "";
+    assert.deepEqual(tokenBody(token).instance, instance);
+    assert.equal(tokenBody(token).expires_at, opened.expires_at);
+    // 그 토큰으로도 운영을 바꾸는 길과 사용자를 초대하는 길은 열리지 않는다. 신원을 받아 가는 길은 아예 없다
     for (const [tail, status] of [["promotions", 403], ["users", 404], ["production/identities", 404]] as const)
     {
-        const tried = await fetch(`${opened.url}/v1/instances/${opened.instance}/${tail}`, {
+        const tried = await fetch(`${direct}/v1/instances/${instance}/${tail}`, {
             method: "POST",
-            headers: { authorization: `Bearer ${opened.token}`, "content-type": "application/json" },
+            headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
             body: JSON.stringify({ release: "r", change: "customer_request", approved_by: "customer", subject: "u1", email: "u1@example.test" }),
         });
         assert.equal(tried.status, status, tail);
     }
-    assert.equal(await orbital.production.get(opened.instance), null);
+    assert.equal(await orbital.production.get(instance), null);
     workspaces.set("alice", opened);
 });
 
-test("다른 고객의 연결로 작업을 열면 다른 인스턴스가 온다. 남의 인스턴스의 토큰은 받지 못한다", { skip }, async () =>
+test("다른 고객의 연결로 작업을 열면 다른 인스턴스가 온다. 남의 작업의 원격에는 닿지 못한다", { skip }, async () =>
 {
     const alice = workspaces.get("alice");
     assert.ok(alice !== undefined);
     const bob = await platform(await connect("bob"));
 
     // 남의 인스턴스를 인자로 적어도 제 인스턴스가 온다
-    const opened = structured<Workspace>(await call(bob, "workspace_open", { instance: alice.instance }));
-    assert.notEqual(opened.instance, alice.instance);
-    assert.equal(tokenBody(opened.token).instance, opened.instance);
+    const opened = structured<Workspace>(await call(bob, "workspace_open", { instance: instanceOf("alice") }));
+    assert.notEqual(instanceOf("bob"), instanceOf("alice"));
+    assert.notEqual(opened.remote, alice.remote);
 
-    // bob 의 토큰으로는 alice 의 코드를 받지 못한다
-    await assert.rejects(agent(scratch, { ...opened, instance: alice.instance }, "clone", "bob-into-alice"));
-    assert.deepEqual(JSON.parse(readFileSync(join(home, "customers.json"), "utf8")), { alice: alice.instance, bob: opened.instance });
+    // bob 의 자격으로는 alice 의 원격에서 받지 못한다
+    await assert.rejects(git(scratch, opened.credential, "clone", "--quiet", alice.remote, "bob-into-alice"));
+    assert.deepEqual(JSON.parse(readFileSync(join(home, "customers.json"), "utf8")), { alice: instanceOf("alice"), bob: instanceOf("bob") });
     workspaces.set("bob", opened);
+});
+
+test("git 의 자격은 그 고객의 그 인스턴스에서만, 두 시간 동안만, git 의 길에서만 통한다", { skip }, async () =>
+{
+    const alice = workspaces.get("alice");
+    const bob = workspaces.get("bob");
+    assert.ok(alice !== undefined && bob !== undefined);
+    const refs = (remote: string): string => `${remote}/info/refs?service=git-upload-pack`;
+    const basic = (password: string): string => `Basic ${Buffer.from(`anyone:${password}`).toString("base64")}`;
+
+    // 제 원격에서는 통한다. 한 번 쓰는 머리말(Bearer)과 자격 도우미의 모양(Basic, 사용자 이름은 보지 않는다) 모두
+    assert.match(await git(scratch, alice.credential, "ls-remote", alice.remote), /refs\/heads\/main/);
+    for (const authorization of [`Bearer ${alice.credential}`, basic(alice.credential)])
+    {
+        const advertised: Response = await fetch(refs(alice.remote), { headers: { authorization } });
+        assert.equal(advertised.status, 200);
+        assert.equal(advertised.headers.get("content-type"), "application/x-git-upload-pack-advertisement");
+    }
+    // 자격이 없으면 401 과 Basic 의 요청이다. git 은 이것을 보고 자격 도우미를 부른다
+    const bare = await fetch(refs(alice.remote));
+    assert.equal(bare.status, 401);
+    assert.match(bare.headers.get("www-authenticate") ?? "", /^Basic /);
+    // 남의 원격 · 지어낸 원격 · 지어낸 자격으로는 통하지 않는다
+    for (const [remote, credential] of [
+        [bob.remote, alice.credential],
+        [alice.remote, bob.credential],
+        [`${origin}/git/${"0".repeat(24)}`, alice.credential],
+        [alice.remote, `${alice.credential}x`],
+        [alice.remote, "fgit_made_up"],
+    ] as const)
+    {
+        assert.equal((await fetch(refs(remote), { headers: { authorization: `Bearer ${credential}` } })).status, 401, `${remote} ${credential.slice(0, 8)}`);
+    }
+    // git 의 길에서만 통한다: 도구의 길(/mcp)과 인가 서버의 길은 열지 못한다
+    const tools = await fetch(`${origin}/mcp`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${alice.credential}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+    assert.equal(tools.status, 401);
+
+    // 두 시간 동안만: 팩토리의 자격은 레이어의 작업이 끝나는 때에 함께 끝난다(시계를 갈아 끼워 잰다)
+    let clock = 1_000;
+    const work = { instance: "k3f9x2ab", expiresAt: clock + 7200 } as unknown as Work;
+    const works = createWorks({ works: { open: async () => work } } as unknown as Orbital, () => clock);
+    const { opened, credential } = await works.open("alice", "k3f9x2ab");
+    assert.equal(works.forGit(opened.id, credential)?.instance, "k3f9x2ab");
+    assert.equal(works.forGit("0".repeat(24), credential), undefined);
+    assert.equal(works.forGit(opened.id, "fat_mcp_token"), undefined);
+    clock += 7199;
+    assert.equal(works.forGit(opened.id, credential)?.customer, "alice");
+    clock += 1;
+    assert.equal(works.forGit(opened.id, credential), undefined);
+    assert.equal(works.current("alice"), undefined);
+});
+
+test("MCP 의 토큰으로는 git 에 닿지 못하고 git 의 자격으로는 도구를 부르지 못한다", { skip }, async () =>
+{
+    const alice = workspaces.get("alice");
+    assert.ok(alice !== undefined);
+    const token = await connect("alice");
+
+    // MCP 의 토큰은 도구를 부른다
+    const client = await platform(token);
+    assert.ok((await client.listTools()).tools.length > 0);
+    // 그 토큰을 git 의 자격 자리에 넣어도 git 의 길은 열리지 않는다
+    await assert.rejects(git(scratch, token, "ls-remote", alice.remote));
+    for (const authorization of [`Bearer ${token}`, `Basic ${Buffer.from(`alice:${token}`).toString("base64")}`])
+    {
+        assert.equal((await fetch(`${alice.remote}/info/refs?service=git-receive-pack`, { headers: { authorization } })).status, 401);
+        assert.equal((await fetch(`${alice.remote}/git-receive-pack`, { method: "POST", headers: { authorization }, body: "0000" })).status, 401);
+    }
+    // git 의 자격으로는 도구를 부르지 못한다
+    const called = await fetch(`${origin}/mcp`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${alice.credential}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "preview", arguments: {} } }),
+    });
+    assert.equal(called.status, 401);
+    assert.match(called.headers.get("www-authenticate") ?? "", /^Bearer resource_metadata=/);
+});
+
+test("에이전트가 팩토리의 도구와 git 만으로 고치기 → 프리뷰 → 승인 → 운영을 돈다", { skip }, async () =>
+{
+    const client = await platform(await connect("erin"));
+    const opened = structured<Workspace>(await call(client, "workspace_open"));
+    const work = join(scratch, "erin");
+
+    // 받기 → 고치기 → 올리기: 평범한 git 으로 팩토리의 원격에
+    await git(scratch, opened.credential, "clone", "--quiet", opened.remote, "erin");
+    writeFileSync(join(work, "server.js"), readFileSync(join(work, "server.js"), "utf8").replace("version: 1", "version: 2"));
+    await git(work, undefined, "commit", "--quiet", "-am", "버전을 올린다");
+    await git(work, opened.credential, "push", "--quiet", "origin", "main");
+    const head = await git(work, undefined, "rev-parse", "HEAD");
+
+    // 프리뷰: 주소 · 어긋난 것 · 권한의 변화 · 막는 것
+    const shown = await call(client, "preview");
+    assert.equal(shown.isError, undefined, textOf(shown));
+    const preview = structured<{ release: string; commit: string; services: { name: string; url: string }[]; findings: string[]; changes: string[]; blockers: string[]; missing_secrets: string[]; conformance: unknown }>(shown);
+    assert.equal(preview.commit, head);
+    assert.deepEqual([preview.findings, preview.blockers, preview.missing_secrets], [[], [], []]);
+    assert.deepEqual(preview.changes, ["`member` 역할이 `todo.card` 표를 자기 행을 읽을 수 있게 됩니다 그리고 자기 행을 고칠 수 있게 됩니다"]);
+    assert.match(textOf(shown), /promotion_request/);
+    const address = preview.services[0]?.url ?? "";
+    assert.equal(((await (await fetch(`${address}/health`)).json()) as { version: number }).version, 2);
+    // 씨앗 사용자로 들어가 본다
+    const signedIn = structured<{ cookie: string }>(await call(client, "preview_sign_in", { user: "u1" }));
+    assert.equal(((await (await fetch(`${address}/cards`, { headers: { cookie: signedIn.cookie } })).json()) as unknown[]).length, 2);
+    const unknownUser = await call(client, "preview_sign_in", { user: "u404" });
+    assert.equal(unknownUser.isError, true);
+    assert.match(textOf(unknownUser), /씨앗 사용자/);
+    // 로그와 리허설
+    const logs = structured<{ release: string; logs: { name: string }[] }>(await call(client, "preview_logs"));
+    assert.deepEqual([logs.release, logs.logs.map((log) => log.name)], [preview.release, ["build-web", "preview-web"]]);
+    assert.equal(structured<{ needed: boolean }>(await call(client, "rehearse", { release: preview.release })).needed, false);
+
+    // 승격 요청 → 카드 → 사람의 승인 → 운영
+    assert.equal((await call(client, "promotion_request", { release: preview.release })).isError, undefined);
+    const seen = approveButton(cardOf(await call(client, "promotion_show")));
+    assert.equal(seen?.release, preview.release);
+    const approved = await call(client, "promotion_approve", seen ?? {});
+    assert.equal(approved.isError, undefined, textOf(approved));
+    const live = structured<{ release: string; url: string }>(await call(client, "production_status"));
+    assert.equal(live.release, preview.release);
+    assert.equal(((await (await fetch(`${live.url}/health`)).json()) as { version: number }).version, 2);
+    // 승인은 사람의 카드(화면 전용 도구)가 했다. 레이어에는 고객의 승인으로 갔다
+    assert.deepEqual(sent.filter((each) => each.path === `/v1/instances/${instanceOf("erin")}/promotions`).map((each) => each.body), [
+        { release: preview.release, change: "customer_request", approved_by: "customer" },
+    ]);
 });
 
 test("연결 없이 호출한 도구는 401 이다", { skip }, async () =>
@@ -518,9 +676,7 @@ test("연결 없이 호출한 도구는 401 이다", { skip }, async () =>
 
 test("승인 카드는 기다리는 release 와 권한이 바뀌는 문장과 실행될 마이그레이션을 보인다 — 사람이 무엇을 승인하는지 읽는다", { skip }, async () =>
 {
-    const alice = workspaces.get("alice");
-    assert.ok(alice !== undefined);
-    const release = await shipChange(alice, "alice", (source) => source.replace("version: 1", "version: 2"), "버전을 올린다");
+    const release = await shipChange("alice", "alice", (source) => source.replace("version: 1", "version: 2"), "버전을 올린다");
     const client = await platform(await connect("alice"));
 
     const shown = await call(client, "promotion_show");
@@ -565,7 +721,7 @@ test("승인하기는 화면 전용 도구라 모델에게 주는 도구 목록�
     const tools = (await client.listTools()).tools;
     const approve = tools.find((tool) => tool.name === "promotion_approve");
 
-    assert.deepEqual(tools.filter((tool) => modelVisible(tool._meta)).map((tool) => tool.name).sort(), ["production_status", "promotion_show", "secret_request", "workspace_open"]);
+    assert.deepEqual(tools.filter((tool) => modelVisible(tool._meta)).map((tool) => tool.name).sort(), MODEL_TOOLS);
     // 화면은 부를 수 있다
     assert.deepEqual((approve?._meta as { ui?: { visibility?: unknown } } | undefined)?.ui?.visibility, ["app"]);
 
@@ -577,7 +733,7 @@ test("승인하기는 화면 전용 도구라 모델에게 주는 도구 목록�
     assert.ok(!JSON.stringify(shown.structuredContent).includes(ticket.approval));
 
     // 표 없이, 또는 지어낸 표로 승인하기를 불러도 오르지 않는다
-    const instance = workspaces.get("alice")?.instance ?? "";
+    const instance = instanceOf("alice");
     for (const approval of ["", "지어낸-표"])
     {
         const tried = await call(client, "promotion_approve", { release: ticket.release, approval });
@@ -589,8 +745,7 @@ test("승인하기는 화면 전용 도구라 모델에게 주는 도구 목록�
 
 test("승인하기는 카드가 보인 release 만 올린다. 그 뒤에 코드가 더 올라왔으면 올리지 않고 카드를 다시 보라고 답한다 — 승인은 사람이 본 release 하나에 묶인다", { skip }, async () =>
 {
-    const alice = workspaces.get("alice");
-    assert.ok(alice !== undefined);
+    const alice = { instance: instanceOf("alice") };
     const client = await platform(await connect("alice"));
 
     // 사람이 카드를 연다
@@ -598,7 +753,7 @@ test("승인하기는 카드가 보인 release 만 올린다. 그 뒤에 코드�
     assert.ok(seen !== undefined);
 
     // 그 사이에 에이전트가 코드를 더 올리고 새 release 의 승격을 요청한다
-    const newer = await shipChange(alice, "alice", (source) => source.replace("version: 2", "version: 3"), "버전을 또 올린다");
+    const newer = await shipChange("alice", "alice", (source) => source.replace("version: 2", "version: 3"), "버전을 또 올린다");
     assert.notEqual(newer, seen.release);
 
     // 사람이 앞에 본 카드에서 승인을 누른다
@@ -608,13 +763,12 @@ test("승인하기는 카드가 보인 release 만 올린다. 그 뒤에 코드�
     assert.equal(approveButton(cardOf(approved)), undefined);
     assert.equal(await orbital.production.get(alice.instance), null);
     assert.equal((await orbital.releases.pending(alice.instance))?.release, newer);
-    assert.equal(sent.filter((each) => each.path.endsWith("/promotions")).length, 0);
+    assert.equal(sent.filter((each) => each.path === `/v1/instances/${alice.instance}/promotions`).length, 0);
 });
 
 test("승인하면 고객의 승인으로 운영에 오르고 답에 운영의 주소가 온다", { skip }, async () =>
 {
-    const alice = workspaces.get("alice");
-    assert.ok(alice !== undefined);
+    const alice = { instance: instanceOf("alice") };
     const client = await platform(await connect("alice"));
     const seen = approveButton(cardOf(await call(client, "promotion_show")));
     assert.ok(seen !== undefined);
@@ -627,7 +781,7 @@ test("승인하면 고객의 승인으로 운영에 오르고 답에 운영의 �
     assert.ok(cardOf(approved).includes(live.url));
 
     // 레이어에는 고객의 요청을 고객이 승인한 것으로 보냈다
-    assert.deepEqual(sent.filter((each) => each.path.endsWith("/promotions")).map((each) => [each.path, each.body]), [
+    assert.deepEqual(sent.filter((each) => each.path === `/v1/instances/${alice.instance}/promotions`).map((each) => [each.path, each.body]), [
         [`/v1/instances/${alice.instance}/promotions`, { release: seen.release, change: "customer_request", approved_by: "customer" }],
     ]);
     // 운영의 앱이 돈다
@@ -638,18 +792,17 @@ test("승인하면 고객의 승인으로 운영에 오르고 답에 운영의 �
 
     // 같은 표로 다시 누르면 오르지 않는다. 표는 한 번 쓴다
     assert.equal((await call(client, "promotion_approve", seen)).isError, true);
-    assert.equal(sent.filter((each) => each.path.endsWith("/promotions")).length, 1);
+    assert.equal(sent.filter((each) => each.path === `/v1/instances/${alice.instance}/promotions`).length, 1);
 });
 
 test("레이어가 승격을 거절하면 그 까닭을 사람이 읽는 문장으로 돌려주고 운영은 그대로다", { skip }, async () =>
 {
-    const alice = workspaces.get("alice");
-    assert.ok(alice !== undefined);
+    const alice = { instance: instanceOf("alice") };
     const client = await platform(await connect("alice"));
     const before = structured<{ release: string; url: string }>(await call(client, "production_status"));
 
     // 프리뷰에서는 뜨고 운영에서만 뜨지 않는 서버를 올린다
-    await shipChange(alice, "alice", (source) => `if (process.env.ORBITAL_STAGE === "production") process.exit(1);\n${source.replace("version: 3", "version: 4")}`, "운영에서 뜨지 않는다");
+    await shipChange("alice", "alice", (source) => `if (process.env.ORBITAL_STAGE === "production") process.exit(1);\n${source.replace("version: 3", "version: 4")}`, "운영에서 뜨지 않는다");
     const seen = approveButton(cardOf(await call(client, "promotion_show")));
     assert.ok(seen !== undefined);
 
@@ -696,21 +849,25 @@ test("service key 는 어떤 도구의 답 · 오류 · 로그에도 실리지 �
 const BANK = "sk_live_bank_factory_T9wKq2Zm";
 const BANK_PREVIEW = "sk_test_bank_factory_R3vBn8Xc";
 
-/** dave 의 에이전트가 `[secrets] external` 에 은행의 키를 선언하고 프리뷰를 세운다. 한 번만 한다 */
-let daveReady: Promise<Workspace> | undefined;
-function daveDeclares(): Promise<Workspace>
+/** dave 의 에이전트가 `[secrets] external` 에 은행의 키를 선언하고 프리뷰를 세운다. 한 번만 한다. dave 의 인스턴스를 돌려준다 */
+let daveReady: Promise<{ instance: string }> | undefined;
+function daveDeclares(): Promise<{ instance: string }>
 {
     daveReady ??= (async () =>
     {
-        const opened = structured<Workspace>(await call(await platform(await connect("dave")), "workspace_open"));
-        await agent(scratch, opened, "clone", "dave");
+        const client = await platform(await connect("dave"));
+        const opened = structured<Workspace>(await call(client, "workspace_open"));
+        await git(scratch, opened.credential, "clone", "--quiet", opened.remote, "dave");
         const work = join(scratch, "dave");
         const manifest = readFileSync(join(work, "orbital.toml"), "utf8");
         writeFileSync(join(work, "orbital.toml"), manifest.replace("generated = [\"SESSION_KEY\"]", "generated = [\"SESSION_KEY\"]\nexternal = [\"BANK_API_KEY\"]"));
-        git(work, "commit", "--quiet", "-am", "은행의 키를 밖에서 넣는다고 선언한다");
-        await agent(work, opened, "push");
-        await agent(work, opened, "preview");
-        return opened;
+        await git(work, undefined, "commit", "--quiet", "-am", "은행의 키를 밖에서 넣는다고 선언한다");
+        await git(work, opened.credential, "push", "--quiet", "origin", "main");
+        const shown = await call(client, "preview");
+        // 프리뷰의 값이 없어 그 환경 변수 없이 섰다. 사람에게 요청할 이름이 답에 온다
+        assert.deepEqual(structured<{ missing_secrets: string[] }>(shown).missing_secrets, ["BANK_API_KEY"]);
+        assert.match(textOf(shown), /secret_request/);
+        return { instance: instanceOf("dave") };
     })();
     return daveReady;
 }
@@ -823,6 +980,47 @@ test("도구의 답과 팩토리의 로그에 값이 실리지 않는다", { ski
     }
 });
 
+test("도구의 답과 팩토리의 로그 어디에도 레이어의 주소와 토큰이 없다", { skip }, async () =>
+{
+    // 거절과 오류의 길도 지난다: 작업 없이 부른 도구, 모르는 release, 지어낸 git 의 자격
+    const carol = await platform(await connect("carol"));
+    await call(carol, "preview");
+    await call(carol, "promotion_request", { release: "r_made_up" });
+    const alice = await platform(await connect("alice"));
+    await call(alice, "rehearse", { release: "r_made_up" });
+    await call(alice, "preview_sign_in", { user: "nobody" });
+    await fetch(`${origin}/git/${"0".repeat(24)}/info/refs?service=git-upload-pack`, { headers: { authorization: "Bearer fgit_x" } });
+
+    const tokens = new Set(workCalls.map((each) => each.token));
+    assert.ok(tokens.size >= 3, "팩토리가 작업의 토큰으로 레이어를 불렀어야 합니다");
+    const secrets = [layer, direct, new URL(layer).host, new URL(direct).host, SERVICE_KEY, "orb1.", ...tokens];
+    assert.ok(answers.length > 30, "모은 답이 있어야 합니다");
+    for (const { name, result } of answers)
+    {
+        // 비밀 입력 표의 주소(레이어)는 화면 전용 도구의 `_meta` 에만 간다. 그 밖의 모든 것을 본다
+        const shown = TOOLS.find((tool) => tool.name === name)?._meta === undefined || modelVisible(TOOLS.find((tool) => tool.name === name)?._meta)
+            ? JSON.stringify(result)
+            : JSON.stringify({ content: result.content, structuredContent: result.structuredContent });
+        for (const leak of secrets)
+        {
+            assert.ok(!shown.includes(leak), `${name} 의 답에 \`${leak.slice(0, 24)}\` 가 있습니다`);
+        }
+    }
+    // 플랫폼이 받은 날것 전체에도 토큰과 service key 는 없다(카드의 CSP 에 실린 레이어의 바깥 주소는 화면이 값을 보내는 곳이라 있다)
+    for (const body of received)
+    {
+        for (const leak of [SERVICE_KEY, "orb1.", layer])
+        {
+            assert.ok(!body.includes(leak), `받은 답에 \`${leak.slice(0, 24)}\` 가 있습니다`);
+        }
+    }
+    assert.ok(logs.length > 0, "팩토리의 로그가 있어야 합니다");
+    for (const leak of secrets)
+    {
+        assert.ok(!logs.includes(leak), `팩토리의 로그에 \`${leak.slice(0, 24)}\` 가 있습니다`);
+    }
+});
+
 /** 저장 방식(stored)의 ZIP 을 읽는다. 중앙 디렉터리를 따라 이름과 내용을 꺼내고 CRC 를 견준다 */
 function unzip(bytes: Uint8Array): Map<string, string>
 {
@@ -896,4 +1094,22 @@ test("패키지는 MCP 서버 하나와 스킬 하나를 묶고 훅이 없다 �
     // 배포한 팩토리의 주소로 바꿔 지을 수 있다
     const deployed = unzip(zip(packageFiles("https://factory.example.com/mcp")));
     assert.match(deployed.get(".mcp.json") ?? "", /"url": "https:\/\/factory\.example\.com\/mcp"/);
+});
+
+test("플러그인의 묶음과 스킬에는 orbital CLI 를 부르라는 말이 없다", () =>
+{
+    const files = unzip(zip(packageFiles()));
+    for (const [path, body] of files)
+    {
+        // CLI 의 명령 · 레이어의 환경 변수 · 레이어의 HTTP 길
+        assert.doesNotMatch(body, /`orbital [a-z-]+|orbital (clone|pull|push|preview|identity|rehearse|request-promotion|check)\b/, path);
+        assert.doesNotMatch(body, /ORBITAL_(URL|TOKEN|INSTANCE)/, path);
+        assert.doesNotMatch(body, /\/v1\/instances|orbitald/, path);
+    }
+    // 스킬은 평범한 git 으로 팩토리의 원격에 오가라고 말하고, 자격은 주소에 넣지 않게 한다
+    const skill = files.get("skills/orbital-dev/SKILL.md") ?? "";
+    assert.match(skill, /git -c http\.extraHeader="Authorization: Bearer \$CREDENTIAL" clone/);
+    assert.match(skill, /git push origin main/);
+    assert.match(skill, /자격 도우미/);
+    assert.ok(!/https?:\/\/[^\s]*@/.test(skill), "원격의 주소에 자격을 넣는 예가 있으면 안 됩니다");
 });
