@@ -626,7 +626,12 @@ name = "orbital-cli"
 version = "0.0.0"
 dependencies = [
  "orbital-core",
+ "orbital-run",
+ "orbital-server",
+ "serde_json",
+ "tiny_http",
  "toml",
+ "ureq",
 ]
 
 [[package]]
