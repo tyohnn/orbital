@@ -260,6 +260,9 @@ fn with_service_key(
                     )?;
                     Ok(ok(json!(report)))
                 }
+                ("GET", ["promotion-request"]) => Ok(ok(json!(
+                    layer.promotion_request(&organization, &instance)?
+                ))),
                 ("GET", ["production"]) => {
                     Ok(ok(json!(layer.production(&organization, &instance)?)))
                 }

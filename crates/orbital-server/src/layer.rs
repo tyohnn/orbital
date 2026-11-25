@@ -203,6 +203,17 @@ pub struct PromotionReport {
     pub migrations: Vec<String>,
 }
 
+/// 사람의 승인을 기다리는 승격 요청. 팩토리의 승인 화면이 이것을 세운다.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingPromotion {
+    pub release: String,
+    pub commit: String,
+    /// 지금의 운영과 견준 권한의 변화.
+    pub changes: Vec<String>,
+    /// 운영에 아직 돌지 않은 마이그레이션의 이름.
+    pub migrations: Vec<String>,
+}
+
 pub struct Options {
     /// 레이어가 저장소 · 빌드 · 기록을 두는 폴더.
     pub home: PathBuf,
@@ -1255,6 +1266,47 @@ impl Layer {
                 },
             );
         }
+    }
+
+    /// 사람의 승인을 기다리는 승격 요청. 없으면 `None` 이다. 권한의 변화는 읽는 때의 운영과 견준다.
+    pub fn promotion_request(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+    ) -> Outcome<Option<PendingPromotion>> {
+        let mut inner = self.lock();
+        let record = Self::owned(&mut inner, organization, instance)?.clone();
+        let Some(release) = record.promotion_requested.clone() else {
+            return Ok(None);
+        };
+        let commit = record
+            .releases
+            .get(&release)
+            .and_then(|known| Commit::parse(&known.commit))
+            .ok_or_else(|| internal("요청된 release 의 commit 을 읽지 못했습니다"))?;
+        let assembled = self.assembled(instance, &commit)?;
+        let all: Vec<&str> = assembled
+            .migrations
+            .iter()
+            .map(|script| script.name.as_str())
+            .collect();
+        let migrations = match &record.production {
+            None => all.iter().map(|name| (*name).to_owned()).collect(),
+            Some(_) => inner
+                .admin
+                .pending(&Names::new(instance.clone()), &all)
+                .map_err(internal)?,
+        };
+        let before = self.production_access(instance, &record)?;
+        Ok(Some(PendingPromotion {
+            release,
+            commit: commit.to_string(),
+            changes: changes(&before, &assembled.access)
+                .into_iter()
+                .map(|change| change.sentence)
+                .collect(),
+            migrations,
+        }))
     }
 
     /// 운영에 올라 있는 것의 주소. 팩토리의 서버가 본다.

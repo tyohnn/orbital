@@ -380,6 +380,26 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
             .0,
         200
     );
+    // 팩토리의 서버는 승인 화면에 세울 것을 읽는다. 어느 release 인지와 권한이 어떻게 바뀌는지다
+    let (status, pending) = bench.call("GET", &path("promotion-request"), Some(FACTORY), &[]);
+    assert_eq!(status, 200, "{pending}");
+    assert_eq!(pending["release"], release);
+    assert_eq!(pending["commit"], preview["commit"]);
+    assert_eq!(pending["changes"], preview["changes"]);
+    assert_eq!(pending["migrations"], json!(["001_card.sql"]));
+    // 다른 팩토리에게는 없는 인스턴스이고, 에이전트의 토큰에는 이 길이 없다
+    assert_eq!(
+        bench
+            .call("GET", &path("promotion-request"), Some(OTHER_FACTORY), &[])
+            .0,
+        404
+    );
+    assert_eq!(
+        bench
+            .call("GET", &path("promotion-request"), Some(&token), &[])
+            .0,
+        404
+    );
     // 고객의 요청은 고객이 승인한다. 팩토리의 승인으로는 오르지 않는다
     let (status, body) = bench.promote(&instance, &release, "factory");
     assert_eq!(
@@ -390,6 +410,11 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
     assert_eq!(status, 200, "{production}");
     assert_eq!(production["migrations"], json!(["001_card.sql"]));
     let live = url(&production);
+    // 오른 뒤에는 기다리는 요청이 없다
+    assert_eq!(
+        bench.call("GET", &path("promotion-request"), Some(FACTORY), &[]),
+        (200, Value::Null)
+    );
 
     // 운영에는 씨앗 데이터가 없다. 미리보기의 신원은 운영에서 읽히지 않는다
     let (_, identity) = bench.post(
