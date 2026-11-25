@@ -323,10 +323,22 @@ test("git 을 이어 주면 clone 과 push 가 팩토리의 주소로 된다", {
     await agentGit(folder, "push", "--quiet", "origin", "main");
     const head = await agentGit(folder, "rev-parse", "HEAD");
     assert.equal((await work.preview()).commit, head);
-    // 다른 폴더가 이어 받는다
+    // 다른 폴더가 이어 받는다. git 이 팩토리의 자격을 실어 보내도(밖에서 온 Authorization) 이어 주는 길은 그것을 레이어에 넘기지 않는다
     const other = join(scratch, "relayed-other");
-    await agentGit(scratch, "clone", "--quiet", remote, other);
+    await agentGit(scratch, "-c", "http.extraHeader=Authorization: Bearer fgit_not_for_the_layer", "clone", "--quiet", remote, other);
     assert.equal(await agentGit(other, "rev-parse", "HEAD"), head);
+    // 받는 쪽에 올리지 않은 commit 이 많으면 git 이 받기 요청을 줄여(gzip) 보낸다. 이어 주는 길이 그 표시(Content-Encoding)를 넘겨야 풀린다
+    for (let at = 0; at < 200; at += 1)
+    {
+        writeFileSync(join(folder, "NOTES.md"), `${at}\n`);
+        await agentGit(folder, "commit", "--quiet", "-am", `올리지 않은 ${at}`);
+    }
+    writeFileSync(join(other, "NEW.md"), "다른 폴더에서\n");
+    await agentGit(other, "add", "-A");
+    await agentGit(other, "commit", "--quiet", "-m", "다른 폴더에서");
+    await agentGit(other, "push", "--quiet", "origin", "main");
+    await agentGit(folder, "fetch", "--quiet", "origin");
+    assert.equal(await agentGit(folder, "rev-parse", "origin/main"), await agentGit(other, "rev-parse", "HEAD"));
     // 레이어가 받지 않는 올리기는 그 까닭이 팩토리의 주소를 지나 git 에 그대로 보인다
     await agentGit(other, "checkout", "--quiet", "-b", "feature");
     await assert.rejects(agentGit(other, "push", "origin", "feature"), /`main` 브랜치 하나만/);

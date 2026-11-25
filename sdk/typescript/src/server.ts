@@ -48,6 +48,38 @@ export interface Production
     services: Service[];
     /** 이번 승격에서 돈 마이그레이션의 이름. */
     migrations: string[];
+    /** 선언의 일정(`[[schedule]]`)마다 다음 때와 마지막 실행. 레이어가 그 시각(UTC)에 운영의 앱을 부른다. */
+    schedules: Schedule[];
+}
+
+/** 일정을 한 번 부른 결과의 갈래. `running` 은 부르는 중이다. */
+export type ScheduleOutcome = "running" | "ok" | "failed" | "unreachable" | "timed_out";
+
+/** 일정을 한 번 부른 것. 숫자와 갈래만 있다(앱의 답의 본문은 없다). */
+export interface ScheduleRun
+{
+    /** 맞춘 때(Unix 초). 레이어가 내려가 있어 놓쳤으면 놓친 때 가운데 마지막 것이다. */
+    dueAt: number;
+    /** 실제로 부른 때(Unix 초). */
+    startedAt: number;
+    outcome: ScheduleOutcome;
+    /** 앱이 답한 상태 코드. 답하지 않았으면 `null` 이다. */
+    status: number | null;
+    /** 걸린 시간(밀리초). 부르는 중이면 `null` 이다. */
+    millis: number | null;
+}
+
+/** 운영의 일정 하나. */
+export interface Schedule
+{
+    service: string;
+    path: string;
+    /** 다섯 칸의 cron 식(UTC). */
+    cron: string;
+    /** 다음에 부를 때(Unix 초). */
+    nextAt: number | null;
+    /** 마지막으로 부른 것. 한 번도 부르지 않았으면 `null` 이다. */
+    lastRun: ScheduleRun | null;
 }
 
 export interface Session
@@ -480,6 +512,29 @@ function toProduction(value: unknown): Production
             url: typeof service.url === "string" ? service.url : null,
         })),
         migrations: texts(record.migrations),
+        schedules: (Array.isArray(record.schedules) ? record.schedules.filter(isRecord) : []).map(toSchedule),
+    };
+}
+
+const SCHEDULE_OUTCOMES: readonly ScheduleOutcome[] = ["running", "ok", "failed", "unreachable", "timed_out"];
+
+function toSchedule(value: Record<string, unknown>): Schedule
+{
+    const run = isRecord(value.last_run) ? value.last_run : null;
+    return {
+        service: text(value.service),
+        path: text(value.path),
+        cron: text(value.cron),
+        nextAt: typeof value.next_at === "number" ? value.next_at : null,
+        lastRun: run === null
+            ? null
+            : {
+                dueAt: number(run.due_at),
+                startedAt: number(run.started_at),
+                outcome: oneOf(SCHEDULE_OUTCOMES, run.outcome, "failed"),
+                status: typeof run.status === "number" ? run.status : null,
+                millis: typeof run.millis === "number" ? run.millis : null,
+            },
     };
 }
 

@@ -192,3 +192,26 @@ test("이어 주는 길은 정해진 셋 밖의 경로와 밖에서 온 Authoriz
     assert.equal(answer.headers.get("set-cookie"), null);
     assert.equal(await answer.text(), "0000");
 });
+
+test("운영의 답에는 일정마다 다음 때와 마지막 실행이 숫자와 갈래로만 온다", async () =>
+{
+    const reply = {
+        release: "r1",
+        services: [{ name: "api", kind: "server", url: "https://hr.example/api" }],
+        migrations: [],
+        schedules: [
+            { service: "api", path: "/api/jobs/payroll", cron: "0 9 25 * *", next_at: 1_798_189_200, last_run: { due_at: 1_795_597_200, started_at: 1_795_597_210, outcome: "timed_out", status: null, millis: 600_000 } },
+            { service: "api", path: "/api/jobs/close", cron: "0 0 1 * *", next_at: 1_798_761_600, last_run: null },
+        ],
+    };
+    const orbital = createOrbital({
+        url: "http://layer.invalid/",
+        serviceKey: SERVICE_KEY,
+        fetch: (async () => new Response(JSON.stringify(reply), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch,
+    });
+    const production = await orbital.production.get("k3f9x2ab");
+    assert.deepEqual(production?.schedules, [
+        { service: "api", path: "/api/jobs/payroll", cron: "0 9 25 * *", nextAt: 1_798_189_200, lastRun: { dueAt: 1_795_597_200, startedAt: 1_795_597_210, outcome: "timed_out", status: null, millis: 600_000 } },
+        { service: "api", path: "/api/jobs/close", cron: "0 0 1 * *", nextAt: 1_798_761_600, lastRun: null },
+    ]);
+});

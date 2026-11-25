@@ -144,11 +144,13 @@ async function shipChange(account: string, folder: string, edit: (source: string
     return release;
 }
 
-async function startFactory(): Promise<void>
+/** 팩토리 서버를 띄운다. `port` 를 주면 그 포트로 다시 띄운다(에이전트가 들고 있는 원격의 주소가 그대로다) */
+async function startFactory(port?: number): Promise<void>
 {
-    const port = await freePort();
+    port ??= await freePort();
     origin = `http://127.0.0.1:${port}`;
-    factory = spawn(process.execPath, [join(here, "src/main.ts")], {
+    // 워크스페이스의 SDK 는 빌드하지 않은 소스(.ts)를 쓴다(`orbital-source` 조건)
+    factory = spawn(process.execPath, ["--conditions=orbital-source", join(here, "src/main.ts")], {
         env: { PATH: process.env.PATH ?? "", ORBITAL_URL: layer, ORBITAL_PUBLIC_URL: direct, ORBITAL_SERVICE_KEY: SERVICE_KEY, FACTORY_PORT: String(port), FACTORY_HOME: home },
         stdio: ["ignore", "pipe", "pipe"],
     });
@@ -542,7 +544,7 @@ test("git 의 자격은 그 고객의 그 인스턴스에서만, 두 시간 동�
     const bare = await fetch(refs(alice.remote));
     assert.equal(bare.status, 401);
     assert.match(bare.headers.get("www-authenticate") ?? "", /^Basic /);
-    // 남의 원격 · 지어낸 원격 · 지어낸 자격으로는 통하지 않는다
+    // 남의 원격 · 지어낸 원격 · 지어낸 자격으로는 통하지 않는다. 자격을 냈는데 통하지 않으면 403 과 git 이 보일 글이다(무엇을 할지만, 레이어는 말하지 않는다)
     for (const [remote, credential] of [
         [bob.remote, alice.credential],
         [alice.remote, bob.credential],
@@ -551,7 +553,9 @@ test("git 의 자격은 그 고객의 그 인스턴스에서만, 두 시간 동�
         [alice.remote, "fgit_made_up"],
     ] as const)
     {
-        assert.equal((await fetch(refs(remote), { headers: { authorization: `Bearer ${credential}` } })).status, 401, `${remote} ${credential.slice(0, 8)}`);
+        const refused = await fetch(refs(remote), { headers: { authorization: `Bearer ${credential}` } });
+        assert.equal(refused.status, 403, `${remote} ${credential.slice(0, 8)}`);
+        assert.match(await refused.text(), /workspace_open/);
     }
     // git 의 길에서만 통한다: 도구의 길(/mcp)과 인가 서버의 길은 열지 못한다
     const tools = await fetch(`${origin}/mcp`, {
@@ -589,8 +593,8 @@ test("MCP 의 토큰으로는 git 에 닿지 못하고 git 의 자격으로는 �
     await assert.rejects(git(scratch, token, "ls-remote", alice.remote));
     for (const authorization of [`Bearer ${token}`, `Basic ${Buffer.from(`alice:${token}`).toString("base64")}`])
     {
-        assert.equal((await fetch(`${alice.remote}/info/refs?service=git-receive-pack`, { headers: { authorization } })).status, 401);
-        assert.equal((await fetch(`${alice.remote}/git-receive-pack`, { method: "POST", headers: { authorization }, body: "0000" })).status, 401);
+        assert.equal((await fetch(`${alice.remote}/info/refs?service=git-receive-pack`, { headers: { authorization } })).status, 403);
+        assert.equal((await fetch(`${alice.remote}/git-receive-pack`, { method: "POST", headers: { authorization }, body: "0000" })).status, 403);
     }
     // git 의 자격으로는 도구를 부르지 못한다
     const called = await fetch(`${origin}/mcp`, {
@@ -978,6 +982,50 @@ test("도구의 답과 팩토리의 로그에 값이 실리지 않는다", { ski
     {
         assert.ok(!everything.includes(value), `\`${value}\` 가 새었습니다`);
     }
+});
+
+test("팩토리의 서버가 다시 뜬 뒤에도 에이전트가 workspace_open 을 다시 불러 받던 작업 폴더로 이어서 올린다", { skip }, async () =>
+{
+    const client = await platform(await connect("frank"));
+    const opened = structured<Workspace>(await call(client, "workspace_open"));
+    await git(scratch, opened.credential, "clone", "--quiet", opened.remote, "frank");
+    const work = join(scratch, "frank");
+    writeFileSync(join(work, "server.js"), readFileSync(join(work, "server.js"), "utf8").replace("version: 1", "version: 3"));
+    await git(work, undefined, "commit", "--quiet", "-am", "다시 뜨기 전에 고친 것");
+
+    // 팩토리가 다시 뜬다. 작업 · git 의 자격 · 연결의 토큰은 메모리에만 있어 사라지고, 고객과 인스턴스의 짝(파일)은 남는다
+    await stopFactory();
+    await startFactory(Number(new URL(origin).port));
+
+    // 앞의 자격으로 올리면 git 이 무엇을 할지 읽는다. 레이어의 주소 · 토큰은 보이지 않는다
+    const helper = ["-c", "credential.helper=", "-c", `credential.helper=!f() { echo username=agent; echo password=${opened.credential}; }; f`];
+    for (const credential of [opened.credential, undefined])
+    {
+        // 한 번 쓰는 머리말로도, 자격 도우미로도
+        const args = credential === undefined ? [...helper, "push", "--quiet", "origin", "main"] : ["push", "--quiet", "origin", "main"];
+        const failed = await git(work, credential, ...args).then(() => "", (error: unknown) => String(error));
+        assert.match(failed, /remote: .*workspace_open/, failed);
+        assert.match(failed, /git remote set-url origin/, failed);
+        for (const leak of [layer, direct, new URL(direct).host, "orb1.", SERVICE_KEY])
+        {
+            assert.ok(!failed.includes(leak), `git 이 보인 글에 \`${leak}\` 가 있습니다`);
+        }
+    }
+    // 앞의 연결의 토큰도 사라졌다. 플랫폼이 계정을 다시 연결하고(MCP 의 401 → OAuth), 에이전트가 작업을 다시 연다
+    const stale = await fetch(`${origin}/mcp`, { method: "POST", headers: { authorization: "Bearer x", "content-type": "application/json" }, body: "{}" });
+    assert.equal(stale.status, 401);
+    const again = await platform(await connect("frank"));
+    const reopened = structured<Workspace>(await call(again, "workspace_open"));
+    assert.notEqual(reopened.remote, opened.remote);
+    // 스킬이 적은 대로 원격만 바꿔 같은 폴더에서 이어서 올린다. 다시 받지 않는다
+    await git(work, undefined, "remote", "set-url", "origin", reopened.remote);
+    await git(work, reopened.credential, "push", "--quiet", "origin", "main");
+    const head = await git(work, undefined, "rev-parse", "HEAD");
+    const shown = await call(again, "preview");
+    assert.equal(shown.isError, undefined, textOf(shown));
+    assert.equal(structured<{ commit: string }>(shown).commit, head);
+    const address = structured<{ services: { url: string }[] }>(shown).services[0]?.url ?? "";
+    assert.equal(((await (await fetch(`${address}/health`)).json()) as { version: number }).version, 3);
 });
 
 test("도구의 답과 팩토리의 로그 어디에도 레이어의 주소와 토큰이 없다", { skip }, async () =>

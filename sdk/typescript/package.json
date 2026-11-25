@@ -5,15 +5,28 @@
     "description": "Orbital 의 TypeScript SDK. 팩토리의 서버 코드가 쓴다",
     "type": "module",
     "exports": {
-        "./server": "./src/server.ts",
-        "./app": "./src/app.ts"
+        "./server": {
+            "orbital-source": "./src/server.ts",
+            "types": "./dist/server.d.ts",
+            "default": "./dist/server.js"
+        },
+        "./app": {
+            "orbital-source": "./src/app.ts",
+            "types": "./dist/app.d.ts",
+            "default": "./dist/app.js"
+        }
     },
     "scripts": {
+        "build": "tsc -p tsconfig.build.json",
+        "prepack": "npm run build",
         "typecheck": "tsc --noEmit",
         "test": "node --test test/*.test.ts"
     },
     "devDependencies": {
         "@types/node": "26.6.9",
         "typescript": "7.0.2"
-    }
+    },
+    "files": [
+        "dist"
+    ]
 }

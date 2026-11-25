@@ -157,18 +157,33 @@ async function sendWeb(response: ServerResponse, answer: globalThis.Response): P
     response.end();
 }
 
+/**
+ * 자격이 통하지 않을 때 에이전트의 git 에 보일 말. 작업과 자격은 이 프로세스의 메모리에만 있어서, 두 시간이 지났거나 팩토리가 다시 뜨면 없어진다.
+ * 무엇을 하면 되는지만 말하고 레이어의 주소 · 이름은 드러내지 않는다.
+ */
+export const STALE_REMOTE = "This git remote's workspace has ended (it expired or the factory restarted). Call the workspace_open tool again for a new remote and credential, then run `git remote set-url origin <new remote>` and retry; your local commits are kept.";
+
 /** 에이전트의 git 을 그 작업의 토큰으로 레이어에 이어 준다. 본문은 모아 두지 않고 흘려 넘긴다 */
 async function serveGit(works: Works, origin: string, url: URL, request: IncomingMessage, response: ServerResponse): Promise<void>
 {
     const id = url.pathname.split("/")[2] ?? "";
-    const opened = works.forGit(id, credentialOf(request.headers.authorization));
+    const presented = credentialOf(request.headers.authorization);
+    const opened = works.forGit(id, presented);
     if (opened === undefined)
     {
         request.resume();
+        // 자격을 냈는데 통하지 않으면 403 과 글(text/plain)로 답한다. git 은 그 글을 `remote: …` 로 그대로 보인다.
+        // 401 로 답하면 git 은 글을 보이지 않고 자격을 다시 묻다가 멈춘다. 자격을 내지 않은 첫 요청에만 401 로 답해 자격 도우미가 돌게 한다
+        if (presented !== "")
+        {
+            response.writeHead(403, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+            response.end(`${STALE_REMOTE}\n`);
+            return;
+        }
         send(response, {
             status: 401,
             headers: { "www-authenticate": "Basic realm=\"factory-todo git\", charset=\"UTF-8\"", "cache-control": "no-store" },
-            body: { error: "unauthorized", error_description: "git 의 자격이 없거나 끝났습니다. `workspace_open` 으로 작업을 다시 열어 새 자격을 받아 주세요" },
+            body: { error: "unauthorized", error_description: STALE_REMOTE },
         });
         return;
     }

@@ -5,10 +5,10 @@
     "description": "팩토리의 본보기. 에이전트 플랫폼의 앱(MCP 서버 + 스킬)으로 서서 Orbital 의 service key 를 저만 갖는다",
     "type": "module",
     "scripts": {
-        "start": "node src/main.ts",
-        "pack": "node src/pack.ts",
+        "start": "node --conditions=orbital-source src/main.ts",
+        "pack": "node --conditions=orbital-source src/pack.ts",
         "typecheck": "tsc --noEmit",
-        "test": "node --test test/*.test.ts"
+        "test": "node --conditions=orbital-source --test test/*.test.ts"
     },
     "dependencies": {
         "@harmony/orbital": "*",
