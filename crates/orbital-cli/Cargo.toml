@@ -1,6 +1,6 @@
 [package]
 name = "orbital-cli"
-description = "Orbital 의 CLI. 에이전트가 sandbox 에서 선언과 권한 표를 올리기 전에 검사한다"
+description = "Orbital 의 CLI. 선언 파일과 권한 표를 검사하고 세워질 역할과 권한의 변화를 본다. 레이어에 닿지 않는다"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,14 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 orbital-core = { path = "../orbital-core" }
-serde_json.workspace = true
 toml.workspace = true
-ureq.workspace = true
-
-[dev-dependencies]
-orbital-run = { path = "../orbital-run" }
-orbital-server = { path = "../orbital-server" }
-tiny_http.workspace = true
 
 [lints]
 workspace = true
