@@ -174,7 +174,7 @@ function reasonOf(error: unknown): { reason: string; details: readonly string[] 
             return { reason: error.message, details: [] };
         case "build_failed":
         case "start_failed":
-            return { reason: `${error.message}. 운영은 앞의 모습 그대로입니다. 에이전트에게 미리보기를 다시 세워 확인해 달라고 해 주세요.`, details: [] };
+            return { reason: `${error.message}. 운영은 앞의 모습 그대로입니다. 에이전트에게 프리뷰를 다시 세워 확인해 달라고 해 주세요.`, details: [] };
         case "not_found":
             return { reason: "그 release 를 레이어에서 찾지 못했습니다. 카드를 다시 열어 주세요.", details: [] };
         default:

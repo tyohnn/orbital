@@ -1,6 +1,6 @@
 //! 인스턴스마다의 하위 도메인. 레이어가 주소 하나에서 모든 인스턴스의 요청을 받고 `Host` 로 가른다.
 //!
-//! `<인스턴스>.<기준 도메인>` 은 그 인스턴스의 운영, `<인스턴스>-preview.<기준 도메인>` 은 미리보기다.
+//! `<인스턴스>.<기준 도메인>` 은 그 인스턴스의 운영, `<인스턴스>-preview.<기준 도메인>` 은 프리뷰다.
 //! 인스턴스의 식별자에는 `-` 가 없어 둘이 겹치지 않는다. `Host` 는 글자 그대로 본다(대소문자를 접거나 끝의 `.` 을 떼지 않는다).
 //! 기준 도메인은 바깥에서 보이는 그대로 적는다. 포트가 붙는 자리(로컬)면 `orbital.test:7480` 처럼 포트까지 적는다.
 
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::name::InstanceId;
 
-/// 미리보기의 하위 도메인에 붙는 꼬리.
+/// 프리뷰의 하위 도메인에 붙는 꼬리.
 pub const PREVIEW_SUFFIX: &str = "-preview";
 
 /// 기준 도메인. 소문자 이름 조각을 `.` 으로 이은 것이고, 바깥 포트가 있으면 `:포트` 가 붙는다.
@@ -145,7 +145,7 @@ impl Scheme {
     }
 }
 
-/// 요청이 가는 곳. 인스턴스 하나의 운영이거나 미리보기다.
+/// 요청이 가는 곳. 인스턴스 하나의 운영이거나 프리뷰다.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "stage", content = "instance", rename_all = "snake_case")]
 pub enum HostTarget {
@@ -169,7 +169,7 @@ impl HostTarget {
     }
 }
 
-/// `Host` 머리말의 값이 가리키는 곳. 기준 도메인 바로 아래의 한 조각이고 그 조각이 인스턴스(또는 그 미리보기)일 때만 있다.
+/// `Host` 머리말의 값이 가리키는 곳. 기준 도메인 바로 아래의 한 조각이고 그 조각이 인스턴스(또는 그 프리뷰)일 때만 있다.
 ///
 /// 기준 도메인 자체, 두 조각 아래, 다른 도메인, 대문자, 끝의 `.`, 기준 도메인과 다른 포트는 모두 `None` 이다.
 pub fn judge_host(host: &str, base: &BaseDomain) -> Option<HostTarget> {
@@ -234,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn 인스턴스의_조각은_운영으로_preview_가_붙은_조각은_미리보기로_간다() {
+    fn 인스턴스의_조각은_운영으로_preview_가_붙은_조각은_프리뷰로_간다() {
         let base = base("orbital.test");
         assert_eq!(
             judge_host("k3f9x2ab.orbital.test", &base),

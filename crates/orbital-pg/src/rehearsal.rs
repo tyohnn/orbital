@@ -1,9 +1,9 @@
-//! 예행연습과 되돌릴 지점. 둘 다 운영 database 의 복제로 한다.
+//! 리허설과 되돌릴 지점. 둘 다 운영 database 의 복제로 한다.
 //!
 //! 복제는 PostgreSQL 18 부터 있는 `STRATEGY = FILE_COPY` 를 쓴다. 블록을 나눠 쓰는 파일시스템(XFS 같은)에서는 크기와 거의 무관하게 끝난다.
 //! 사본은 만들자마자 아무도 접속하지 못하게 막는다. 인스턴스의 로그인도, 에이전트의 토큰도 닿지 못한다.
 //!
-//! 예행연습이 돌려주는 것은 숫자뿐이다. 통과했는지, 얼마나 걸렸는지, 몇 번째에서 멈췄는지, 표마다 행이 몇 개인지다.
+//! 리허설이 돌려주는 것은 숫자뿐이다. 통과했는지, 얼마나 걸렸는지, 몇 번째에서 멈췄는지, 표마다 행이 몇 개인지다.
 //! Postgres 의 오류 문구는 싣지 않는다. 문구와 DETAIL 에 행의 값이 섞일 수 있어서 SQLSTATE 만 싣는다.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -21,7 +21,7 @@ pub struct TableCount {
     pub after: Option<i64>,
 }
 
-/// 예행연습의 결과. 행의 내용은 어디에도 없다.
+/// 리허설의 결과. 행의 내용은 어디에도 없다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rehearsal {
     pub passed: bool,
@@ -154,7 +154,7 @@ impl Admin {
         let copy = format!("{}_reh_{}", names.prefix(), suffix());
         self.clone_database(&names.database(), &copy)?;
         let result = self.rehearse_in(names, &copy, migrations);
-        // 예행연습이 어떻게 끝났든 사본은 지운다
+        // 리허설이 어떻게 끝났든 사본은 지운다
         self.drop_database(&copy)?;
         result
     }
@@ -186,7 +186,7 @@ impl Admin {
         let started = Instant::now();
         let mut failure = None;
         for (index, migration) in migrations.iter().enumerate() {
-            let mut transaction = client.transaction().map_err(pg("예행연습을 시작"))?;
+            let mut transaction = client.transaction().map_err(pg("리허설을 시작"))?;
             if let Err(error) = transaction
                 .batch_execute(migration)
                 .and_then(|()| transaction.commit())

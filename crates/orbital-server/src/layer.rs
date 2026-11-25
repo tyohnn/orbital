@@ -1,4 +1,4 @@
-//! 레이어의 동작. 인스턴스를 세우고, 코드를 받고, 그 commit 에서 직접 빌드해 미리보기를 세우고, 승인받은 release 를 운영에 올린다.
+//! 레이어의 동작. 인스턴스를 세우고, 코드를 받고, 그 commit 에서 직접 빌드해 프리뷰를 세우고, 승인받은 release 를 운영에 올린다.
 //!
 //! 판정은 core 가 한다(토큰의 범위, 권한 검사, 승격의 규칙). 여기서는 부품을 순서대로 부르고, 중간에 깨지면 앞의 모습으로 돌린다.
 //! 서버가 하나일 때의 모양이라 일을 하나씩 차례로 한다(자물쇠 하나).
@@ -275,7 +275,7 @@ impl Starter for ServiceStarter {
     }
 }
 
-/// 띄울 자리. 미리보기와 운영이 이름 · 비밀 · 서명의 열쇠를 따로 갖는다.
+/// 띄울 자리. 프리뷰와 운영이 이름 · 비밀 · 서명의 열쇠를 따로 갖는다.
 struct Stand<'a> {
     names: &'a Names,
     generated: &'a BTreeMap<String, String>,
@@ -298,14 +298,14 @@ impl Drop for LiveService {
     }
 }
 
-/// 떠 있는 것 하나(미리보기이거나 운영). 서비스가 먼저 내려가고 router 가 뒤에 내려간다.
+/// 떠 있는 것 하나(프리뷰이거나 운영). 서비스가 먼저 내려가고 router 가 뒤에 내려간다.
 struct Live {
     release: String,
     /// router 의 바깥 주소. Google 의 콜백이 한 번 쓰는 표를 들고 이리로 보낸다.
     origin: String,
     names: Names,
     manifest: ValidManifest,
-    /// 미리보기의 씨앗 사용자. 운영에는 없다.
+    /// 프리뷰의 씨앗 사용자. 운영에는 없다.
     seed_users: Vec<String>,
     services: Vec<LiveService>,
     _router: Front,
@@ -463,7 +463,7 @@ pub struct Options {
 pub struct Hosting {
     /// 모든 인스턴스의 요청을 받는 주소(`ORBITAL_ROUTER_LISTEN`).
     pub listen: String,
-    /// 기준 도메인(`ORBITAL_BASE_DOMAIN`). `<인스턴스>.<기준 도메인>` 이 운영, `<인스턴스>-preview.<기준 도메인>` 이 미리보기다.
+    /// 기준 도메인(`ORBITAL_BASE_DOMAIN`). `<인스턴스>.<기준 도메인>` 이 운영, `<인스턴스>-preview.<기준 도메인>` 이 프리뷰다.
     pub base: BaseDomain,
     /// 바깥의 스킴(`ORBITAL_PUBLIC_SCHEME`). TLS 는 레이어 앞에서 끝난다고 본다.
     pub scheme: Scheme,
@@ -574,10 +574,10 @@ fn blocker_text(blocker: &orbital_core::release::Blocker) -> String {
             format!("권한 검사에서 어긋남이 {findings}개 나왔습니다")
         }
         Blocker::RehearsalNotRun => {
-            "마이그레이션의 예행연습을 아직 돌리지 않았습니다. `orbital rehearse` 로 돌려 주세요"
+            "마이그레이션의 리허설을 아직 돌리지 않았습니다. `orbital rehearse` 로 돌려 주세요"
                 .to_owned()
         }
-        Blocker::RehearsalFailed => "마이그레이션의 예행연습이 실패했습니다".to_owned(),
+        Blocker::RehearsalFailed => "마이그레이션의 리허설이 실패했습니다".to_owned(),
         Blocker::KeyMissing { key } => key_text(*key),
         Blocker::SecretMissing { secret } => secret_text(secret),
     }
@@ -704,7 +704,7 @@ impl Layer {
     /// 관리 서버가 다시 떴을 때 기록에서 운영 중인 인스턴스의 router 를 「자는」 상태로 다시 세운다. 첫 요청에 깬다.
     ///
     /// 기록(`registry.json`)의 운영 release · 서명의 열쇠 · 레이어가 만든 비밀과, 레이어가 빌드한 폴더를 믿는다.
-    /// 빌드한 폴더가 없으면 그 commit 에서 다시 빌드한다. 미리보기는 되살리지 않는다(다시 세우면 된다).
+    /// 빌드한 폴더가 없으면 그 commit 에서 다시 빌드한다. 프리뷰는 되살리지 않는다(다시 세우면 된다).
     /// 되살리지 못한 인스턴스는 건너뛰고 식별자와 갈래만 알린다.
     fn restore(&self) {
         let mut inner = self.lock();
@@ -716,7 +716,7 @@ impl Layer {
             .filter(|(_, record)| record.production.is_some())
             .map(|(id, record)| (id.clone(), record.clone()))
             .collect();
-        // 미리보기는 되살리지 않는다. 앞의 관리 서버가 세워 둔 미리보기의 database 를 걷는다
+        // 프리뷰는 되살리지 않는다. 앞의 관리 서버가 세워 둔 프리뷰의 database 를 걷는다
         let previews: Vec<(String, String)> = inner
             .registry
             .state
@@ -734,7 +734,7 @@ impl Layer {
                         record.preview = None;
                     }
                 }
-                Err(_) => eprintln!("orbitald: {id} 의 앞 미리보기 database 를 걷지 못했습니다"),
+                Err(_) => eprintln!("orbitald: {id} 의 앞 프리뷰 database 를 걷지 못했습니다"),
             }
         }
         if inner.registry.save().is_err() {
@@ -1032,7 +1032,7 @@ impl Layer {
     /// 빌드한 것을 띄운다. 서버 서비스마다 proxy 를 하나 세우고, 앱에는 그 주소와 레이어가 만든 비밀만 건넨다.
     /// 서비스들 앞에 router 를 세운다. 밖에서는 router 의 주소로만 닿는다.
     ///
-    /// `wake` 면 서버 서비스를 지금 띄워 실제로 뜨는지 확인한다(미리보기와 승격). 아니면 자는 채로 세워 첫 요청에 깨운다
+    /// `wake` 면 서버 서비스를 지금 띄워 실제로 뜨는지 확인한다(프리뷰와 승격). 아니면 자는 채로 세워 첫 요청에 깨운다
     /// (관리 서버가 다시 떴을 때). 어느 쪽이든 요청이 없으면 정한 시간 뒤에 잔다.
     fn launch(
         &self,
@@ -1094,7 +1094,7 @@ impl Layer {
             // 포트(`PORT`)는 띄울 때마다 새로 받는다. 자고 깨면 바뀐다
             let mut env = vec![
                 ("HOST".to_owned(), "127.0.0.1".to_owned()),
-                // 미리보기에서 메일을 보내지 않는 것처럼, 앱이 어디에 섰는지에 따라 달리 굴 일이 있다
+                // 프리뷰에서 메일을 보내지 않는 것처럼, 앱이 어디에 섰는지에 따라 달리 굴 일이 있다
                 (
                     "ORBITAL_STAGE".to_owned(),
                     match stage {
@@ -1201,7 +1201,7 @@ impl Layer {
             );
             Arc::new(move || AuthStore::connect(&url, &names, &manifest)) as Connect
         });
-        // 메일과 Google 은 팩토리의 키로 한다. 미리보기의 router 는 메일을 보내지 않고 Google 의 문이 없다
+        // 메일과 Google 은 팩토리의 키로 한다. 프리뷰의 router 는 메일을 보내지 않고 Google 의 문이 없다
         let mailer = Arc::new(FactoryMailer {
             settings: Arc::clone(&self.settings),
             organization: stand.organization.to_owned(),
@@ -1264,7 +1264,7 @@ impl Layer {
         })
     }
 
-    /// 씨앗 사용자의 식별자. 미리보기에만 있다.
+    /// 씨앗 사용자의 식별자. 프리뷰에만 있다.
     fn seed_ids(assembled: &Assembled, stage: Stage) -> Vec<String> {
         if stage == Stage::Preview {
             assembled
@@ -1332,7 +1332,7 @@ impl Layer {
         Ok(self.assembled(instance, &commit)?.access)
     }
 
-    /// commit 하나의 미리보기를 세운다. 그 commit 에서 직접 빌드하고, 씨앗 데이터만 든 DB 를 새로 만들어 역할과 권한을 세우고, 권한 검사를 돌린다.
+    /// commit 하나의 프리뷰를 세운다. 그 commit 에서 직접 빌드하고, 씨앗 데이터만 든 DB 를 새로 만들어 역할과 권한을 세우고, 권한 검사를 돌린다.
     pub fn preview(&self, instance: &InstanceId, commit: Option<Commit>) -> Outcome<PreviewReport> {
         let mut inner = self.lock();
         let record = inner
@@ -1349,7 +1349,7 @@ impl Layer {
         let assembled = self.assembled(instance, &commit)?;
         let folder = self.build(instance, &assembled)?;
 
-        // 앞의 미리보기를 걷는다. 인스턴스마다 미리보기는 하나다
+        // 앞의 프리뷰를 걷는다. 인스턴스마다 프리뷰는 하나다
         if let Some(old) = inner
             .live
             .remove(&(instance.as_str().to_owned(), Stage::Preview))
@@ -1389,7 +1389,7 @@ impl Layer {
             }
         };
 
-        // 운영에 아직 돌지 않은 마이그레이션이 있으면 예행연습이 필요하다
+        // 운영에 아직 돌지 않은 마이그레이션이 있으면 리허설이 필요하다
         let rehearsal = match &record.production {
             None => Rehearsed::NotNeeded,
             Some(_) => {
@@ -1491,7 +1491,7 @@ impl Layer {
         Ok(report)
     }
 
-    /// 미리보기의 database 를 기록에 적거나 지운다.
+    /// 프리뷰의 database 를 기록에 적거나 지운다.
     fn note_preview(
         inner: &mut Inner,
         instance: &InstanceId,
@@ -1531,7 +1531,7 @@ impl Layer {
                 "빈 DB 에 마이그레이션을 돌리다가 실패했습니다. {error}"
             ))
         })?;
-        // 씨앗 데이터의 SQL 이 씨앗 사용자를 가리킬 수 있게 그 앞에 넣는다. 미리보기에만 들어간다
+        // 씨앗 데이터의 SQL 이 씨앗 사용자를 가리킬 수 있게 그 앞에 넣는다. 프리뷰에만 들어간다
         admin
             .seed_users(names, &assembled.seed_users, now())
             .map_err(|error| {
@@ -1557,9 +1557,9 @@ impl Layer {
         ))
     }
 
-    /// 미리보기에서 씨앗 사용자로 요청해 볼 수 있게 그 사용자의 세션을 만들고, 요청에 그대로 붙일 `Cookie` 머리말의 값을 돌려준다.
+    /// 프리뷰에서 씨앗 사용자로 요청해 볼 수 있게 그 사용자의 세션을 만들고, 요청에 그대로 붙일 `Cookie` 머리말의 값을 돌려준다.
     ///
-    /// 미리보기의 DB 에만 있는 세션이라 운영에서는 읽히지 않는다. 씨앗 사용자(`db/seed/users.toml`)만 된다.
+    /// 프리뷰의 DB 에만 있는 세션이라 운영에서는 읽히지 않는다. 씨앗 사용자(`db/seed/users.toml`)만 된다.
     pub fn preview_session(&self, instance: &InstanceId, user: &str) -> Outcome<String> {
         let (names, manifest) = {
             let inner = self.lock();
@@ -1568,7 +1568,7 @@ impl Layer {
                 .get(&(instance.as_str().to_owned(), Stage::Preview))
                 .ok_or_else(|| {
                     Failure::Conflict(
-                        "떠 있는 미리보기가 없습니다. `orbital preview` 로 먼저 세워 주세요"
+                        "떠 있는 프리뷰가 없습니다. `orbital preview` 로 먼저 세워 주세요"
                             .to_owned(),
                     )
                 })?;
@@ -1589,7 +1589,7 @@ impl Layer {
         Ok(format!("{SESSION_COOKIE}={}", session.to_text()))
     }
 
-    /// 미리보기를 걷는다.
+    /// 프리뷰를 걷는다.
     pub fn stop_preview(&self, instance: &InstanceId) -> Outcome<()> {
         let mut inner = self.lock();
         if let Some(old) = inner
@@ -1615,8 +1615,7 @@ impl Layer {
             .ok_or(Failure::NotFound)?;
         let known = record.releases.get(release).ok_or_else(|| {
             Failure::Conflict(
-                "그 release 의 미리보기가 없습니다. `orbital preview` 로 먼저 세워 주세요"
-                    .to_owned(),
+                "그 release 의 프리뷰가 없습니다. `orbital preview` 로 먼저 세워 주세요".to_owned(),
             )
         })?;
         let commit = Commit::parse(&known.commit)
@@ -1696,8 +1695,7 @@ impl Layer {
             .ok_or(Failure::NotFound)?;
         let known = record.releases.get(release).ok_or_else(|| {
             Failure::Conflict(
-                "그 release 의 미리보기가 없습니다. `orbital preview` 로 먼저 세워 주세요"
-                    .to_owned(),
+                "그 release 의 프리뷰가 없습니다. `orbital preview` 로 먼저 세워 주세요".to_owned(),
             )
         })?;
         let commit = Commit::parse(&known.commit)
@@ -1755,7 +1753,7 @@ impl Layer {
             // 밖에서 넣는 비밀도 올리는 때의 운영 칸을 본다
             missing_secrets: self.missing_secrets(organization, instance, &assembled.manifest),
         };
-        // 승인은 호출에 적힌 release 하나에 묶인다. 승인한 뒤 commit 이 더해졌으면 식별자가 달라 여기서 찾지 못하거나 예행연습이 다시 필요하다
+        // 승인은 호출에 적힌 release 하나에 묶인다. 승인한 뒤 commit 이 더해졌으면 식별자가 달라 여기서 찾지 못하거나 리허설이 다시 필요하다
         let approval = Approval {
             release: ReleaseId(release.to_owned()),
             by: approved_by,

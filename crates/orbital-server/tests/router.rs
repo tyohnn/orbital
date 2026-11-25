@@ -460,7 +460,7 @@ impl Bench {
         body["token"].as_str().unwrap().to_owned()
     }
 
-    /// 미리보기를 세운다. 그 주소와 release 를 돌려준다.
+    /// 프리뷰를 세운다. 그 주소와 release 를 돌려준다.
     fn preview(&self, instance: &str, token: &str) -> (String, String) {
         let (status, preview) = self.call(
             "POST",
@@ -475,7 +475,7 @@ impl Bench {
         )
     }
 
-    /// 미리보기 → 승격 요청 → 고객의 승인 → 운영. (인스턴스, 미리보기의 주소, 운영의 주소).
+    /// 프리뷰 → 승격 요청 → 고객의 승인 → 운영. (인스턴스, 프리뷰의 주소, 운영의 주소).
     fn ship_with_preview(&mut self, app: &str) -> (String, String, String) {
         let instance = self.instance(app);
         let token = self.token(&instance);
@@ -845,7 +845,7 @@ fn 관리_서버가_다시_떠도_운영은_첫_요청에_깬다() {
     assert!(bench.database_exists(&preview_database));
 
     bench.restart();
-    // 미리보기는 되살리지 않고, 앞의 레이어가 세운 미리보기의 database 는 걷는다
+    // 프리뷰는 되살리지 않고, 앞의 레이어가 세운 프리뷰의 database 는 걷는다
     assert!(!bench.database_exists(&preview_database));
     // 다시 뜬 레이어는 운영의 router 를 자는 채로 세운다. 앱의 프로세스는 아직 없다
     assert_eq!(bench.probe.starts(), 0);
@@ -855,9 +855,9 @@ fn 관리_서버가_다시_떠도_운영은_첫_요청에_깬다() {
     assert_eq!(cards.status, 200, "{}", cards.everything());
     assert_eq!(titles(&cards), vec!["다시 뜨기 전의 일"]);
     assert_eq!(bench.probe.starts(), 1);
-    // 미리보기는 되살리지 않는다. 다시 세우면 된다
+    // 프리뷰는 되살리지 않는다. 다시 세우면 된다
     let preview_port: u16 = preview.rsplit(':').next().unwrap().parse().unwrap();
-    assert!(!listening(preview_port), "미리보기가 되살아났습니다");
+    assert!(!listening(preview_port), "프리뷰가 되살아났습니다");
 }
 
 // ---- 하위 도메인 ----
@@ -888,7 +888,7 @@ fn 인스턴스의_하위_도메인으로_온_요청은_그_인스턴스의_운�
 }
 
 #[test]
-fn 미리보기는_운영과_다른_하위_도메인으로_가고_쿠키를_나누지_않는다() {
+fn 프리뷰는_운영과_다른_하위_도메인으로_가고_쿠키를_나누지_않는다() {
     let mut bench = bench!(true);
     let (instance, preview, live) = bench.ship_with_preview("cards");
     assert_eq!(preview, format!("http://{instance}-preview.{BASE}"));

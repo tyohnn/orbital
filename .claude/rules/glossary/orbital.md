@@ -21,17 +21,17 @@ paths:
 | 마이그레이션 역할 | 레이어가 배포하는 동안만 들어가 스키마를 바꾸는 역할 | `Names::migrator` |
 | 계획 | DB 에 세울 것을 적은 단계의 목록 | `Step`, `provision`, `grants` |
 | 권한 검사 | 실제 DB 가 선언과 권한 표에 정확히 맞는지 보는 일. 승격의 관문 | `Snapshot`, `Finding`, `check::judge` |
-| 토큰 | 에이전트의 작업 한 번 동안의 권한. 인스턴스 하나, 미리보기까지 | `Token`, `Capability`, `scope::judge` |
-| 예행연습 | 운영 DB 의 사본에 마이그레이션을 미리 돌리는 일. 숫자만 돌아온다 | `orbital-pg` |
+| 토큰 | 에이전트의 작업 한 번 동안의 권한. 인스턴스 하나, 프리뷰까지 | `Token`, `Capability`, `scope::judge` |
+| 리허설 | 운영 DB 의 사본에 마이그레이션을 미리 돌리는 일. 숫자만 돌아온다 | `orbital-pg` |
 | 서명된 신원 | router 가 세션을 확인해 서명한 것(`v2`: 사람 · 세션 · 업무 역할). 요청마다 60초짜리로 앱에 싣는다. 행 단위 규칙은 이것만 읽는다 | `orbital-pg::identity`, `Claims` |
 | 역할 제한 정책 | `[auth]` 를 선언한 인스턴스의 표마다 레이어가 두는 제한하는 정책. 연결의 업무 역할이 신원에 없으면 어떤 행도 내주지 않는다 | `Step::SetRolePolicy`, `orbital.granted()`, `ROLE_POLICY` |
-| router | 미리보기 · 운영마다 하나가 서서(포트 하나, 또는 레이어의 주소 하나를 하위 도메인으로 나눠) 요청을 서비스로 가르고, 세션을 확인해 신원을 싣는 것. `/_orbital/` 은 직접 답한다 | `orbital-router`, `Router`, `auth::route` |
-| 기준 도메인 · 하위 도메인 | 레이어가 받는 도메인(`ORBITAL_BASE_DOMAIN`)과, 그 바로 아래 인스턴스마다의 한 조각(`<인스턴스>` 는 운영, `<인스턴스>-preview` 는 미리보기). 그 주소가 인스턴스의 origin 이다 | `BaseDomain`, `HostTarget`, `judge_host`, `Hosts` |
+| router | 프리뷰 · 운영마다 하나가 서서(포트 하나, 또는 레이어의 주소 하나를 하위 도메인으로 나눠) 요청을 서비스로 가르고, 세션을 확인해 신원을 싣는 것. `/_orbital/` 은 직접 답한다 | `orbital-router`, `Router`, `auth::route` |
+| 기준 도메인 · 하위 도메인 | 레이어가 받는 도메인(`ORBITAL_BASE_DOMAIN`)과, 그 바로 아래 인스턴스마다의 한 조각(`<인스턴스>` 는 운영, `<인스턴스>-preview` 는 프리뷰). 그 주소가 인스턴스의 origin 이다 | `BaseDomain`, `HostTarget`, `judge_host`, `Hosts` |
 | 재우기 · 깨우기 | 요청이 없는 서버 서비스의 프로세스를 내리는 일(`ORBITAL_SLEEP_AFTER`, 기본 5분)과, 첫 요청에 다시 띄우는 일. 깨우지 못하면 503 | `AppServer`, `Starter`, `WakeFailure` |
 | 쓰고 남은 줄 | 만료됐거나 거둔 로그인 링크 · Google 의 표 · 인가 요청 · 코드 · 세션 · 토큰. 하루 뒤 새 줄을 적을 때 지운다 | `sweep`, `Leftover` |
-| 사용자 | 인스턴스의 앱에 로그인하는 사람. 인스턴스의 database 안 `orbital_auth` 에 있다. 씨앗 사용자는 미리보기에만 있다 | `SessionUser`, `User`, `SeedUser` |
+| 사용자 | 인스턴스의 앱에 로그인하는 사람. 인스턴스의 database 안 `orbital_auth` 에 있다. 씨앗 사용자는 프리뷰에만 있다 | `SessionUser`, `User`, `SeedUser` |
 | 초대 | 그 이메일이 들어올 수 있게 하고 처음 가질 업무 역할을 정한 것. 14일 동안 받아들여진다 | `AuthStore::invite`, `judge_invitation` |
-| 로그인 링크 | 메일로 가는 한 번 쓰는 주소. 운영에서만 팩토리의 키로 나가고 미리보기에서는 나가지 않는다. 15분, 요청한 브라우저에서만 열린다. 같은 이메일로는 1분에 하나 | `AuthStore::request_link` · `enter`, `judge_link` |
+| 로그인 링크 | 메일로 가는 한 번 쓰는 주소. 운영에서만 팩토리의 키로 나가고 프리뷰에서는 나가지 않는다. 15분, 요청한 브라우저에서만 열린다. 같은 이메일로는 1분에 하나 | `AuthStore::request_link` · `enter`, `judge_link` |
 | 세션 | 로그인한 브라우저의 쿠키(`__Host-orbital-session`)가 가리키는 것. 거두거나 사용자를 빼면 다음 요청부터 없는 것이다 | `AuthStore::session`, `judge_session` |
 | 팩토리의 설정 | 팩토리마다 한 벌인 로그인의 키(Resend 의 키 · 보내는 주소, Google 클라이언트). 비밀은 어떤 답에도 돌아오지 않는다. 없으면 그 로그인 방법은 운영에 오르지 못한다 | `Settings`, `PUT /v1/settings/auth`, `FactoryKey`, `missing_keys` |
 | 봉인 | 팩토리의 비밀을 기록에 두는 모양. 조직과 칸을 함께 묶어 다른 줄에 옮기면 풀리지 않는다. 열쇠는 기록 밖(`ORBITAL_SEAL_KEY`)에 있다 | `seal`, `SealKey` |
@@ -52,7 +52,7 @@ paths:
 | 스캐폴드 | 팩토리가 올린 앱의 원본. 버전(태그)이 있고 인스턴스가 그 하나에서 갈라진다 | `receive_scaffold`, `SourceStore::create` |
 | 묶음 | 코드를 주고받는 git bundle. 에이전트가 받아 가서 고친 뒤 올린다 | `SourceStore::bundle` · `receive` |
 | release | commit 하나와 거기서 읽은 선언 · 권한 표 · 마이그레이션. 식별자가 commit 에 묶인다 | `ReleaseId`, `Assembled`, `release_id` |
-| 미리보기 | release 를 씨앗 데이터의 DB 와 함께 임시로 세운 것. 인스턴스마다 하나 | `Layer::preview` |
+| 프리뷰 | release 를 씨앗 데이터의 DB 와 함께 임시로 세운 것. 인스턴스마다 하나 | `Layer::preview` |
 | 승격 | 사람이 승인한 release 를 운영에 올리는 일. 팩토리의 서버만 부른다 | `release::promote`, `Layer::promote` |
 | 되돌릴 지점 | 승격 직전의 운영 DB 를 떠 둔 것 | `RestorePoint`, `Admin::mark` · `restore` |
 | service key | 팩토리의 서버가 쓰는 열쇠. 운영을 바꾸는 길은 이 열쇠에만 있다 | `Layer::organization` |

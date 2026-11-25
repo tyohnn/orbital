@@ -120,7 +120,7 @@ impl AppServer {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// 지금 떠 있는 프로세스를 넣는다. 레이어가 미리보기와 승격에서 새 서버가 실제로 뜨는지 확인한 뒤에 넘긴다.
+    /// 지금 떠 있는 프로세스를 넣는다. 레이어가 프리뷰와 승격에서 새 서버가 실제로 뜨는지 확인한 뒤에 넘긴다.
     /// 요청이 오지 않으면 정한 시간 뒤에 잔다.
     pub fn adopt(self: &Arc<Self>, process: Box<dyn Running>, port: u16) {
         let generation = {

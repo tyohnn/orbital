@@ -21,9 +21,9 @@ pub struct OrganizationId(pub String);
 pub enum Capability {
     /// 코드를 받고 올린다.
     Source,
-    /// 미리보기를 세우고, 그 로그와 DB(씨앗 데이터)를 본다. 승격을 요청한다.
+    /// 프리뷰를 세우고, 그 로그와 DB(씨앗 데이터)를 본다. 승격을 요청한다.
     Preview,
-    /// 운영 사본에 마이그레이션을 예행연습한다. 숫자만 돌아온다.
+    /// 운영 사본에 마이그레이션을 리허설한다. 숫자만 돌아온다.
     Rehearse,
     /// 사람에게 비밀의 입력을 요청한다. 값은 보지 못한다.
     SecretsRequest,

@@ -181,7 +181,7 @@ impl Remote {
                 .collect()
         };
         let mut text = format!(
-            "미리보기가 섰습니다. release {}\n",
+            "프리뷰가 섰습니다. release {}\n",
             report["release"].as_str().unwrap_or_default()
         );
         for service in report["services"].as_array().into_iter().flatten() {
@@ -216,7 +216,7 @@ impl Remote {
         Ok(text)
     }
 
-    /// 미리보기의 씨앗 사용자로 세션을 만들고, 요청에 그대로 붙일 `Cookie` 머리말의 값을 한 줄로 찍는다.
+    /// 프리뷰의 씨앗 사용자로 세션을 만들고, 요청에 그대로 붙일 `Cookie` 머리말의 값을 한 줄로 찍는다.
     fn identity(&self, user: &str) -> Result<String, String> {
         let reply = self.json("POST", "previews/identities", Some(json!({ "user": user })))?;
         Ok(format!(
@@ -228,13 +228,13 @@ impl Remote {
     fn rehearse(&self, release: &str) -> Result<String, String> {
         let report = self.json("POST", "rehearsals", Some(json!({ "release": release })))?;
         if report["needed"].as_bool() != Some(true) {
-            return Ok("운영에 돌릴 마이그레이션이 없어 예행연습이 필요 없습니다.\n".to_owned());
+            return Ok("운영에 돌릴 마이그레이션이 없어 리허설이 필요 없습니다.\n".to_owned());
         }
         let mut text = if report["passed"].as_bool() == Some(true) {
-            format!("예행연습이 통과했습니다({} ms).\n", report["millis"])
+            format!("리허설이 통과했습니다({} ms).\n", report["millis"])
         } else {
             format!(
-                "예행연습이 실패했습니다. `{}` 에서 멈췄습니다(SQLSTATE {}). 운영의 데이터에서만 나는 문제일 수 있습니다.\n",
+                "리허설이 실패했습니다. `{}` 에서 멈췄습니다(SQLSTATE {}). 운영의 데이터에서만 나는 문제일 수 있습니다.\n",
                 report["failed_at"].as_str().unwrap_or_default(),
                 report["sqlstate"].as_str().unwrap_or("모름")
             )

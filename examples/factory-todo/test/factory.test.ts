@@ -116,7 +116,7 @@ function wordAfter(text: string, marker: string): string
     return text.split(marker)[1]?.trim().split(/\s+/)[0] ?? "";
 }
 
-/** 에이전트가 고쳐 올리고 미리보기를 세운 뒤 승격을 요청한다. 요청한 release 를 돌려준다 */
+/** 에이전트가 고쳐 올리고 프리뷰를 세운 뒤 승격을 요청한다. 요청한 release 를 돌려준다 */
 async function shipChange(workspace: Workspace, folder: string, edit: (source: string) => string, message: string): Promise<string>
 {
     const work = join(scratch, folder);
@@ -648,7 +648,7 @@ test("레이어가 승격을 거절하면 그 까닭을 사람이 읽는 문장�
     const client = await platform(await connect("alice"));
     const before = structured<{ release: string; url: string }>(await call(client, "production_status"));
 
-    // 미리보기에서는 뜨고 운영에서만 뜨지 않는 서버를 올린다
+    // 프리뷰에서는 뜨고 운영에서만 뜨지 않는 서버를 올린다
     await shipChange(alice, "alice", (source) => `if (process.env.ORBITAL_STAGE === "production") process.exit(1);\n${source.replace("version: 3", "version: 4")}`, "운영에서 뜨지 않는다");
     const seen = approveButton(cardOf(await call(client, "promotion_show")));
     assert.ok(seen !== undefined);

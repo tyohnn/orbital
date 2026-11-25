@@ -80,8 +80,8 @@ fn denied(denied: &PromoteDenied) -> Reply {
                     Blocker::AccessCheckFailed { findings } => {
                         format!("권한 검사에서 어긋남이 {findings}개 나왔습니다. `orbital preview` 의 결과를 보고 고쳐 주세요")
                     }
-                    Blocker::RehearsalNotRun => "마이그레이션의 예행연습을 아직 돌리지 않았습니다. `orbital rehearse` 로 돌려 주세요".to_owned(),
-                    Blocker::RehearsalFailed => "마이그레이션의 예행연습이 실패했습니다".to_owned(),
+                    Blocker::RehearsalNotRun => "마이그레이션의 리허설을 아직 돌리지 않았습니다. `orbital rehearse` 로 돌려 주세요".to_owned(),
+                    Blocker::RehearsalFailed => "마이그레이션의 리허설이 실패했습니다".to_owned(),
                     Blocker::KeyMissing { key } => crate::layer::key_text(*key),
                     Blocker::SecretMissing { secret } => crate::layer::secret_text(secret),
                 })
@@ -239,7 +239,7 @@ struct OfRelease {
 
 #[derive(Deserialize)]
 struct NewIdentity {
-    /// 미리보기의 씨앗 사용자의 식별자.
+    /// 프리뷰의 씨앗 사용자의 식별자.
     user: String,
 }
 
@@ -318,7 +318,7 @@ fn with_token(
             layer.stop_preview(&instance)?;
             Ok(ok(json!({ "stopped": true })))
         }
-        // 미리보기의 씨앗 사용자로 세션을 만들어, 요청에 그대로 붙일 `Cookie` 머리말의 값을 돌려준다
+        // 프리뷰의 씨앗 사용자로 세션을 만들어, 요청에 그대로 붙일 `Cookie` 머리말의 값을 돌려준다
         ("POST", ["previews", "identities"]) => {
             allow(Action::PreviewDatabase)?;
             let request: NewIdentity = parse(body)?;

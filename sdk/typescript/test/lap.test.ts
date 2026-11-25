@@ -210,7 +210,7 @@ test("팩토리의 서버가 인스턴스를 세워 토큰을 내고 에이전�
     assert.ok(session.token.startsWith("orb1."));
     assert.ok(session.expiresAt >= asked + 7200 && session.expiresAt <= asked + 7260);
 
-    // 에이전트가 코드를 받아 고쳐 올리고, 미리보기를 세우고, 승격을 요청한다
+    // 에이전트가 코드를 받아 고쳐 올리고, 프리뷰를 세우고, 승격을 요청한다
     agent(scratch, instance.id, session.token, "clone", "work");
     const work = join(scratch, "work");
     const source = readFileSync(join(work, "server.js"), "utf8");

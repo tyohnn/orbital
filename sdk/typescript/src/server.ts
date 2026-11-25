@@ -200,7 +200,7 @@ export interface Orbital
             get(): Promise<AuthSettings>;
             /**
              * 키를 넣는다. 적지 않은 칸은 그대로 두고, `null` 이면 지운다. 레이어에 봉인의 열쇠가 없으면 409 로 거절된다.
-             * 키가 없으면 그 로그인 방법(`email_link` · `google`)을 선언한 release 는 운영에 오르지 못한다. 미리보기는 선다.
+             * 키가 없으면 그 로그인 방법(`email_link` · `google`)을 선언한 release 는 운영에 오르지 못한다. 프리뷰는 선다.
              */
             set(input: { mail?: MailSettings | null; google?: GoogleSettings | null }): Promise<AuthSettings>;
         };

@@ -167,7 +167,7 @@ pub struct Database {
     /// 업무 역할. 권한은 권한 표가 정한다.
     #[serde(default)]
     pub roles: Vec<Ident>,
-    /// 미리보기 DB 에 넣을 가짜 데이터.
+    /// 프리뷰 DB 에 넣을 가짜 데이터.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<String>,
 }

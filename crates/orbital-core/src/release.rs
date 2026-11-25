@@ -21,11 +21,11 @@ pub struct ReleaseId(pub String);
 pub enum BuiltBy {
     /// 레이어가 그 commit 에서 직접 빌드했다.
     Layer,
-    /// 밖에서 빌드한 결과를 올려 받았다. 미리보기에는 쓰지만 운영에는 올리지 않는다.
+    /// 밖에서 빌드한 결과를 올려 받았다. 프리뷰에는 쓰지만 운영에는 올리지 않는다.
     Uploaded,
 }
 
-/// 마이그레이션의 예행연습이 어떻게 끝났는가.
+/// 마이그레이션의 리허설이 어떻게 끝났는가.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Rehearsed {
@@ -70,7 +70,7 @@ pub struct Keys {
     pub dev_mailbox: bool,
 }
 
-/// 선언의 로그인 방법이 쓰는데 팩토리가 넣지 않은 키. 비어 있어야 운영에 오른다. 미리보기는 키 없이 선다.
+/// 선언의 로그인 방법이 쓰는데 팩토리가 넣지 않은 키. 비어 있어야 운영에 오른다. 프리뷰는 키 없이 선다.
 pub fn missing_keys(manifest: &ValidManifest, keys: &Keys) -> Vec<FactoryKey> {
     let Some(auth) = &manifest.get().auth else {
         return Vec::new();
@@ -420,7 +420,7 @@ path = "/"
     }
 
     #[test]
-    fn 예행연습이_실패했거나_돌지_않은_마이그레이션은_승격하지_못한다() {
+    fn 리허설이_실패했거나_돌지_않은_마이그레이션은_승격하지_못한다() {
         let mut release = release("r1");
         release.rehearsal = Rehearsed::Failed;
         assert_eq!(blockers(&release), vec![Blocker::RehearsalFailed]);
@@ -429,7 +429,7 @@ path = "/"
     }
 
     #[test]
-    fn 마이그레이션이_없는_release_는_예행연습_없이_올린다() {
+    fn 마이그레이션이_없는_release_는_리허설_없이_올린다() {
         let mut release = release("r1");
         release.rehearsal = Rehearsed::NotNeeded;
         assert_eq!(blockers(&release), vec![]);

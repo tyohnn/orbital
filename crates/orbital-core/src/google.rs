@@ -65,7 +65,7 @@ pub struct StateClaims {
 #[serde(rename_all = "snake_case")]
 pub enum StateRefusal {
     Expired,
-    /// 미리보기에서 시작했다. 미리보기에는 Google 로그인이 없다.
+    /// 프리뷰에서 시작했다. 프리뷰에는 Google 로그인이 없다.
     NotProduction,
 }
 
@@ -364,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn state_는_10분_뒤부터_읽히지_않고_미리보기의_것은_받지_않는다() {
+    fn state_는_10분_뒤부터_읽히지_않고_프리뷰의_것은_받지_않는다() {
         assert_eq!(judge_state(&state(), NOW + STATE_TTL - 1), Ok(()));
         assert_eq!(
             judge_state(&state(), NOW + STATE_TTL),

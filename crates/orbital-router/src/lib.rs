@@ -1,4 +1,4 @@
-//! router. 인스턴스(미리보기나 운영)마다 하나가 선다. 포트 하나를 듣거나([`serve`]), 레이어의 주소 하나를 하위 도메인으로 나눠 듣는다([`serve_hosts`]).
+//! router. 인스턴스(프리뷰나 운영)마다 하나가 선다. 포트 하나를 듣거나([`serve`]), 레이어의 주소 하나를 하위 도메인으로 나눠 듣는다([`serve_hosts`]).
 //! 서버 서비스는 요청이 없으면 자고 첫 요청에 깬다([`AppServer`]).
 //!
 //! 요청을 선언의 서비스 `path` 가운데 가장 길게 맞는 서비스로 가른다. 서버 서비스에는 HTTP/1.1 로 흘려보내고, 정적 서비스는
@@ -115,7 +115,7 @@ impl std::fmt::Display for MailFailure {
     }
 }
 
-/// 로그인 링크를 보내는 것. 운영에서는 팩토리의 키로 보내고([`Resend`]), 개발용은 보내는 대신 쌓는다. 미리보기의 router 는 부르지 않는다.
+/// 로그인 링크를 보내는 것. 운영에서는 팩토리의 키로 보내고([`Resend`]), 개발용은 보내는 대신 쌓는다. 프리뷰의 router 는 부르지 않는다.
 pub trait Mailer: Send + Sync {
     /// 한 통을 보낸다. 실패해도 링크 요청의 답은 같고, router 는 까닭의 갈래만 기록에 남긴다.
     fn send(&self, mail: Mail) -> Result<(), MailFailure>;
@@ -311,7 +311,7 @@ impl DocumentFetcher for HttpsFetcher {
 
 // ---- 설정 ----
 
-/// router 가 선 자리. 씨앗 사용자로 들어가는 길은 미리보기에만 있다.
+/// router 가 선 자리. 씨앗 사용자로 들어가는 길은 프리뷰에만 있다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Preview,
@@ -344,7 +344,7 @@ pub struct Config {
     pub auth: Option<Connect>,
     pub mailer: Arc<dyn Mailer>,
     pub stage: Stage,
-    /// 미리보기의 씨앗 사용자. 이 식별자로만 링크 없이 들어간다.
+    /// 프리뷰의 씨앗 사용자. 이 식별자로만 링크 없이 들어간다.
     pub seed_users: Vec<String>,
     /// 요청마다 한 줄(메서드, 질의를 뗀 경로, 상태)을 적는 파일.
     pub log: Option<PathBuf>,
@@ -391,7 +391,7 @@ impl Pool {
         };
         let pool = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            // 연결이 끊겼으면(운영 DB 의 문을 잠깐 닫는 예행연습 같은) 한 번만 새로 열어 다시 한다
+            // 연결이 끊겼으면(운영 DB 의 문을 잠깐 닫는 리허설 같은) 한 번만 새로 열어 다시 한다
             for _ in 0..2 {
                 let idle = pool.idle.lock().ok().and_then(|mut idle| idle.pop());
                 let mut store = match idle {
@@ -656,7 +656,7 @@ impl Note {
     }
 }
 
-/// 인스턴스(미리보기나 운영) 하나의 router. 포트 하나를 듣거나([`serve`]), 여러 인스턴스가 주소 하나를 나눠 듣는다([`serve_hosts`]).
+/// 인스턴스(프리뷰나 운영) 하나의 router. 포트 하나를 듣거나([`serve`]), 여러 인스턴스가 주소 하나를 나눠 듣는다([`serve_hosts`]).
 #[derive(Clone)]
 pub struct Router {
     state: Arc<State>,
@@ -1130,7 +1130,7 @@ impl State {
             .run(move |store| store.request_link(&asked, &next, &browser, now()))
             .await;
         match made {
-            // 미리보기에서는 메일을 보내지 않는다. 미리보기의 사람은 씨앗 사용자로 들어간다
+            // 프리뷰에서는 메일을 보내지 않는다. 프리뷰의 사람은 씨앗 사용자로 들어간다
             Ok(Some(_)) if self.config.stage == Stage::Preview => {}
             Ok(Some(token)) => {
                 let mail = Mail {
@@ -1309,7 +1309,7 @@ impl State {
         let Some(user) = body["user"].as_str().map(str::to_owned) else {
             return error(StatusCode::BAD_REQUEST, "bad_request");
         };
-        // 씨앗 사용자만 된다. 미리보기에서 초대받아 들어온 사람은 링크로 들어온다
+        // 씨앗 사용자만 된다. 프리뷰에서 초대받아 들어온 사람은 링크로 들어온다
         if !self.config.seed_users.contains(&user) {
             return error(StatusCode::NOT_FOUND, "no_such_user");
         }

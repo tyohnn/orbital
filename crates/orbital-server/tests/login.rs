@@ -1,4 +1,4 @@
-//! 로그인 한 바퀴를 실제로 돈다. 레이어가 미리보기와 운영 앞에 router 를 세우고, 사람은 router 의 주소로만 닿는다.
+//! 로그인 한 바퀴를 실제로 돈다. 레이어가 프리뷰와 운영 앞에 router 를 세우고, 사람은 router 의 주소로만 닿는다.
 //!
 //! 실제 PostgreSQL, 실제 git, 실제 앱 프로세스(Node 서버), 실제 HTTP 로 잰다. router 에는 손으로 짠 HTTP/1.1 요청을 보낸다.
 //! 브라우저나 HTTP 라이브러리가 경로의 `..` 를 미리 풀어 버리지 않게, 그리고 답의 머리말을 빠짐없이 견주려는 것이다.
@@ -381,7 +381,7 @@ impl Bench {
         body["token"].as_str().unwrap().to_owned()
     }
 
-    /// 미리보기를 세운다. 그 router 의 주소와 release 를 돌려준다.
+    /// 프리뷰를 세운다. 그 router 의 주소와 release 를 돌려준다.
     fn preview_release(&self, instance: &str, token: &str) -> (String, String) {
         let (status, preview) = self.call(
             "POST",
@@ -401,7 +401,7 @@ impl Bench {
         self.preview_release(instance, token).0
     }
 
-    /// 미리보기 → 승격 요청 → 고객의 승인 → 운영. 운영의 router 의 주소를 돌려준다.
+    /// 프리뷰 → 승격 요청 → 고객의 승인 → 운영. 운영의 router 의 주소를 돌려준다.
     fn ship(&mut self, app: &str) -> (String, String) {
         let instance = self.instance(app);
         let token = self.token(&instance);
@@ -832,7 +832,7 @@ fn 로그인이_필요한_서비스에_세션_없이_화면을_열면_로그인_
 }
 
 #[test]
-fn 씨앗_사용자로_들어가는_길은_미리보기에만_있고_운영에서는_404_다() {
+fn 씨앗_사용자로_들어가는_길은_프리뷰에만_있고_운영에서는_404_다() {
     let mut bench = bench!();
     let instance = bench.instance("cards");
     let token = bench.token(&instance);
@@ -1169,7 +1169,7 @@ fn 직원의_요청이_앱의_버그로_급여_관리자의_연결을_타도_행
 }
 
 #[test]
-fn 행_단위_규칙을_끈_표는_역할_제한이_걸리지_않는_표로_미리보기에_알리고_실패로_보지_않는다() {
+fn 행_단위_규칙을_끈_표는_역할_제한이_걸리지_않는_표로_프리뷰에_알리고_실패로_보지_않는다() {
     let mut bench = bench!();
     let instance = bench.instance("payroll");
     let token = bench.token(&instance);

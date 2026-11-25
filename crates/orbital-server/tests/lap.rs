@@ -1,5 +1,5 @@
 //! 한 바퀴를 실제로 돈다. 스캐폴드를 올리고, 인스턴스를 세우고, 에이전트가 토큰으로 코드를 받아 고쳐 올리고,
-//! 미리보기 → 예행연습 → 승격 요청 → 사람의 승인 → 운영까지 간다.
+//! 프리뷰 → 리허설 → 승격 요청 → 사람의 승인 → 운영까지 간다.
 //!
 //! 실제 PostgreSQL, 실제 git, 실제 프로세스(Node 서버)로 잰다. `ORBITAL_PG` 가 없으면 건너뛰었다고 찍고 통과한다.
 //! 요청은 HTTP 층의 `handle` 에 바로 넣고, 띄운 앱에는 실제 HTTP 로 요청한다.
@@ -352,13 +352,13 @@ fn titles(cards: &Value) -> Vec<String> {
 }
 
 #[test]
-fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운영에_서고_고친_것이_다시_오른다() {
+fn 스캐폴드에서_갈라진_코드가_프리뷰와_승인을_거쳐_운영에_서고_고친_것이_다시_오른다() {
     let mut bench = bench!();
     let instance = bench.instance();
     let token = bench.token(&instance, &ALL);
     let path = |tail: &str| format!("/v1/instances/{instance}/{tail}");
 
-    // ---- 미리보기: 그 commit 에서 빌드하고, 씨앗 데이터의 DB 를 세우고, 권한 검사를 돌린다 ----
+    // ---- 프리뷰: 그 commit 에서 빌드하고, 씨앗 데이터의 DB 를 세우고, 권한 검사를 돌린다 ----
     let (status, preview) = bench.preview(&instance, &token);
     assert_eq!(status, 200, "{preview}");
     assert_eq!(preview["findings"], json!([]));
@@ -465,7 +465,7 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
         (200, Value::Null)
     );
 
-    // 운영에는 씨앗 데이터도 씨앗 사용자도 없다. 미리보기의 세션은 운영에서 읽히지 않는다.
+    // 운영에는 씨앗 데이터도 씨앗 사용자도 없다. 프리뷰의 세션은 운영에서 읽히지 않는다.
     // 운영의 사람은 팩토리가 초대하고, 링크로 들어온다
     let (status, body) = bench.post(
         &path("users"),
@@ -527,15 +527,10 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
     let second = preview["release"].as_str().unwrap().to_owned();
     assert_ne!(second, release);
     assert_eq!(preview["commit"], pushed["commit"]);
-    // 권한 표는 그대로라 권한의 변화는 없다. 운영에 아직 돌지 않은 마이그레이션이 있어 예행연습이 필요하다
+    // 권한 표는 그대로라 권한의 변화는 없다. 운영에 아직 돌지 않은 마이그레이션이 있어 리허설이 필요하다
     assert_eq!(preview["changes"], json!([]));
     assert_eq!(preview["blockers"].as_array().unwrap().len(), 1);
-    assert!(
-        preview["blockers"][0]
-            .as_str()
-            .unwrap()
-            .contains("예행연습")
-    );
+    assert!(preview["blockers"][0].as_str().unwrap().contains("리허설"));
     let (status, body) = bench.post(
         &path("promotion-requests"),
         &token,
@@ -545,7 +540,7 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
     let (status, body) = bench.promote(&instance, &second, "customer");
     assert_eq!((status, body["error"].as_str()), (409, Some("denied")));
 
-    // 예행연습은 운영 데이터의 사본에 돌고 숫자만 돌려준다
+    // 리허설은 운영 데이터의 사본에 돌고 숫자만 돌려준다
     let (status, rehearsal) = bench.post(&path("rehearsals"), &token, json!({ "release": second }));
     assert_eq!(status, 200, "{rehearsal}");
     assert_eq!(
@@ -562,9 +557,9 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
     assert_eq!(card, Some(json!(["todo.card", 2, 2])));
     assert!(
         !rehearsal.to_string().contains("첫 일"),
-        "예행연습의 결과에 행의 내용이 있습니다"
+        "리허설의 결과에 행의 내용이 있습니다"
     );
-    // 예행연습 동안 잠깐 닫혔던 운영이 다시 요청을 받는다
+    // 리허설 동안 잠깐 닫혔던 운영이 다시 요청을 받는다
     assert_eq!(
         titles(&app("GET", &format!("{live}/cards"), Some(&u9), "").1).len(),
         2
@@ -593,7 +588,7 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
     assert_eq!(titles(&cards), vec!["첫 일", "첫 일"]);
     assert_eq!(cards[0]["done"], false);
 
-    // ---- 운영의 데이터에서만 깨지는 마이그레이션: 예행연습이 잡고, 운영은 그대로다 ----
+    // ---- 운영의 데이터에서만 깨지는 마이그레이션: 리허설이 잡고, 운영은 그대로다 ----
     fs::write(
         work.join("db/migrations/003_unique.sql"),
         "CREATE UNIQUE INDEX card_title ON todo.card (title);\n",
@@ -606,7 +601,7 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
         200
     );
     let (status, preview) = bench.preview(&instance, &token);
-    // 씨앗 데이터에는 겹치는 제목이 없어서 미리보기는 선다
+    // 씨앗 데이터에는 겹치는 제목이 없어서 프리뷰는 선다
     assert_eq!(status, 200, "{preview}");
     let third = preview["release"].as_str().unwrap().to_owned();
     let (_, rehearsal) = bench.post(&path("rehearsals"), &token, json!({ "release": third }));
@@ -635,7 +630,7 @@ fn 스캐폴드에서_갈라진_코드가_미리보기와_승인을_거쳐_운�
         body["details"][0]
             .as_str()
             .unwrap()
-            .contains("예행연습이 실패")
+            .contains("리허설이 실패")
     );
     // 운영은 앞의 release 그대로 돈다
     assert_eq!(
@@ -656,7 +651,7 @@ fn 운영에서만_뜨지_않는_release_는_앞의_release_와_앞의_db_로_�
     let instance = bench.instance();
     let token = bench.token(&instance, &ALL);
     let path = |tail: &str| format!("/v1/instances/{instance}/{tail}");
-    // 미리보기 → (예행연습) → 승격 요청 → 승인받은 승격
+    // 프리뷰 → (리허설) → 승격 요청 → 승인받은 승격
     let ship = |bench: &Bench| -> (String, u16, Value) {
         let (status, preview) = bench.preview(&instance, &token);
         assert_eq!(status, 200, "{preview}");
@@ -714,7 +709,7 @@ fn 운영에서만_뜨지_않는_release_는_앞의_release_와_앞의_db_로_�
             .0,
         200
     );
-    // 미리보기와 예행연습은 통과한다. 깨지는 것은 운영에 올린 뒤다
+    // 프리뷰와 리허설은 통과한다. 깨지는 것은 운영에 올린 뒤다
     let (second, status, body) = ship(&bench);
     assert_eq!(
         (status, body["error"].as_str()),
@@ -905,7 +900,7 @@ fn 운영을_바꾸는_능력은_토큰에_적어_달라고_해도_실리지_않
 }
 
 #[test]
-fn 코드에_고칠_것이_있으면_미리보기가_서지_않고_무엇을_고칠지_돌려준다() {
+fn 코드에_고칠_것이_있으면_프리뷰가_서지_않고_무엇을_고칠지_돌려준다() {
     let mut bench = bench!();
     let instance = bench.instance();
     let token = bench.token(&instance, &ALL);
@@ -973,7 +968,7 @@ fn 코드에_고칠_것이_있으면_미리보기가_서지_않고_무엇을_고
     );
     assert!(body["details"][0].as_str().unwrap().contains("뜨다 말았다"));
 
-    // 권한 표에 없는 표를 마이그레이션이 만든다. 미리보기는 서지만 승격은 요청하지 못한다
+    // 권한 표에 없는 표를 마이그레이션이 만든다. 프리뷰는 서지만 승격은 요청하지 못한다
     fs::write(work.join("orbital.toml"), &manifest).unwrap();
     fs::write(
         work.join("db/migrations/002_note.sql"),

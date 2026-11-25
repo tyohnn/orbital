@@ -567,7 +567,7 @@ impl Bench {
         preview
     }
 
-    /// 미리보기 → 승격 요청 → 승격. 둘의 답을 돌려준다.
+    /// 프리뷰 → 승격 요청 → 승격. 둘의 답을 돌려준다.
     fn try_ship(&self, key: &str, instance: &str) -> (Value, (u16, Value), (u16, Value)) {
         let token = self.token(key, instance);
         let preview = self.preview(instance, &token);
@@ -917,14 +917,14 @@ fn google_키를_넣지_않은_팩토리의_google_로그인은_운영에_오르
 }
 
 #[test]
-fn 키가_없어도_미리보기는_서고_메일은_나가지_않는다() {
+fn 키가_없어도_프리뷰는_서고_메일은_나가지_않는다() {
     let mut bench = bench!(false);
     let instance = bench.instance(FACTORY, "gcards");
     let token = bench.token(FACTORY, &instance);
     let preview = bench.preview(&instance, &token);
     let origin = preview["services"][0]["url"].as_str().unwrap().to_owned();
     assert_eq!(texts(&preview["blockers"]).len(), 2, "{preview}");
-    // 미리보기의 씨앗 사용자로 들어가는 길은 그대로 있다
+    // 프리뷰의 씨앗 사용자로 들어가는 길은 그대로 있다
     let seeded = http(
         "POST",
         &origin,
@@ -934,7 +934,7 @@ fn 키가_없어도_미리보기는_서고_메일은_나가지_않는다() {
     );
     assert_eq!(seeded.status, 302, "{}", seeded.everything());
 
-    // 키를 넣은 뒤에도 미리보기의 링크 요청은 같은 202 이고 메일은 나가지 않는다
+    // 키를 넣은 뒤에도 프리뷰의 링크 요청은 같은 202 이고 메일은 나가지 않는다
     bench.put_mail(FACTORY, MAIL_KEY, "login@factory.example");
     for email in ["u1@example.test", "u2@example.test"] {
         let asked = Bench::ask_link(&origin, email, None);
@@ -1583,7 +1583,7 @@ fn 위조하거나_만료된_state_로는_콜백이_아무것도_하지_않는�
         hex(serde_json::to_string(&claims).unwrap().as_bytes()),
         parts[2]
     );
-    // 레이어의 열쇠로 서명했어도 만료된 것과 미리보기의 것은 받지 않는다
+    // 레이어의 열쇠로 서명했어도 만료된 것과 프리뷰의 것은 받지 않는다
     let key = fs::read(bench.home.join("token.key")).unwrap();
     claims.next = "/cards".to_owned();
     let mut expired = claims.clone();
@@ -1635,7 +1635,7 @@ fn 위조하거나_만료된_state_로는_콜백이_아무것도_하지_않는�
 }
 
 #[test]
-fn 미리보기에는_google_로그인이_없다() {
+fn 프리뷰에는_google_로그인이_없다() {
     let mut bench = bench!(false);
     bench.put_mail(FACTORY, MAIL_KEY, "login@factory.example");
     bench.put_google(FACTORY);

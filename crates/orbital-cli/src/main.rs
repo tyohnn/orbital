@@ -27,9 +27,9 @@ orbital --version
 orbital clone <폴더>                         코드를 이력째 받는다
 orbital pull                                 레이어의 최신 commit 을 받아 합친다
 orbital push                                 commit 을 올린다
-orbital preview                              올린 commit 을 빌드해 미리보기를 세운다
-orbital identity <사용자>                    미리보기의 씨앗 사용자로 들어가 요청에 붙일 Cookie 값을 받는다
-orbital rehearse <release>                   운영 사본에 마이그레이션을 예행연습한다
+orbital preview                              올린 commit 을 빌드해 프리뷰를 세운다
+orbital identity <사용자>                    프리뷰의 씨앗 사용자로 들어가 요청에 붙일 Cookie 값을 받는다
+orbital rehearse <release>                   운영 사본에 마이그레이션을 리허설한다
 orbital request-promotion <release>          승격을 요청한다. 승인은 사람이 한다
 ";
 
