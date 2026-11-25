@@ -400,6 +400,7 @@ pub fn judge(
     wanted_roles.insert(names.migrator(), true);
     if auth {
         wanted_roles.insert(names.auth(), true);
+        wanted_roles.insert(names.auth_owner(), false);
     }
     wanted_roles.extend(groups.keys().map(|group| (group.clone(), false)));
     wanted_roles.extend(logins.iter().map(|login| (login.name.clone(), true)));
@@ -806,6 +807,15 @@ pub(crate) mod tests {
             replication: false,
             bypass_rls: false,
         });
+        snapshot.roles.push(RoleState {
+            name: names().auth_owner(),
+            login: false,
+            superuser: false,
+            create_db: false,
+            create_role: false,
+            replication: false,
+            bypass_rls: false,
+        });
         snapshot
     }
 
@@ -841,13 +851,26 @@ pub(crate) mod tests {
     fn auth_를_선언한_db_는_orbital_auth_와_인증_역할이_있어도_통과한다() {
         let (manifest, access) = with_auth();
         assert_eq!(judge(&names(), &manifest, &access, &guarded()), vec![]);
-        // 인증 역할이 없으면 모자란 것이다
-        let mut missing = guarded();
-        missing.roles.retain(|state| state.name != names().auth());
+        // 인증 역할이나 orbital_auth 의 주인이 없으면 모자란 것이다
+        for role in [names().auth(), names().auth_owner()] {
+            let mut missing = guarded();
+            missing.roles.retain(|state| state.name != role);
+            assert_eq!(
+                judge(&names(), &manifest, &access, &missing),
+                vec![Finding::RoleMissing { role: role.clone() }]
+            );
+        }
+        // 주인이 로그인할 수 있으면 실패한다
+        let mut loose = guarded();
+        for state in &mut loose.roles {
+            if state.name == names().auth_owner() {
+                state.login = true;
+            }
+        }
         assert_eq!(
-            judge(&names(), &manifest, &access, &missing),
-            vec![Finding::RoleMissing {
-                role: names().auth()
+            judge(&names(), &manifest, &access, &loose),
+            vec![Finding::GroupCanLogin {
+                role: names().auth_owner()
             }]
         );
     }
@@ -940,6 +963,9 @@ pub(crate) mod tests {
                 },
                 Finding::RoleNotDeclared {
                     role: names().auth()
+                },
+                Finding::RoleNotDeclared {
+                    role: names().auth_owner()
                 },
             ]
         );

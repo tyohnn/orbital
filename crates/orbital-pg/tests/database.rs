@@ -61,9 +61,9 @@ CREATE TABLE payroll.payslip (
 );
 ALTER TABLE payroll.payslip ENABLE ROW LEVEL SECURITY;
 CREATE POLICY own ON payroll.payslip FOR SELECT
-    USING (orbital.role() = 'employee' AND employee = (SELECT orbital.subject()));
+    USING ((SELECT orbital.role()) = 'employee' AND employee = (SELECT orbital.subject()));
 CREATE POLICY admin ON payroll.payslip
-    USING (orbital.role() = 'payroll_admin') WITH CHECK (orbital.role() = 'payroll_admin');
+    USING ((SELECT orbital.role()) = 'payroll_admin') WITH CHECK ((SELECT orbital.role()) = 'payroll_admin');
 INSERT INTO hr.department (name) VALUES ('인사'), ('재무');
 INSERT INTO payroll.payslip (employee, amount) VALUES ('emp_1', 100), ('emp_1', 110), ('emp_2', 200);
 "#;

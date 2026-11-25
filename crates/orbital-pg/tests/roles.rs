@@ -61,9 +61,9 @@ CREATE TABLE payroll.payslip (
 );
 ALTER TABLE payroll.payslip ENABLE ROW LEVEL SECURITY;
 CREATE POLICY own ON payroll.payslip FOR SELECT
-    USING (orbital.role() = 'employee' AND employee = (SELECT orbital.subject()));
+    USING ((SELECT orbital.role()) = 'employee' AND employee = (SELECT orbital.subject()));
 CREATE POLICY admin ON payroll.payslip
-    USING (orbital.role() = 'payroll_admin') WITH CHECK (orbital.role() = 'payroll_admin');
+    USING ((SELECT orbital.role()) = 'payroll_admin') WITH CHECK ((SELECT orbital.role()) = 'payroll_admin');
 INSERT INTO hr.department (name) VALUES ('인사'), ('재무');
 INSERT INTO payroll.payslip (employee, amount) VALUES ('emp1', 100), ('emp1', 110), ('emp2', 200);
 "#;
@@ -506,7 +506,7 @@ fn 역할_제한_정책의_검증은_행마다가_아니라_문장마다_한_번
     plan_nodes(&explained[0]["Plan"], &mut nodes);
 
     // 검증 함수는 따로 된 마디(InitPlan)에서 문장마다 한 번만 돈다
-    for function in ["orbital.granted()", "orbital.subject()"] {
+    for function in ["orbital.granted()", "orbital.subject()", "orbital.role()"] {
         let once = nodes.iter().find(|node| {
             node["Parent Relationship"] == "InitPlan"
                 && node["Output"].as_array().is_some_and(|output| {
@@ -527,6 +527,7 @@ fn 역할_제한_정책의_검증은_행마다가_아니라_문장마다_한_번
     let filter = scan["Filter"].as_str().unwrap_or_default();
     assert!(!filter.contains("orbital.granted("), "{filter}");
     assert!(!filter.contains("orbital.subject("), "{filter}");
+    assert!(!filter.contains("orbital.role("), "{filter}");
     // PostgreSQL 18 부터 행 수를 소수로 적는다
     let examined = scan["Actual Rows"]
         .as_f64()

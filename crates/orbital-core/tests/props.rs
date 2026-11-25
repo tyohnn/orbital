@@ -491,14 +491,14 @@ fn 권한의_말은_닿는_범위로_읽힌다() {
 
 mod oauth {
     use orbital_core::oauth::{
-        Authorize, AuthorizeQuery, KnownClient, Stop, judge_authorize, pkce_matches, same_redirect,
+        Authorize, AuthorizeQuery, KnownClient, Stop, judge_authorize, same_redirect,
     };
     use proptest::prelude::*;
     use sha2::{Digest, Sha256};
 
     const RESOURCE: &str = "http://127.0.0.1:4100/mcp";
 
-    /// 오라클. 구현의 SHA-256 과 base64url 을 부르지 않고 `sha2` 와 따로 적은 부호화로 challenge 를 만든다.
+    /// 모양이 맞는 challenge 를 만든다(S256 의 43자). redirect 의 판정에만 쓴다.
     fn challenge_of(verifier: &str) -> String {
         let digest = Sha256::digest(verifier.as_bytes());
         let table: Vec<char> = ('A'..='Z')
@@ -520,10 +520,6 @@ mod oauth {
                 table[usize::from_str_radix(&six, 2).unwrap()]
             })
             .collect()
-    }
-
-    fn verifier() -> impl Strategy<Value = String> {
-        "[A-Za-z0-9._~-]{43,128}"
     }
 
     fn redirect() -> impl Strategy<Value = String> {
@@ -554,13 +550,6 @@ mod oauth {
     }
 
     proptest! {
-        #[test]
-        fn 어떤_verifier_든_제_challenge_에만_맞는다(mine in verifier(), other in verifier()) {
-            let challenge = challenge_of(&mine);
-            prop_assert!(pkce_matches(&challenge, &mine));
-            prop_assert_eq!(pkce_matches(&challenge, &other), other == mine);
-        }
-
         #[test]
         fn 어떤_redirect_든_등록된_것과_한_글자라도_다르면_받지_않는다(registered in redirect(), change in edit()) {
             let given = apply(&registered, change);

@@ -7,12 +7,15 @@
 //! - 쓴 인가 코드가 다시 오면 그 코드로 낸 토큰(갈아 준 것까지)을 모두 거둔다.
 //! - 쓴 refresh 토큰이 다시 오면 그 승인(grant) 전체와 그 토큰을 모두 거둔다.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use orbital_core::oauth::{
-    ACCESS_TTL, Accepted, CodeRefusal, CodeState, REFRESH_TTL, REQUEST_TTL, TokenRefusal,
-    TokenState, approved_location, code_expires_at, denied_location, judge_code, judge_token,
-    pkce_matches, request_open,
+    ACCESS_TTL, Accepted, CodeRefusal, CodeState, REFRESH_TTL, REGISTRATION_WINDOW, REQUEST_TTL,
+    TokenRefusal, TokenState, approved_location, code_expires_at, denied_location, judge_code,
+    judge_token, pkce_matches, registration_wait, request_open, unapproved_cutoff,
 };
 use postgres::Transaction;
+use sha2::{Digest, Sha256};
 
 use crate::auth::{AuthError, AuthStore, Secret, SessionUser, db, random_id, seconds, unix};
 
@@ -24,8 +27,8 @@ pub struct OauthClient {
     pub kind: String,
     pub name: String,
     pub redirect_uris: Vec<String>,
-    /// metadata 문서를 받아 온 때(유닉스 초).
-    pub fetched_at: Option<u64>,
+    /// metadata 문서를 기억해도 되는 마지막 때(유닉스 초).
+    pub fresh_until: Option<u64>,
 }
 
 /// 동의 화면이 읽는 요청.
@@ -60,6 +63,16 @@ pub struct GrantView {
     pub client_id: String,
     pub client_name: String,
     pub created_at: u64,
+}
+
+/// PKCE 의 S256: `BASE64URL(SHA256(verifier))`(덧붙임 없음). 해시는 검증된 구현(`sha2`)으로 계산한다.
+pub fn s256(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+/// verifier 가 challenge 에 맞는가. 해시는 여기서 계산하고, 모양과 견주기는 core 의 `pkce_matches` 가 판정한다.
+pub fn verifier_matches(challenge: &str, verifier: &str) -> bool {
+    pkce_matches(challenge, verifier, &s256(verifier))
 }
 
 fn issue(
@@ -120,6 +133,65 @@ impl AuthStore {
         Ok(id)
     }
 
+    /// 동적 등록(RFC 7591). 한도를 넘으면 `RateLimited` 로 몇 초 뒤에 다시 하라고 알린다.
+    ///
+    /// 한 번도 승인받지 못하고 하루가 지난 동적 클라이언트는 여기서 함께 치운다. 같은 인스턴스의 등록은 잠금으로 하나씩 센다.
+    pub fn register_dynamic(
+        &mut self,
+        name: &str,
+        redirect_uris: &[String],
+        application_type: Option<&str>,
+        now: u64,
+    ) -> Result<String, AuthError> {
+        let mut transaction = self.client.transaction().map_err(db("동적 등록을 시작"))?;
+        transaction
+            .execute(
+                "SELECT pg_advisory_xact_lock(hashtext('orbital_auth.oauth_register'))",
+                &[],
+            )
+            .map_err(db("동적 등록을 잠그"))?;
+        transaction
+            .execute(
+                "DELETE FROM orbital_auth.oauth_client c WHERE c.kind = 'dynamic' \
+                 AND c.created_at < to_timestamp($1::bigint) \
+                 AND NOT EXISTS (SELECT 1 FROM orbital_auth.oauth_grant g WHERE g.client_id = c.id)",
+                &[&seconds(unapproved_cutoff(now))],
+            )
+            .map_err(db("승인받지 못한 동적 클라이언트를 치우"))?;
+        let recent: Vec<u64> = transaction
+            .query(
+                "SELECT extract(epoch FROM created_at)::bigint FROM orbital_auth.oauth_client \
+                 WHERE kind = 'dynamic' AND created_at > to_timestamp($1::bigint)",
+                &[&seconds(now.saturating_sub(REGISTRATION_WINDOW))],
+            )
+            .map_err(db("최근의 동적 등록을 세"))?
+            .iter()
+            .filter_map(|row| unix(row.get(0)))
+            .collect();
+        let live: i64 = transaction
+            .query_one(
+                "SELECT count(*) FROM orbital_auth.oauth_client WHERE kind = 'dynamic'",
+                &[],
+            )
+            .map_err(db("동적 클라이언트를 세"))?
+            .get(0);
+        if let Some(retry_after) =
+            registration_wait(&recent, usize::try_from(live).unwrap_or(usize::MAX), now)
+        {
+            return Err(AuthError::RateLimited { retry_after });
+        }
+        let id = random_id("c_")?;
+        transaction
+            .execute(
+                "INSERT INTO orbital_auth.oauth_client (id, kind, name, redirect_uris, application_type, created_at) \
+                 VALUES ($1, 'dynamic', $2, $3, $4, to_timestamp($5::bigint))",
+                &[&id, &name, &redirect_uris, &application_type, &seconds(now)],
+            )
+            .map_err(db("클라이언트를 등록하"))?;
+        transaction.commit().map_err(db("동적 등록을 마무리"))?;
+        Ok(id)
+    }
+
     /// metadata 문서로 밝힌 클라이언트를 적어 둔다. 다시 받아 오면 이름과 redirect 를 새로 적는다.
     pub fn remember_document(
         &mut self,
@@ -127,14 +199,16 @@ impl AuthStore {
         name: &str,
         redirect_uris: &[String],
         now: u64,
+        fresh_until: u64,
     ) -> Result<(), AuthError> {
         self.client
             .execute(
-                "INSERT INTO orbital_auth.oauth_client (id, kind, name, redirect_uris, created_at, fetched_at) \
-                 VALUES ($1, 'document', $2, $3, to_timestamp($4::bigint), to_timestamp($4::bigint)) \
-                 ON CONFLICT (id) DO UPDATE SET name = excluded.name, redirect_uris = excluded.redirect_uris, fetched_at = excluded.fetched_at \
+                "INSERT INTO orbital_auth.oauth_client (id, kind, name, redirect_uris, created_at, fetched_at, fresh_until) \
+                 VALUES ($1, 'document', $2, $3, to_timestamp($4::bigint), to_timestamp($4::bigint), to_timestamp($5::bigint)) \
+                 ON CONFLICT (id) DO UPDATE SET name = excluded.name, redirect_uris = excluded.redirect_uris, \
+                 fetched_at = excluded.fetched_at, fresh_until = excluded.fresh_until \
                  WHERE orbital_auth.oauth_client.kind = 'document'",
-                &[&url, &name, &redirect_uris, &seconds(now)],
+                &[&url, &name, &redirect_uris, &seconds(now), &seconds(fresh_until)],
             )
             .map_err(db("metadata 문서를 적"))?;
         Ok(())
@@ -144,7 +218,7 @@ impl AuthStore {
         let row = self
             .client
             .query_opt(
-                "SELECT id, kind, name, redirect_uris, extract(epoch FROM fetched_at)::bigint \
+                "SELECT id, kind, name, redirect_uris, extract(epoch FROM fresh_until)::bigint \
                  FROM orbital_auth.oauth_client WHERE id = $1",
                 &[&id],
             )
@@ -154,7 +228,7 @@ impl AuthStore {
             kind: row.get(1),
             name: row.get(2),
             redirect_uris: row.get(3),
-            fetched_at: unix(row.get(4)),
+            fresh_until: unix(row.get(4)),
         }))
     }
 
@@ -350,7 +424,7 @@ impl AuthStore {
         let matches = stored_client == client_id
             && stored_redirect == redirect_uri
             && resource.is_none_or(|given| given == stored_resource)
-            && pkce_matches(&challenge, verifier)
+            && verifier_matches(&challenge, verifier)
             && !grant_revoked
             && !user_disabled;
         if !matches {
@@ -557,5 +631,35 @@ impl AuthStore {
             .map_err(db("승인의 토큰을 거두"))?;
         transaction.commit().map_err(db("승인 거두기를 마무리"))?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rfc_7636_부록_b_의_verifier_는_그_challenge_를_낸다() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        assert_eq!(s256(verifier), challenge);
+        assert!(verifier_matches(challenge, verifier));
+    }
+
+    #[test]
+    fn verifier_가_challenge_와_맞지_않으면_토큰을_내지_않는다() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = s256(verifier);
+        let mut other = verifier.to_owned();
+        other.replace_range(0..1, "e");
+        assert!(!verifier_matches(&challenge, &other));
+        assert!(!verifier_matches(&challenge, ""));
+        // verifier 자체를 challenge 로 내밀어도(plain) 맞지 않는다
+        assert!(!verifier_matches(verifier, verifier));
+        // 모양이 틀린 verifier 는 해시가 맞아도 받지 않는다(42자 · 허용되지 않는 글자)
+        let short = &verifier[..42];
+        assert!(!verifier_matches(&s256(short), short));
+        let odd = format!("{}!", &verifier[..42]);
+        assert!(!verifier_matches(&s256(&odd), &odd));
     }
 }

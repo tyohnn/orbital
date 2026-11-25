@@ -2,7 +2,7 @@
 //!
 //! 인가 서버는 인스턴스마다 따로이고 발급자(`iss`)는 그 router 의 주소다. 저장과 무작위 값은 `orbital-pg` 가, 받아 오는 일은
 //! router 가 맡고, 여기서는 읽어 온 상태와 받은 글자를 판정만 한다. 시각은 인자로 받는 유닉스 초이고 경계는 `now < expires_at` 이다.
-//! PKCE 의 SHA-256 은 런타임 의존을 늘리지 않으려고 여기에 직접 둔다(FIPS 180-4).
+//! PKCE 의 해시는 어댑터가 `sha2` 로 계산한다. 여기서는 verifier 의 모양을 보고 계산된 값을 견주기만 한다.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +16,10 @@ pub const ACCESS_TTL: u64 = 60 * 60;
 pub const REFRESH_TTL: u64 = 30 * 24 * 60 * 60;
 /// 동의를 기다리는 요청이 읽히는 시간. 10분.
 pub const REQUEST_TTL: u64 = 10 * 60;
-/// 받아 온 metadata 문서를 기억하는 시간. 24시간.
+/// 받아 온 metadata 문서를 기억하는 가장 긴 시간. 24시간.
 pub const DOCUMENT_TTL: u64 = 24 * 60 * 60;
+/// metadata 문서를 기억하는 가장 짧은 길이(초).
+pub const DOCUMENT_MIN_TTL: u64 = 5 * 60;
 /// 이 인가 서버가 내는 scope. 지금은 하나다.
 pub const SCOPE: &str = "mcp";
 
@@ -127,31 +129,12 @@ pub fn same_redirect(registered: &[String], given: &str) -> bool {
 
 // ---- PKCE ----
 
-/// `BASE64URL(SHA256(verifier))`. 덧붙임(`=`)은 없다.
-pub fn s256(verifier: &str) -> String {
-    base64url(&sha256(verifier.as_bytes()))
-}
-
 /// verifier 가 challenge 에 맞는가. verifier 는 43~128자의 unreserved 글자여야 한다(RFC 7636).
-pub fn pkce_matches(challenge: &str, verifier: &str) -> bool {
-    valid_verifier(verifier) && same_text(&s256(verifier), challenge)
-}
-
-fn unreserved(text: &str) -> bool {
-    text.bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"-._~".contains(&byte))
-}
-
-fn valid_verifier(verifier: &str) -> bool {
-    (43..=128).contains(&verifier.len()) && unreserved(verifier)
-}
-
-/// S256 의 challenge 모양: SHA-256 을 덧붙임 없이 base64url 로 적은 43자.
-fn valid_challenge(challenge: &str) -> bool {
-    challenge.len() == 43
-        && challenge
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+///
+/// 해시(`BASE64URL(SHA256(verifier))`)는 여기서 계산하지 않는다. 어댑터가 검증된 구현(`sha2`)으로 계산해 `computed` 로 넘기고,
+/// 여기서는 모양과 견주기만 한다.
+pub fn pkce_matches(challenge: &str, verifier: &str, computed: &str) -> bool {
+    valid_verifier(verifier) && same_text(computed, challenge)
 }
 
 fn same_text(left: &str, right: &str) -> bool {
@@ -163,93 +146,22 @@ fn same_text(left: &str, right: &str) -> bool {
             == 0
 }
 
-fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut text = String::new();
-    for chunk in bytes.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |acc, (index, byte)| {
-            acc | (u32::from(*byte) << (16 - 8 * index))
-        });
-        for index in 0..=chunk.len() {
-            text.push(char::from(
-                ALPHABET[((n >> (18 - 6 * index)) & 63) as usize],
-            ));
-        }
-    }
-    text
+fn unreserved(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"-._~".contains(&byte))
 }
 
-fn sha256(message: &[u8]) -> [u8; 32] {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut state: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    let mut padded = message.to_vec();
-    let bits = (message.len() as u64).wrapping_mul(8);
-    padded.push(0x80);
-    while padded.len() % 64 != 56 {
-        padded.push(0);
-    }
-    padded.extend_from_slice(&bits.to_be_bytes());
-    for block in padded.chunks(64) {
-        let mut w = [0u32; 64];
-        for (index, word) in block.chunks(4).enumerate() {
-            w[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for index in 16..64 {
-            let s0 = w[index - 15].rotate_right(7)
-                ^ w[index - 15].rotate_right(18)
-                ^ (w[index - 15] >> 3);
-            let s1 = w[index - 2].rotate_right(17)
-                ^ w[index - 2].rotate_right(19)
-                ^ (w[index - 2] >> 10);
-            w[index] = w[index - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[index - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
-        for index in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let choose = (e & f) ^ (!e & g);
-            let t1 = h
-                .wrapping_add(s1)
-                .wrapping_add(choose)
-                .wrapping_add(K[index])
-                .wrapping_add(w[index]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let majority = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(majority);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-            *slot = slot.wrapping_add(value);
-        }
-    }
-    let mut digest = [0u8; 32];
-    for (index, word) in state.iter().enumerate() {
-        digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    digest
+/// verifier 의 모양: 43~128자의 unreserved 글자(RFC 7636 4.1).
+pub fn valid_verifier(verifier: &str) -> bool {
+    (43..=128).contains(&verifier.len()) && unreserved(verifier)
+}
+
+/// S256 의 challenge 모양: SHA-256 을 덧붙임 없이 base64url 로 적은 43자.
+fn valid_challenge(challenge: &str) -> bool {
+    challenge.len() == 43
+        && challenge
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 // ---- 인가 요청 ----
@@ -607,9 +519,32 @@ pub fn judge_document(url: &str, document: &ClientMetadata) -> Result<(), Docume
     Ok(())
 }
 
-/// 받아 온 문서를 아직 기억해도 되는가.
-pub fn document_fresh(fetched_at: u64, now: u64) -> bool {
-    now < fetched_at.saturating_add(DOCUMENT_TTL)
+/// 받아 온 문서를 아직 기억해도 되는가. `fresh_until` 은 [`document_lifetime`] 으로 정한 때다.
+pub fn document_fresh(fresh_until: u64, now: u64) -> bool {
+    now < fresh_until
+}
+
+/// 문서를 기억해 둘 길이(초). 문서의 `Cache-Control: max-age` 를 따르되 5분에서 하루 사이로 묶는다.
+///
+/// `max-age` 가 없거나 읽히지 않거나 `no-store` · `no-cache` 면 가장 짧게(5분) 기억한다.
+pub fn document_lifetime(cache_control: Option<&str>) -> u64 {
+    let mut said = None;
+    for directive in cache_control.unwrap_or_default().split(',') {
+        let directive = directive.trim().to_ascii_lowercase();
+        if directive == "no-store" || directive == "no-cache" {
+            return DOCUMENT_MIN_TTL;
+        }
+        if let Some(seconds) = directive.strip_prefix("max-age=") {
+            let seconds = seconds.trim().trim_matches('"');
+            if !seconds.is_empty() && seconds.bytes().all(|byte| byte.is_ascii_digit()) {
+                // 아주 긴 숫자는 넘쳐도 하루로 묶이니 가장 긴 값으로 읽는다
+                said = Some(seconds.parse::<u64>().unwrap_or(u64::MAX));
+            }
+        }
+    }
+    said.map_or(DOCUMENT_MIN_TTL, |seconds| {
+        seconds.clamp(DOCUMENT_MIN_TTL, DOCUMENT_TTL)
+    })
 }
 
 // ---- 동적 등록(RFC 7591) ----
@@ -651,6 +586,40 @@ impl RegistrationProblem {
             _ => "invalid_client_metadata",
         }
     }
+}
+
+/// 동적 등록을 1분에 몇 번까지 받는가.
+pub const REGISTRATION_LIMIT: usize = 10;
+/// 동적 등록의 횟수를 세는 시간. 1분.
+pub const REGISTRATION_WINDOW: u64 = 60;
+/// 살아 있는 동적 클라이언트를 인스턴스마다 몇 개까지 두는가.
+pub const DYNAMIC_LIMIT: usize = 200;
+/// 살아 있는 동적 클라이언트가 가득 찼을 때 다시 해 보라고 알리는 시간. 1시간.
+pub const DYNAMIC_FULL_WAIT: u64 = 60 * 60;
+/// 한 번도 승인받지 못한 동적 클라이언트를 두는 시간. 하루.
+pub const UNAPPROVED_TTL: u64 = 24 * 60 * 60;
+
+/// 지금 동적 등록을 받을 수 없으면 몇 초 뒤에 다시 해 보라고 할지(`Retry-After`). 받을 수 있으면 `None` 이다.
+///
+/// `recent` 는 동적 클라이언트를 등록한 시각들이다(1분이 넘은 것이 섞여 있어도 된다). `live` 는 살아 있는 동적 클라이언트의 수다.
+pub fn registration_wait(recent: &[u64], live: usize, now: u64) -> Option<u64> {
+    if live >= DYNAMIC_LIMIT {
+        return Some(DYNAMIC_FULL_WAIT);
+    }
+    let start = now.saturating_sub(REGISTRATION_WINDOW);
+    let mut within: Vec<u64> = recent.iter().copied().filter(|at| *at > start).collect();
+    if within.len() < REGISTRATION_LIMIT {
+        return None;
+    }
+    within.sort_unstable();
+    // 가장 오래된 것이 창 밖으로 나가면 한 자리가 빈다
+    let frees_at = within[within.len() - REGISTRATION_LIMIT] + REGISTRATION_WINDOW;
+    Some(frees_at.saturating_sub(now).max(1))
+}
+
+/// 이 시각보다 먼저 등록되고 한 번도 승인받지 못한 동적 클라이언트는 지운다.
+pub fn unapproved_cutoff(now: u64) -> u64 {
+    now.saturating_sub(UNAPPROVED_TTL)
 }
 
 /// 동적 등록의 요청을 받을 수 있는가. 공개 클라이언트만, 인가 코드와 refresh 토큰만, redirect 는 등록할 수 있는 것만.
@@ -699,9 +668,8 @@ mod tests {
     const ISSUER: &str = "http://127.0.0.1:4100";
     const RESOURCE: &str = "http://127.0.0.1:4100/mcp";
     const REDIRECT: &str = "https://client.example/callback";
-    /// verifier 와 그 challenge. challenge 는 Python 의 `hashlib.sha256` 과 `base64.urlsafe_b64encode` 로 따로 구한 값이다.
-    const VERIFIER: &str = "dBjftJeZ4CVP-mJ92K1uX6s5wN5AtbcbN6p6pQs1bR8";
-    const CHALLENGE: &str = "82hCCcUaX78_KHQ_-h_TNPnvb4uVcFODJnnPYx5vBUI";
+    /// RFC 7636 부록 B 의 challenge. 인가 요청의 판정은 그 모양만 본다.
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
     fn client() -> KnownClient {
         KnownClient {
@@ -902,20 +870,22 @@ mod tests {
     }
 
     #[test]
-    fn verifier_가_challenge_와_맞지_않으면_토큰을_내지_않는다() {
-        assert_eq!(s256(VERIFIER), CHALLENGE);
-        assert!(pkce_matches(CHALLENGE, VERIFIER));
-        let mut other = VERIFIER.to_owned();
-        other.replace_range(0..1, "e");
-        assert!(!pkce_matches(CHALLENGE, &other));
-        assert!(!pkce_matches(CHALLENGE, ""));
-        // verifier 자체를 challenge 로 내밀어도(plain) 맞지 않는다
-        assert!(!pkce_matches(VERIFIER, VERIFIER));
-        // 모양이 틀린 verifier 는 해시가 맞아도 받지 않는다(42자 · 허용되지 않는 글자)
-        let short = &VERIFIER[..42];
-        assert!(!pkce_matches(&s256(short), short));
-        let odd = format!("{}!", &VERIFIER[..42]);
-        assert!(!pkce_matches(&s256(&odd), &odd));
+    fn verifier_의_모양은_43자에서_128자의_허용된_글자이고_계산된_challenge_와_같아야_맞는다() {
+        let verifier = "a".repeat(43);
+        assert!(valid_verifier(&verifier));
+        assert!(valid_verifier(&"Az09-._~".repeat(16)));
+        assert!(!valid_verifier(&"a".repeat(42)));
+        assert!(!valid_verifier(&"a".repeat(129)));
+        assert!(!valid_verifier(&format!("{}!", "a".repeat(42))));
+        assert!(!valid_verifier(&format!("{} ", "a".repeat(43))));
+        assert!(pkce_matches(CHALLENGE, &verifier, CHALLENGE));
+        assert!(!pkce_matches(
+            CHALLENGE,
+            &verifier,
+            &CHALLENGE.replace('E', "F")
+        ));
+        // 모양이 틀린 verifier 는 계산된 값이 맞아도 받지 않는다
+        assert!(!pkce_matches(CHALLENGE, "short", CHALLENGE));
     }
 
     #[test]
@@ -1089,8 +1059,58 @@ mod tests {
                 uri: "http://client.example/cb".to_owned()
             })
         );
-        assert!(document_fresh(100, 100 + DOCUMENT_TTL - 1));
-        assert!(!document_fresh(100, 100 + DOCUMENT_TTL));
+        assert!(document_fresh(100, 99));
+        assert!(!document_fresh(100, 100));
+    }
+
+    #[test]
+    fn metadata_문서는_그_문서가_말한_만큼_기억하되_5분보다_짧지도_하루보다_길지도_않다() {
+        // 말한 만큼
+        assert_eq!(document_lifetime(Some("public, max-age=3600")), 3600);
+        assert_eq!(document_lifetime(Some("Max-Age=900")), 900);
+        // 경계: 5분과 하루는 그대로, 그 바깥은 묶는다
+        assert_eq!(document_lifetime(Some("max-age=300")), DOCUMENT_MIN_TTL);
+        assert_eq!(document_lifetime(Some("max-age=299")), DOCUMENT_MIN_TTL);
+        assert_eq!(document_lifetime(Some("max-age=0")), DOCUMENT_MIN_TTL);
+        assert_eq!(document_lifetime(Some("max-age=86400")), DOCUMENT_TTL);
+        assert_eq!(document_lifetime(Some("max-age=86401")), DOCUMENT_TTL);
+        assert_eq!(
+            document_lifetime(Some("max-age=99999999999999999999999")),
+            DOCUMENT_TTL
+        );
+        // 말하지 않았거나 기억하지 말라고 하면 가장 짧게
+        assert_eq!(document_lifetime(None), DOCUMENT_MIN_TTL);
+        assert_eq!(document_lifetime(Some("public")), DOCUMENT_MIN_TTL);
+        assert_eq!(document_lifetime(Some("max-age=abc")), DOCUMENT_MIN_TTL);
+        assert_eq!(
+            document_lifetime(Some("no-store, max-age=3600")),
+            DOCUMENT_MIN_TTL
+        );
+        assert_eq!(
+            document_lifetime(Some("max-age=3600, no-cache")),
+            DOCUMENT_MIN_TTL
+        );
+        assert_eq!(DOCUMENT_MIN_TTL, 5 * 60);
+        assert_eq!(DOCUMENT_TTL, 24 * 60 * 60);
+    }
+
+    #[test]
+    fn 동적_등록의_한도는_1분에_열_번이고_살아_있는_동적_클라이언트는_200개다() {
+        let now = 1_000;
+        let recent: Vec<u64> = (0..9).map(|n| now - 50 + n).collect();
+        assert_eq!(registration_wait(&recent, 9, now), None);
+        let full: Vec<u64> = (0..10).map(|n| now - 50 + n).collect();
+        // 가장 오래된 것이 1분을 넘길 때까지 기다린다
+        assert_eq!(registration_wait(&full, 10, now), Some(10));
+        // 1분이 지난 것은 세지 않는다
+        let old: Vec<u64> = (0..10).map(|n| now - 70 - n).collect();
+        assert_eq!(registration_wait(&old, 10, now), None);
+        assert_eq!(registration_wait(&[], DYNAMIC_LIMIT - 1, now), None);
+        assert_eq!(
+            registration_wait(&[], DYNAMIC_LIMIT, now),
+            Some(DYNAMIC_FULL_WAIT)
+        );
+        assert_eq!(unapproved_cutoff(now + UNAPPROVED_TTL), now);
     }
 
     #[test]

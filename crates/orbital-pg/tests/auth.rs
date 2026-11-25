@@ -376,6 +376,80 @@ fn 인증_역할은_앱의_표를_읽지_못한다() {
     assert!(auth.query("SELECT 1 FROM orbital_auth.users", &[]).is_ok());
 }
 
+#[test]
+fn orbital_auth_의_표와_뷰의_주인은_로그인하지_못하고_앱의_표를_읽지_못한다() {
+    let bench = bench!();
+    let owner = bench.names.auth_owner();
+    let mut superuser = bench.superuser();
+    // orbital_auth 의 표와 두 뷰의 주인이 모두 그 역할이다
+    let rows = superuser
+        .query(
+            "SELECT n.nspname || '.' || c.relname, pg_get_userbyid(c.relowner) \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE (n.nspname = 'orbital_auth' AND c.relkind IN ('r', 'p', 'v', 'm')) \
+                OR (n.nspname = 'orbital' AND c.relname IN ('me', 'users'))",
+            &[],
+        )
+        .unwrap();
+    assert!(rows.len() >= TABLES.len() + 2, "{}", rows.len());
+    for row in &rows {
+        let (relation, by): (String, String) = (row.get(0), row.get(1));
+        assert_eq!(by, owner, "{relation}");
+    }
+    // 그 역할로 접속해 보면 거절된다
+    let refused = bench
+        .admin
+        .connect_as(&bench.names.database(), &owner)
+        .err()
+        .expect("주인 역할로는 접속하지 못해야 합니다");
+    assert_eq!(
+        refused.code(),
+        Some(&SqlState::INVALID_AUTHORIZATION_SPECIFICATION),
+        "{refused}"
+    );
+    // 어느 역할에도 딸리지 않고, 아무도 그 역할에 딸리지 않는다
+    let memberships: i64 = superuser
+        .query_one(
+            "SELECT count(*) FROM pg_auth_members WHERE roleid = $1::text::regrole OR member = $1::text::regrole",
+            &[&owner],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(memberships, 0);
+    // 그 역할이 되어 해 보면 앱의 표와 레이어의 표에는 닿지 못한다
+    superuser
+        .batch_execute(&format!("SET ROLE \"{owner}\""))
+        .unwrap();
+    for statement in [
+        "SELECT * FROM app.note",
+        "INSERT INTO app.note (author, body) VALUES ('x', 'y')",
+        "CREATE TABLE app.scratch (id int)",
+        "CREATE TABLE public.scratch (id int)",
+        "SELECT signing_key FROM orbital.instance",
+        "SELECT * FROM orbital.migration",
+        "CREATE TABLE orbital_auth.scratch (id int)",
+    ] {
+        assert!(denied(superuser.execute(statement, &[])), "{statement}");
+    }
+    superuser.batch_execute("RESET ROLE").unwrap();
+    // 주인이 바뀌어도 뷰는 그대로 돈다(뷰는 주인의 권한으로 표를 읽는다)
+    let (user, _) = sign_in(&mut bench.store(), "kim@example.com", &["member"]);
+    let mut member = bench.login("api", "member");
+    member
+        .batch_execute(&format!(
+            "SET orbital.identity = '{}'",
+            bench.identity(&user)
+        ))
+        .unwrap();
+    let me: Vec<String> = member
+        .query("SELECT id FROM orbital.me", &[])
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(me, vec![user]);
+}
+
 // ---- 토큰과 링크 ----
 
 #[test]

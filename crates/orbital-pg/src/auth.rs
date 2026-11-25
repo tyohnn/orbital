@@ -113,6 +113,8 @@ pub enum AuthError {
     InvalidGrant,
     /// 그런 인가 요청이 없거나, 남의 것이거나, 이미 정했거나, 만료됐다. 넷을 가르지 않는다.
     NoSuchRequest,
+    /// 동적 등록의 한도를 넘었다. 이만큼(초) 뒤에 다시 한다.
+    RateLimited { retry_after: u64 },
 }
 
 impl fmt::Display for AuthError {
@@ -179,6 +181,10 @@ impl fmt::Display for AuthError {
             Self::NoSuchRequest => write!(
                 f,
                 "인가 요청을 찾지 못했습니다. 클라이언트에서 다시 연결해 주세요"
+            ),
+            Self::RateLimited { retry_after } => write!(
+                f,
+                "동적 등록이 너무 잦습니다. {retry_after}초 뒤에 다시 등록해 주세요"
             ),
         }
     }
@@ -285,7 +291,9 @@ CREATE TABLE IF NOT EXISTS orbital_auth.oauth_client (
     redirect_uris text[] NOT NULL,
     application_type text,
     created_at timestamptz NOT NULL,
-    fetched_at timestamptz
+    -- metadata 문서를 받아 온 때와 기억해도 되는 마지막 때
+    fetched_at timestamptz,
+    fresh_until timestamptz
 );
 CREATE TABLE IF NOT EXISTS orbital_auth.oauth_request (
     id_hash bytea PRIMARY KEY CHECK (length(id_hash) = 32),
@@ -337,7 +345,7 @@ CREATE INDEX IF NOT EXISTS oauth_grant_user ON orbital_auth.oauth_grant (user_id
 
 REVOKE ALL ON ALL TABLES IN SCHEMA orbital_auth FROM PUBLIC;
 
--- 두 뷰는 레이어의 관리 역할이 갖는다. 읽는 역할에게 표의 권한이 없어도 뷰가 준 줄만 보인다.
+-- 두 뷰는 orbital_auth 의 주인 역할이 갖는다(install_auth 가 넘긴다). 읽는 역할에게 표의 권한이 없어도 뷰가 준 줄만 보인다.
 -- security_barrier 는 읽는 쪽의 조건이 뷰의 조건보다 먼저 돌아 남의 줄을 엿보지 못하게 한다.
 CREATE OR REPLACE VIEW orbital.me WITH (security_barrier) AS
     SELECT u.id,
@@ -372,6 +380,23 @@ $$;
 REVOKE ALL ON orbital.me, orbital.users FROM PUBLIC;
 "#;
 
+/// 주인 역할에게 넘기는 것. [`INSTALL`] 이 만드는 표와 뷰를 모두 적는다(글자로 고정한 이름이라 SQL 에 바로 넣는다).
+const AUTH_RELATIONS: [(&str, &str); 13] = [
+    ("TABLE", "orbital_auth.users"),
+    ("TABLE", "orbital_auth.user_role"),
+    ("TABLE", "orbital_auth.login"),
+    ("TABLE", "orbital_auth.invitation"),
+    ("TABLE", "orbital_auth.email_link"),
+    ("TABLE", "orbital_auth.session"),
+    ("TABLE", "orbital_auth.oauth_client"),
+    ("TABLE", "orbital_auth.oauth_request"),
+    ("TABLE", "orbital_auth.oauth_grant"),
+    ("TABLE", "orbital_auth.oauth_code"),
+    ("TABLE", "orbital_auth.oauth_token"),
+    ("VIEW", "orbital.me"),
+    ("VIEW", "orbital.users"),
+];
+
 impl Admin {
     /// `[auth]` 를 선언한 인스턴스에 `orbital_auth` 와 두 뷰를 두고 권한을 준다. 선언하지 않았으면 아무것도 하지 않는다.
     ///
@@ -388,7 +413,14 @@ impl Admin {
         transaction
             .batch_execute(INSTALL)
             .map_err(pg("로그인의 표를 두"))?;
-        let mut grants = vec![
+        // 표와 뷰의 주인을 관리 역할에서 로그인하지 못하는 주인 역할로 넘긴다. 뷰는 주인의 권한으로 표를 읽으므로,
+        // 뷰가 잘못 쓰여도 닿는 곳은 orbital_auth 의 표뿐이다. 이미 준 권한은 주인이 바뀌어도 남는다
+        let auth_owner = quote(&names.auth_owner());
+        let mut grants: Vec<String> = AUTH_RELATIONS
+            .iter()
+            .map(|(kind, relation)| format!("ALTER {kind} {relation} OWNER TO {auth_owner}"))
+            .collect();
+        grants.extend([
             format!(
                 "GRANT USAGE ON SCHEMA orbital_auth TO {}",
                 quote(&names.auth())
@@ -406,7 +438,10 @@ impl Admin {
                 "GRANT REFERENCES (id) ON orbital_auth.users TO {}",
                 quote(&names.owner())
             ),
-        ];
+            // 외래 키의 검사(FOR KEY SHARE)와 ON DELETE CASCADE 는 표의 주인으로 돈다. 그래서 주인은 제 스키마에 들어가야 하고,
+            // 제 표의 쓰는 권한도 걷지 않는다. 대신 로그인하지 못하고 누구도 이 역할의 묶음이 아니어서 사람도 앱도 이 역할이 되지 못한다
+            format!("GRANT USAGE ON SCHEMA orbital_auth TO {auth_owner}"),
+        ]);
         for role in &manifest.get().database.roles {
             grants.push(format!(
                 "GRANT SELECT ON orbital.me TO {}",

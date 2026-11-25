@@ -64,6 +64,11 @@ impl Names {
         format!("{}_auth", self.prefix())
     }
 
+    /// `orbital_auth` 의 표와 `orbital.me` · `orbital.users` 뷰의 주인. 로그인하지 못하고, 어느 역할의 묶음도 아니다.
+    pub fn auth_owner(&self) -> String {
+        format!("{}_auth_owner", self.prefix())
+    }
+
     /// 이 이름이 이 인스턴스의 것인가. 머리말 뒤가 `_` 로 이어져야 한다(`i_abc` 는 `i_abcd_owner` 의 주인이 아니다).
     pub fn owns(&self, name: &str) -> bool {
         name.strip_prefix(&self.prefix())
@@ -354,6 +359,11 @@ pub fn provision(names: &Names, manifest: &ValidManifest) -> Vec<Step> {
             name: names.auth(),
             login: true,
         });
+        // orbital_auth 의 표와 두 뷰의 주인. 레이어의 관리 역할 대신 이 역할이 뷰를 돌린다. 아무도 이 역할이 되지 못한다
+        steps.push(Step::CreateRole {
+            name: names.auth_owner(),
+            login: false,
+        });
     }
     for role in &database.roles {
         steps.push(Step::CreateRole {
@@ -492,6 +502,9 @@ pub fn grants(
 /// 클러스터에 남아 있지만 선언에는 없는 이 인스턴스의 역할. 서비스나 역할을 선언에서 빼면 생긴다.
 pub fn stale_roles(names: &Names, manifest: &ValidManifest, existing: &[String]) -> Vec<String> {
     let mut wanted: BTreeSet<String> = [names.owner()].into();
+    if manifest.get().auth.is_some() {
+        wanted.insert(names.auth_owner());
+    }
     wanted.extend(connectors(names, manifest));
     wanted.extend(
         manifest
@@ -756,15 +769,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn auth_를_선언하면_orbital_auth_의_주인이_로그인하지_못하는_역할로_서고_어디에도_접속하지_않는다()
+     {
+        assert_eq!(names().auth_owner(), "i_k3f9x2ab_auth_owner");
+        assert!(names().owns(&names().auth_owner()));
+        let steps = provision(&names(), &with_auth());
+        assert!(steps.contains(&Step::CreateRole {
+            name: "i_k3f9x2ab_auth_owner".to_owned(),
+            login: false
+        }));
+        assert!(!steps.iter().any(|step| matches!(
+            step,
+            Step::GrantMembership { group, member, .. } if group == "i_k3f9x2ab_auth_owner" || member == "i_k3f9x2ab_auth_owner"
+        ) || matches!(
+            step,
+            Step::GrantConnect { role, .. } if role == "i_k3f9x2ab_auth_owner"
+        )));
+        assert!(!connectors(&names(), &with_auth()).contains(&names().auth_owner()));
+        assert!(!format!("{:?}", provision(&names(), &manifest())).contains("auth_owner"));
+    }
+
+    #[test]
     fn 인증_역할은_auth_를_선언했을_때만_남은_역할이_아니다() {
-        let existing = ["i_k3f9x2ab_auth".to_owned()];
+        let existing = [
+            "i_k3f9x2ab_auth".to_owned(),
+            "i_k3f9x2ab_auth_owner".to_owned(),
+        ];
         assert_eq!(
             stale_roles(&names(), &with_auth(), &existing),
             Vec::<String>::new()
         );
         assert_eq!(
             stale_roles(&names(), &manifest(), &existing),
-            vec!["i_k3f9x2ab_auth".to_owned()]
+            existing.to_vec()
         );
     }
 
