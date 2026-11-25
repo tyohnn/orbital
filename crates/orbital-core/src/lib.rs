@@ -5,6 +5,7 @@
 
 pub mod access;
 pub mod auth;
+pub mod backup;
 pub mod check;
 pub mod describe;
 pub mod google;

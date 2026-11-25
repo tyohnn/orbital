@@ -55,6 +55,8 @@ pub enum Action {
     RolloutView,
     /// rollout 을 만들고, 합치기를 부르고, 다시 열고, 거둔다. service key 로만 한다.
     RolloutManage,
+    /// 운영 DB 를 지난 시점으로 되살린다. service key 로만 한다.
+    RestoreInstance,
 }
 
 impl Action {
@@ -74,7 +76,8 @@ impl Action {
             | Self::ProductionDatabase
             | Self::SecretsRead
             | Self::SecretsWrite
-            | Self::RolloutManage => None,
+            | Self::RolloutManage
+            | Self::RestoreInstance => None,
         }
     }
 }
@@ -198,6 +201,7 @@ mod tests {
             Action::ProductionDatabase,
             Action::SecretsRead,
             Action::SecretsWrite,
+            Action::RestoreInstance,
         ] {
             assert_eq!(
                 judge(&token, &request(action)),

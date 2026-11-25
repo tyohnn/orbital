@@ -352,6 +352,7 @@ fn action() -> impl Strategy<Value = Action> {
         Just(Action::SecretsWrite),
         Just(Action::RolloutView),
         Just(Action::RolloutManage),
+        Just(Action::RestoreInstance),
     ]
 }
 
@@ -400,6 +401,7 @@ fn touches_production(action: Action) -> bool {
             | Action::SecretsRead
             | Action::SecretsWrite
             | Action::RolloutManage
+            | Action::RestoreInstance
     )
 }
 
@@ -1100,6 +1102,194 @@ mod rollout {
                     at: 0,
                 };
                 prop_assert_ne!(judge(&parsed, &request), Verdict::Allow);
+            }
+        }
+    }
+}
+
+/// 백업과 복구 훈련의 판정.
+mod backup {
+    use orbital_core::backup::{BaseBackup, Check, Checked, DrillVerdict, judge_drill, prune};
+    use orbital_core::name::InstanceId;
+    use orbital_core::scope::{
+        Action, Capability, DenyReason, OrganizationId, Request, Token, Verdict, judge,
+    };
+    use proptest::prelude::*;
+
+    fn check() -> impl Strategy<Value = Check> {
+        prop_oneof![
+            Just(Check::ClusterStarted),
+            Just(Check::MarkBeforeKept),
+            Just(Check::MarkAfterGone),
+            Just(Check::Records),
+            prop_oneof![Just("k3f9x2ab"), Just("k3f9x2abc")].prop_flat_map(|instance| {
+                prop_oneof![
+                    Just(Check::Database {
+                        instance: instance.to_owned()
+                    }),
+                    Just(Check::Fingerprint {
+                        instance: instance.to_owned()
+                    }),
+                    Just(Check::Roles {
+                        instance: instance.to_owned()
+                    }),
+                ]
+            }),
+            Just(Check::Moved {
+                database: "i_k3f9x2ab".to_owned()
+            }),
+        ]
+    }
+
+    /// 통과한 확인이 훨씬 자주 나오게 해서 「하나만 어긋난」 경우가 자주 나온다.
+    fn checked() -> impl Strategy<Value = Checked> {
+        (check(), prop::bool::weighted(0.9)).prop_map(|(check, passed)| Checked { check, passed })
+    }
+
+    proptest! {
+        #[test]
+        fn 훈련은_확인이_하나라도_어긋나면_통과하지_못한다(checks in proptest::collection::vec(checked(), 0..12)) {
+            let failed: Vec<Check> = checks
+                .iter()
+                .filter(|checked| !checked.passed)
+                .map(|checked| checked.check.clone())
+                .collect();
+            let verdict = judge_drill(&checks);
+            if checks.is_empty() || !failed.is_empty() {
+                prop_assert_eq!(verdict, DrillVerdict::Failed { failed });
+            } else {
+                prop_assert_eq!(verdict, DrillVerdict::Passed);
+            }
+        }
+    }
+
+    const DAY: u64 = 86_400_000;
+
+    /// 기반 백업의 목록. 다 뜬 때가 보관 기간의 경계 근처에 자주 오게 좁힌다.
+    fn backups() -> impl Strategy<Value = Vec<BaseBackup>> {
+        proptest::collection::vec(
+            prop_oneof![
+                0u64..40 * DAY,
+                Just(16 * DAY),
+                Just(16 * DAY + 1),
+                Just(16 * DAY - 1)
+            ],
+            0..8,
+        )
+        .prop_map(|times| {
+            times
+                .into_iter()
+                .enumerate()
+                .map(|(index, finished_at)| BaseBackup {
+                    id: format!("b{index}"),
+                    started_at: finished_at.saturating_sub(5),
+                    finished_at,
+                    // 조각은 다 뜬 때를 따라 커진다(하루에 한 조각)
+                    start_wal: format!("00000001000000000000{:04X}", finished_at / DAY),
+                    segment_bytes: 1024 * 1024,
+                })
+                .collect()
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn 보관_기간이_지난_백업만_지우고_마지막_기반_백업은_언제나_남긴다(backups in backups()) {
+            // 지금은 30일, 보관 기간은 14일이다. 16일보다 앞에 다 뜬 것이 지난 것이다
+            let now = 30 * DAY;
+            let keep_for = 14 * DAY;
+            let pruning = prune(&backups, now, keep_for);
+            let newest = backups.iter().map(|backup| backup.finished_at).max();
+            let mut newest_kept = false;
+            for backup in &backups {
+                let gone = pruning.backups.contains(&backup.id);
+                let expired = backup.finished_at + keep_for < now;
+                if Some(backup.finished_at) == newest {
+                    // 가장 새 것과 같은 때에 뜬 것 가운데 하나는 반드시 남는다
+                    newest_kept |= !gone;
+                } else {
+                    prop_assert_eq!(gone, expired, "{:?}", backup);
+                }
+            }
+            prop_assert!(backups.is_empty() || newest_kept);
+            // WAL 은 남는 가장 오랜 기반 백업이 시작하는 조각 앞까지만 지운다
+            let oldest_kept = backups
+                .iter()
+                .filter(|backup| !pruning.backups.contains(&backup.id))
+                .map(|backup| backup.start_wal.clone())
+                .min();
+            prop_assert_eq!(pruning.wal_before, oldest_kept);
+        }
+    }
+
+    const POOL: [&str; 2] = ["k3f9x2ab", "k3f9x2abc"];
+
+    fn capability() -> impl Strategy<Value = Capability> {
+        prop_oneof![
+            Just(Capability::Source),
+            Just(Capability::Preview),
+            Just(Capability::Rehearse),
+            Just(Capability::SecretsRequest)
+        ]
+    }
+
+    /// 토큰에 적어 보낼 능력의 이름. 되살리기를 다루는 능력처럼 보이는 이름을 섞는다.
+    fn word() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just("source"),
+            Just("preview"),
+            Just("rehearse"),
+            Just("secrets_request"),
+            Just("restore"),
+            Just("restore_instance"),
+            Just("backup"),
+            Just("drill"),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn 어떤_토큰으로도_인스턴스를_되살리는_능력을_얻지_못한다(
+            can in proptest::collection::btree_set(capability(), 0..=4),
+            token_instance in 0usize..2,
+            request_instance in 0usize..2,
+            at in 0u64..6,
+            words in proptest::collection::vec(word(), 0..5),
+        ) {
+            let token = Token {
+                organization: OrganizationId("org_a".to_owned()),
+                instance: InstanceId::parse(POOL[token_instance]).unwrap(),
+                can,
+                expires_at: 5,
+            };
+            let request = Request {
+                organization: OrganizationId("org_a".to_owned()),
+                instance: InstanceId::parse(POOL[request_instance]).unwrap(),
+                action: Action::RestoreInstance,
+                at,
+            };
+            prop_assert_ne!(judge(&token, &request), Verdict::Allow);
+            // 되살리기를 다루는 능력의 이름을 적어 보낸 토큰은 읽히지 않는다
+            let text = serde_json::json!({
+                "organization": "org_a",
+                "instance": "k3f9x2ab",
+                "can": words,
+                "expires_at": 5,
+            })
+            .to_string();
+            let known = words
+                .iter()
+                .all(|word| matches!(*word, "source" | "preview" | "rehearse" | "secrets_request"));
+            let parsed = serde_json::from_str::<Token>(&text);
+            prop_assert_eq!(parsed.is_ok(), known);
+            if let Ok(parsed) = parsed {
+                let request = Request {
+                    organization: parsed.organization.clone(),
+                    instance: parsed.instance.clone(),
+                    action: Action::RestoreInstance,
+                    at: 0,
+                };
+                prop_assert_eq!(judge(&parsed, &request), Verdict::Deny(DenyReason::ServiceKeyOnly));
             }
         }
     }
