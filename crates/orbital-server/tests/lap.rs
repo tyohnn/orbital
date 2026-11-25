@@ -794,7 +794,9 @@ fn 토큰은_발급받은_인스턴스에서_받은_능력만큼만_쓴다() {
         404
     );
     // 서명이 틀리거나 없는 토큰
-    let forged = format!("{}00", &token[..token.len() - 2]);
+    // 끝 두 글자를 늘 다른 것으로 바꾼다(원래 끝이 `00` 이면 `00` 으로 바꿔도 같은 토큰이다)
+    let tail = if token.ends_with("00") { "11" } else { "00" };
+    let forged = format!("{}{tail}", &token[..token.len() - 2]);
     assert_eq!(
         bench
             .call(

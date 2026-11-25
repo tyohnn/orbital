@@ -15,8 +15,8 @@ use hyper::{Method, Request, Response, StatusCode};
 use orbital_core::auth::login_location;
 use orbital_core::oauth::{
     ACCESS_TTL, Authorize, AuthorizeQuery, ClientMetadata, KnownClient, Registration, SCOPE,
-    document_fresh, document_url, is_document_id, is_resource_metadata_path, judge_authorize,
-    judge_document, judge_registration, mcp, redirect_host, resource_url,
+    document_fresh, document_lifetime, document_url, is_document_id, is_resource_metadata_path,
+    judge_authorize, judge_document, judge_registration, mcp, redirect_host, resource_url,
 };
 use orbital_pg::auth::{AuthError, Secret};
 use orbital_pg::oauth::IssuedTokens;
@@ -281,10 +281,11 @@ impl State {
             Err(StoreError::Refused(_)) => None,
             Err(StoreError::Unavailable) => return Err(Unavailable),
         };
-        let fresh =
-            |fetched_at: Option<u64>| fetched_at.is_some_and(|at| document_fresh(at, now()));
+        let fresh = |fresh_until: Option<u64>| {
+            fresh_until.is_some_and(|until| document_fresh(until, now()))
+        };
         match known {
-            Some(client) if client.kind != "document" || fresh(client.fetched_at) => {
+            Some(client) if client.kind != "document" || fresh(client.fresh_until) => {
                 return Ok(Some(KnownClient {
                     id: client.id,
                     redirect_uris: client.redirect_uris,
@@ -300,10 +301,11 @@ impl State {
             .await
             .ok()
             .and_then(Result::ok);
-        let Some(bytes) = fetched else {
+        let Some(fetched) = fetched else {
             return Ok(None);
         };
-        let Ok(document) = serde_json::from_slice::<ClientMetadata>(&bytes) else {
+        let lifetime = document_lifetime(fetched.cache_control.as_deref());
+        let Ok(document) = serde_json::from_slice::<ClientMetadata>(&fetched.body) else {
             return Ok(None);
         };
         if judge_document(&id, &document).is_err() {
@@ -313,7 +315,10 @@ impl State {
         let redirect_uris = document.redirect_uris.clone();
         let (url, uris) = (id.clone(), redirect_uris.clone());
         match pool
-            .run(move |store| store.remember_document(&url, &name, &uris, now()))
+            .run(move |store| {
+                let at = now();
+                store.remember_document(&url, &name, &uris, at, at.saturating_add(lifetime))
+            })
             .await
         {
             Ok(()) => Ok(Some(KnownClient { id, redirect_uris })),
@@ -531,7 +536,7 @@ impl State {
         let issued_at = now();
         match pool
             .run(move |store| {
-                store.register_client("dynamic", &stored_name, &uris, kind.as_deref(), issued_at)
+                store.register_dynamic(&stored_name, &uris, kind.as_deref(), issued_at)
             })
             .await
         {
@@ -548,6 +553,14 @@ impl State {
                     "response_types": ["code"],
                 }),
             ),
+            Err(StoreError::Refused(AuthError::RateLimited { retry_after })) => {
+                let mut response =
+                    oauth_error(StatusCode::TOO_MANY_REQUESTS, "temporarily_unavailable");
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
+                response
+            }
             Err(StoreError::Refused(_) | StoreError::Unavailable) => {
                 error(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
             }

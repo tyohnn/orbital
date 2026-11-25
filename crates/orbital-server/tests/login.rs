@@ -15,8 +15,8 @@ use std::time::Duration;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use orbital_core::oauth::s256;
-use orbital_router::{DocumentFetcher, FetchError, Mail, Outbox};
+use orbital_pg::oauth::s256;
+use orbital_router::{DocumentFetcher, FetchError, Fetched, Mail, Outbox};
 use orbital_run::LocalRunner;
 use orbital_server::http::handle;
 use orbital_server::layer::{Layer, OUTBOX, Options};
@@ -204,27 +204,35 @@ struct Bench {
 /// 주소마다 돌려줄 문서를 테스트가 적어 두는 가짜 가져오기.
 #[derive(Default)]
 struct FakeDocuments {
-    documents: Mutex<BTreeMap<String, String>>,
+    /// 주소마다 문서와 그 답의 `Cache-Control`.
+    documents: Mutex<BTreeMap<String, (String, Option<String>)>>,
     asked: Mutex<Vec<String>>,
 }
 
 impl FakeDocuments {
     fn put(&self, url: &str, document: &Value) {
-        self.documents
-            .lock()
-            .unwrap()
-            .insert(url.to_owned(), document.to_string());
+        self.put_cached(url, document, None);
+    }
+
+    fn put_cached(&self, url: &str, document: &Value, cache_control: Option<&str>) {
+        self.documents.lock().unwrap().insert(
+            url.to_owned(),
+            (document.to_string(), cache_control.map(str::to_owned)),
+        );
     }
 }
 
 impl DocumentFetcher for FakeDocuments {
-    fn fetch(&self, url: &str) -> Result<Vec<u8>, FetchError> {
+    fn fetch(&self, url: &str) -> Result<Fetched, FetchError> {
         self.asked.lock().unwrap().push(url.to_owned());
         self.documents
             .lock()
             .unwrap()
             .get(url)
-            .map(|text| text.as_bytes().to_vec())
+            .map(|(text, cache_control)| Fetched {
+                body: text.as_bytes().to_vec(),
+                cache_control: cache_control.clone(),
+            })
             .ok_or(FetchError::Unreachable)
     }
 }
@@ -2133,7 +2141,7 @@ fn metadata_문서로_자신을_밝힌_클라이언트가_등록_없이_인가�
     assert_eq!(issued.status, 200, "{}", issued.everything());
     let access = issued.json()["access_token"].as_str().unwrap().to_owned();
     assert_eq!(Bench::mcp(&live, &access).status, 200);
-    // 다시 와도 24시간 안에는 문서를 또 받아 오지 않는다
+    // 기억하는 동안에는 다시 와도 문서를 또 받아 오지 않는다
     Bench::open_request(&live, &cookie, url);
     assert_eq!(bench.documents.asked.lock().unwrap().len(), 1);
 
@@ -2160,6 +2168,69 @@ fn metadata_문서로_자신을_밝힌_클라이언트가_등록_없이_인가�
     );
 }
 
+fn register_raw(origin: &str) -> Reply {
+    http(
+        "POST",
+        origin,
+        "/_orbital/oauth/register",
+        &[("Content-Type", "application/json")],
+        &json!({ "client_name": "테스트 클라이언트", "redirect_uris": [CALLBACK] }).to_string(),
+    )
+}
+
+#[test]
+fn 동적_등록은_1분에_열_번까지_받고_그_뒤로는_429_다() {
+    let mut bench = bench!();
+    let (instance, live) = bench.ship("mcp");
+    for round in 0..10 {
+        assert_eq!(register_raw(&live).status, 201, "{round}");
+    }
+    let refused = register_raw(&live);
+    assert_eq!(refused.status, 429, "{}", refused.everything());
+    let wait: u64 = refused.header("retry-after").unwrap().parse().unwrap();
+    assert!((1..=60).contains(&wait), "{wait}");
+    assert_eq!(
+        bench.superuser_rows(
+            &instance,
+            "SELECT count(*)::text FROM orbital_auth.oauth_client"
+        ),
+        vec!["10"]
+    );
+    // 1분이 지나면 다시 받는다
+    bench.superuser_rows(
+        &instance,
+        "UPDATE orbital_auth.oauth_client SET created_at = created_at - interval '2 minutes' RETURNING id",
+    );
+    assert_eq!(register_raw(&live).status, 201);
+}
+
+#[test]
+fn 한_번도_승인받지_못한_동적_클라이언트는_하루_뒤에_지워진다() {
+    let mut bench = bench!();
+    let (instance, live, cookie) = bench.mcp_instance("mcp", "kim@example.com");
+    let approved = Bench::register(&live);
+    Bench::code(&live, &cookie, &approved);
+    let forgotten = Bench::register(&live);
+    let fresh = Bench::register(&live);
+    // 승인받은 것과 못 받은 것을 이틀 앞으로 당기고, 하나는 그대로 둔다
+    bench.superuser_rows(
+        &instance,
+        &format!(
+            "UPDATE orbital_auth.oauth_client SET created_at = created_at - interval '2 days' \
+             WHERE id IN ('{approved}', '{forgotten}') RETURNING id"
+        ),
+    );
+    // 다음 등록이 치운다
+    Bench::register(&live);
+    let left = bench.superuser_rows(
+        &instance,
+        "SELECT id FROM orbital_auth.oauth_client ORDER BY id",
+    );
+    assert!(left.contains(&approved), "{left:?}");
+    assert!(left.contains(&fresh), "{left:?}");
+    assert!(!left.contains(&forgotten), "{left:?}");
+}
+
 #[test]
 fn mcp_를_선언하지_않은_인스턴스에는_인가_서버의_주소가_없다() {
     let mut bench = bench!();
@@ -2176,4 +2247,195 @@ fn mcp_를_선언하지_않은_인스턴스에는_인가_서버의_주소가_없
         let reply = http(method, &live, path, &[JSON], "");
         assert_eq!(reply.status, 404, "{method} {path}: {}", reply.everything());
     }
+}
+
+// ---- 다른 주소의 브라우저(CORS) ----
+
+const ELSEWHERE: &str = "https://inspector.example";
+
+fn preflight(origin: &str, path: &str, method: &str) -> Reply {
+    http(
+        "OPTIONS",
+        origin,
+        path,
+        &[
+            ("Origin", ELSEWHERE),
+            ("Access-Control-Request-Method", method),
+            ("Access-Control-Request-Headers", "content-type"),
+        ],
+        "",
+    )
+}
+
+#[test]
+fn 메타데이터와_토큰과_등록의_주소는_다른_주소의_브라우저에서_부를_수_있다() {
+    let mut bench = bench!();
+    let (_, live) = bench.ship("mcp");
+    let open = [
+        ("/.well-known/oauth-authorization-server", "GET"),
+        ("/.well-known/oauth-protected-resource/mcp", "GET"),
+        ("/_orbital/oauth/token", "POST"),
+        ("/_orbital/oauth/register", "POST"),
+    ];
+    for (path, method) in open {
+        let answer = preflight(&live, path, method);
+        assert_eq!(answer.status, 204, "{path} {}", answer.everything());
+        assert_eq!(
+            answer.header("access-control-allow-origin"),
+            Some("*"),
+            "{path}"
+        );
+        let methods = answer
+            .header("access-control-allow-methods")
+            .unwrap_or_default();
+        assert!(methods.contains(method), "{path} {methods}");
+        let headers = answer
+            .header("access-control-allow-headers")
+            .unwrap_or_default();
+        assert!(
+            headers.to_ascii_lowercase().contains("content-type"),
+            "{path} {headers}"
+        );
+        // 쿠키를 싣는 요청은 열지 않는다
+        assert_eq!(
+            answer.header("access-control-allow-credentials"),
+            None,
+            "{path}"
+        );
+    }
+    // 실제 답에도 붙는다
+    let metadata = http(
+        "GET",
+        &live,
+        "/.well-known/oauth-authorization-server",
+        &[("Origin", ELSEWHERE)],
+        "",
+    );
+    assert_eq!(metadata.status, 200);
+    assert_eq!(metadata.header("access-control-allow-origin"), Some("*"));
+    let registered = http(
+        "POST",
+        &live,
+        "/_orbital/oauth/register",
+        &[("Origin", ELSEWHERE), ("Content-Type", "application/json")],
+        &json!({ "client_name": "검사기", "redirect_uris": [CALLBACK] }).to_string(),
+    );
+    assert_eq!(registered.status, 201, "{}", registered.everything());
+    assert_eq!(registered.header("access-control-allow-origin"), Some("*"));
+    let refused = http(
+        "POST",
+        &live,
+        "/_orbital/oauth/token",
+        &[
+            ("Origin", ELSEWHERE),
+            ("Content-Type", "application/x-www-form-urlencoded"),
+        ],
+        "grant_type=authorization_code&code=nothing",
+    );
+    assert_eq!(refused.status, 400, "{}", refused.everything());
+    assert_eq!(refused.header("access-control-allow-origin"), Some("*"));
+    assert_eq!(refused.header("access-control-allow-credentials"), None);
+}
+
+#[test]
+fn 쿠키를_쓰는_주소는_다른_주소의_브라우저에_열리지_않는다() {
+    let mut bench = bench!();
+    let (instance, live) = bench.ship("mcp");
+    bench.invite(&instance, "ana@example.com");
+    let cookie = bench.sign_in(&live, "ana@example.com");
+    let closed = [
+        ("/_orbital/auth/me", "GET"),
+        ("/_orbital/auth/email-link", "POST"),
+        ("/_orbital/auth/logout", "POST"),
+        ("/_orbital/auth/callback", "GET"),
+        ("/_orbital/oauth/authorize", "GET"),
+        ("/_orbital/oauth/requests/r_x", "GET"),
+        ("/_orbital/oauth/requests/r_x/approve", "POST"),
+        ("/_orbital/oauth/grants", "GET"),
+        ("/_orbital/oauth/grants/g_x", "DELETE"),
+    ];
+    for (path, method) in closed {
+        let answer = preflight(&live, path, method);
+        assert_ne!(answer.status, 204, "{path}");
+        assert_eq!(answer.header("access-control-allow-origin"), None, "{path}");
+        assert_eq!(
+            answer.header("access-control-allow-credentials"),
+            None,
+            "{path}"
+        );
+    }
+    let me = http(
+        "GET",
+        &live,
+        "/_orbital/auth/me",
+        &[("Origin", ELSEWHERE), ("Cookie", &cookie)],
+        "",
+    );
+    assert_eq!(me.status, 200, "{}", me.everything());
+    assert_eq!(me.header("access-control-allow-origin"), None);
+    let grants = http(
+        "GET",
+        &live,
+        "/_orbital/oauth/grants",
+        &[("Origin", ELSEWHERE), ("Cookie", &cookie)],
+        "",
+    );
+    assert_eq!(grants.header("access-control-allow-origin"), None);
+}
+
+// ---- metadata 문서를 기억하는 길이 ----
+
+#[test]
+fn metadata_문서를_기억하는_길이는_받아_온_답의_cache_control_을_따른다() {
+    let mut bench = bench!();
+    let (instance, live, cookie) = bench.mcp_instance("mcpclosed", "kim@example.com");
+    let remembered = |bench: &Bench, url: &str| -> i64 {
+        bench.superuser_rows(
+            &instance,
+            &format!(
+                "SELECT round(extract(epoch FROM fresh_until - now()))::bigint::text \
+                 FROM orbital_auth.oauth_client WHERE id = '{url}'"
+            ),
+        )[0]
+        .parse()
+        .unwrap()
+    };
+    let cases = [
+        ("https://a.example/client.json", Some("max-age=600"), 600),
+        ("https://b.example/client.json", Some("max-age=10"), 300),
+        (
+            "https://c.example/client.json",
+            Some("max-age=31536000"),
+            86_400,
+        ),
+        ("https://d.example/client.json", None, 300),
+    ];
+    for (url, cache_control, expected) in cases {
+        bench.documents.put_cached(
+            url,
+            &json!({ "client_id": url, "client_name": "문서", "redirect_uris": [CALLBACK] }),
+            cache_control,
+        );
+        Bench::open_request(&live, &cookie, url);
+        let seconds = remembered(&bench, url);
+        assert!(
+            (expected - 5..=expected).contains(&seconds),
+            "{url} {seconds}"
+        );
+    }
+    // 기억이 지나면 다시 받아 온다
+    let url = "https://a.example/client.json";
+    let before = bench.documents.asked.lock().unwrap().len();
+    Bench::open_request(&live, &cookie, url);
+    assert_eq!(bench.documents.asked.lock().unwrap().len(), before);
+    bench.superuser_rows(
+        &instance,
+        &format!(
+            "UPDATE orbital_auth.oauth_client SET fresh_until = now() - interval '1 second' \
+             WHERE id = '{url}' RETURNING id"
+        ),
+    );
+    Bench::open_request(&live, &cookie, url);
+    assert_eq!(bench.documents.asked.lock().unwrap().len(), before + 1);
+    assert!(remembered(&bench, url) > 500);
 }

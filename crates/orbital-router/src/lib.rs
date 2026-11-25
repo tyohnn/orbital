@@ -182,7 +182,15 @@ pub enum FetchError {
 
 /// metadata 문서를 받아 오는 자리. 갈아 끼운다. 테스트는 가짜를, `orbitald` 는 [`HttpsFetcher`] 를 쓴다.
 pub trait DocumentFetcher: Send + Sync {
-    fn fetch(&self, url: &str) -> Result<Vec<u8>, FetchError>;
+    fn fetch(&self, url: &str) -> Result<Fetched, FetchError>;
+}
+
+/// 받아 온 문서와, 얼마나 기억해도 되는지 그 답이 말한 것.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fetched {
+    pub body: Vec<u8>,
+    /// 답의 `Cache-Control`. 얼마나 기억할지는 core 의 `document_lifetime` 이 정한다.
+    pub cache_control: Option<String>,
 }
 
 /// 실제로 받아 오는 것. `https` 만, 넘겨주기(redirect)를 따라가지 않고, 5초, 64KB 까지.
@@ -234,7 +242,7 @@ impl ureq::Resolver for PublicResolver {
 }
 
 impl DocumentFetcher for HttpsFetcher {
-    fn fetch(&self, url: &str) -> Result<Vec<u8>, FetchError> {
+    fn fetch(&self, url: &str) -> Result<Fetched, FetchError> {
         use std::io::Read as _;
         if orbital_core::oauth::document_url(url).is_err() {
             return Err(FetchError::Refused);
@@ -253,6 +261,7 @@ impl DocumentFetcher for HttpsFetcher {
         if response.status() != 200 {
             return Err(FetchError::NotOk);
         }
+        let cache_control = response.header("cache-control").map(str::to_owned);
         let mut body = Vec::new();
         response
             .into_reader()
@@ -262,7 +271,10 @@ impl DocumentFetcher for HttpsFetcher {
         if body.len() as u64 > DOCUMENT_LIMIT {
             return Err(FetchError::TooLarge);
         }
-        Ok(body)
+        Ok(Fetched {
+            body,
+            cache_control,
+        })
     }
 }
 
@@ -390,6 +402,19 @@ fn full(bytes: impl Into<Bytes>) -> Body {
     Full::new(bytes.into())
         .map_err(|never| match never {})
         .boxed()
+}
+
+/// 다른 주소의 브라우저가 부를 수 있는 주소와 그 방법. 쿠키를 보지 않는 주소(메타데이터 · 토큰 · 동적 등록)뿐이다.
+///
+/// 로그인 · 동의 · 승인 목록처럼 세션 쿠키로 사람을 알아보는 주소는 여기에 넣지 않는다.
+fn cross_origin_methods(path: &str) -> Option<&'static str> {
+    if path.starts_with("/.well-known/oauth-") {
+        return Some("GET, OPTIONS");
+    }
+    match path {
+        "/_orbital/oauth/token" | "/_orbital/oauth/register" => Some("POST, OPTIONS"),
+        _ => None,
+    }
 }
 
 fn empty() -> Body {
@@ -629,6 +654,38 @@ impl State {
     }
 
     async fn answer(&self, request: Request<Incoming>) -> Response<Body> {
+        // 쿠키를 보지 않는 주소만 다른 주소의 브라우저에 연다. 자격 증명(credentials)은 열지 않으니 쿠키는 실리지 않는다
+        let Some(methods) = cross_origin_methods(request.uri().path()) else {
+            return self.dispatch(request).await;
+        };
+        let mut response = if request.method() == Method::OPTIONS {
+            let mut preflight = Response::new(empty());
+            *preflight.status_mut() = StatusCode::NO_CONTENT;
+            let headers = preflight.headers_mut();
+            headers.insert(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                HeaderValue::from_static(methods),
+            );
+            headers.insert(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                HeaderValue::from_static("content-type, mcp-protocol-version"),
+            );
+            headers.insert(
+                header::ACCESS_CONTROL_MAX_AGE,
+                HeaderValue::from_static("600"),
+            );
+            preflight
+        } else {
+            self.dispatch(request).await
+        };
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        response
+    }
+
+    async fn dispatch(&self, request: Request<Incoming>) -> Response<Body> {
         let path = request.uri().path().to_owned();
         // 인가 서버와 자원 서버의 메타데이터는 서비스로 보내지 않고 router 가 답한다
         if path.starts_with("/.well-known/oauth-") {
