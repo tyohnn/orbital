@@ -373,3 +373,76 @@ fn 권한의_말은_닿는_범위로_읽힌다() {
         ]
     );
 }
+
+mod release {
+    use orbital_core::release::{
+        Approval, Approver, BuiltBy, Change, Rehearsed, Release, ReleaseId, promote,
+    };
+    use proptest::prelude::*;
+
+    fn release() -> impl Strategy<Value = Release> {
+        (
+            prop_oneof![Just("r1"), Just("r2")],
+            any::<bool>(),
+            0usize..3,
+            prop_oneof![
+                Just(Rehearsed::NotNeeded),
+                Just(Rehearsed::NotRun),
+                Just(Rehearsed::Passed),
+                Just(Rehearsed::Failed)
+            ],
+        )
+            .prop_map(|(id, by_layer, access_findings, rehearsal)| Release {
+                id: ReleaseId(id.to_owned()),
+                built_by: if by_layer {
+                    BuiltBy::Layer
+                } else {
+                    BuiltBy::Uploaded
+                },
+                access_findings,
+                rehearsal,
+            })
+    }
+
+    fn change() -> impl Strategy<Value = Change> {
+        prop_oneof![
+            Just(Change::CustomerRequest),
+            Just(Change::FeatureUpdate),
+            Just(Change::LegalUpdate),
+            Just(Change::SecurityUpdate),
+            Just(Change::CorePackage)
+        ]
+    }
+
+    fn approval() -> impl Strategy<Value = Option<Approval>> {
+        proptest::option::of(
+            (prop_oneof![Just("r1"), Just("r2")], any::<bool>()).prop_map(|(id, customer)| {
+                Approval {
+                    release: ReleaseId(id.to_owned()),
+                    by: if customer {
+                        Approver::Customer
+                    } else {
+                        Approver::Factory
+                    },
+                }
+            }),
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn 어떤_release_든_운영에_오르려면_검사_셋을_통과하고_제_승인을_받아야_한다(
+            release in release(), change in change(), approval in approval(),
+        ) {
+            // 구현의 `blockers` 를 부르지 않고 조건을 따로 적는다
+            let checks_pass = release.built_by == BuiltBy::Layer
+                && release.access_findings == 0
+                && matches!(release.rehearsal, Rehearsed::NotNeeded | Rehearsed::Passed);
+            let needs_customer = matches!(change, Change::CustomerRequest | Change::FeatureUpdate);
+            let approved = approval.as_ref().is_some_and(|approval| {
+                approval.release == release.id && (approval.by == Approver::Customer) == needs_customer
+            });
+            prop_assert_eq!(promote(&release, change, approval.as_ref()).is_ok(), checks_pass && approved);
+        }
+    }
+}
