@@ -248,14 +248,18 @@ impl Bench {
         fs::create_dir_all(&scratch).unwrap();
         let home = scratch.join("home");
         let documents = Arc::new(FakeDocuments::default());
+        // 이 테스트들은 팩토리의 키 없이 운영까지 올린다. 개발용 메일함을 명시해 켠다
         let layer = Layer::open(Options {
-            home: home.clone(),
-            pg_url: pg_url.clone(),
-            service_keys: vec![
-                (FACTORY.to_owned(), ORGANIZATION.to_owned()),
-                (OTHER_FACTORY.to_owned(), "other".to_owned()),
-            ],
-            runner: Box::new(LocalRunner::default()),
+            dev_mailbox: true,
+            ..Options::new(
+                home.clone(),
+                pg_url.clone(),
+                vec![
+                    (FACTORY.to_owned(), ORGANIZATION.to_owned()),
+                    (OTHER_FACTORY.to_owned(), "other".to_owned()),
+                ],
+                Box::new(LocalRunner::default()),
+            )
         })
         .expect("레이어를 열지 못했습니다")
         .with_document_fetcher(documents.clone());

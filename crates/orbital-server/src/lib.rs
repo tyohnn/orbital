@@ -4,5 +4,8 @@
 
 pub mod http;
 pub mod layer;
+pub mod login;
 pub mod registry;
+pub mod seal;
+pub mod settings;
 pub mod token;

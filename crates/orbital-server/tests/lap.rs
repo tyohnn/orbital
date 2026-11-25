@@ -90,14 +90,18 @@ impl Bench {
     fn new() -> Option<Self> {
         let pg_url = std::env::var("ORBITAL_PG").ok()?;
         let scratch = Scratch::new();
+        // 팩토리의 키 없이 운영까지 올린다. 개발용 메일함을 명시해 켠다
         let layer = Layer::open(Options {
-            home: scratch.path("home"),
-            pg_url,
-            service_keys: vec![
-                (FACTORY.to_owned(), "factory".to_owned()),
-                (OTHER_FACTORY.to_owned(), "other".to_owned()),
-            ],
-            runner: Box::new(LocalRunner::default()),
+            dev_mailbox: true,
+            ..Options::new(
+                scratch.path("home"),
+                pg_url,
+                vec![
+                    (FACTORY.to_owned(), "factory".to_owned()),
+                    (OTHER_FACTORY.to_owned(), "other".to_owned()),
+                ],
+                Box::new(LocalRunner::default()),
+            )
         })
         .expect("레이어를 열지 못했습니다");
 
