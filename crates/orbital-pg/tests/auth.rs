@@ -138,16 +138,19 @@ impl Bench {
         let access =
             Access::parse(&toml::from_str::<RawAccess>(ACCESS).unwrap(), &manifest).unwrap();
         admin.provision(&names, &manifest).unwrap();
-        admin.install_identity(&names, KEY).unwrap();
-        admin.install_auth(&names, &manifest).unwrap();
-        admin.migrate(&names, &[migration]).unwrap();
-        admin.grant(&names, &manifest, &access).unwrap();
-        Some(Self {
+        // 세우다가 깨져도 걷히도록, 여기부터는 다 지은 값 위에서 세운다(값이 떨어질 때 `Drop` 이 걷는다)
+        let mut bench = Self {
             admin,
             names,
             manifest,
             access,
-        })
+        };
+        let (admin, names, manifest) = (&mut bench.admin, &bench.names, &bench.manifest);
+        admin.install_identity(names, KEY).unwrap();
+        admin.install_auth(names, manifest).unwrap();
+        admin.migrate(names, &[migration]).unwrap();
+        admin.grant(names, manifest, &bench.access).unwrap();
+        Some(bench)
     }
 
     fn store(&self) -> AuthStore {
@@ -193,7 +196,9 @@ impl Bench {
             KEY,
             &self.names,
             &Claims {
-                subject: subject.to_owned(),
+                subject: Some(subject.to_owned()),
+                roles: vec!["member".to_owned(), "manager".to_owned()],
+                session: None,
                 expires_at: FAR_FUTURE,
             },
         )

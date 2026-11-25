@@ -69,6 +69,8 @@ INSERT INTO payroll.payslip (employee, amount) VALUES ('emp_1', 100), ('emp_1', 
 "#;
 
 const KEY: &[u8] = b"test-signing-key-not-a-real-secret";
+/// 테스트의 신원에 싣는 업무 역할. 선언의 역할을 모두 싣는다(역할을 견주는 일은 `roles.rs` 가 잰다).
+const ROLES: [&str; 3] = ["employee", "manager", "payroll_admin"];
 const FAR_FUTURE: u64 = 4_000_000_000;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -154,7 +156,9 @@ impl Bench {
             KEY,
             &self.names,
             &Claims {
-                subject: subject.to_owned(),
+                subject: Some(subject.to_owned()),
+                roles: ROLES.iter().map(|role| (*role).to_owned()).collect(),
+                session: None,
                 expires_at: FAR_FUTURE,
             },
         )
@@ -530,7 +534,9 @@ fn 서명이_없거나_틀린_신원으로는_어떤_행도_읽지_못한다() {
         b"another-key",
         &bench.names,
         &Claims {
-            subject: "emp_1".to_owned(),
+            subject: Some("emp_1".to_owned()),
+            roles: ROLES.iter().map(|role| (*role).to_owned()).collect(),
+            session: None,
             expires_at: FAR_FUTURE,
         },
     );
@@ -563,7 +569,9 @@ fn 만료된_신원과_다른_인스턴스의_신원은_읽히지_않는다() {
         KEY,
         &bench.names,
         &Claims {
-            subject: "emp_1".to_owned(),
+            subject: Some("emp_1".to_owned()),
+            roles: ROLES.iter().map(|role| (*role).to_owned()).collect(),
+            session: None,
             expires_at: 1,
         },
     );
@@ -577,7 +585,9 @@ fn 만료된_신원과_다른_인스턴스의_신원은_읽히지_않는다() {
         KEY,
         &elsewhere,
         &Claims {
-            subject: "emp_1".to_owned(),
+            subject: Some("emp_1".to_owned()),
+            roles: ROLES.iter().map(|role| (*role).to_owned()).collect(),
+            session: None,
             expires_at: FAR_FUTURE,
         },
     );

@@ -131,7 +131,9 @@ impl Bench {
             KEY,
             &self.names,
             &Claims {
-                subject: subject.to_owned(),
+                subject: Some(subject.to_owned()),
+                roles: vec!["employee".to_owned(), "payroll_admin".to_owned()],
+                session: None,
                 expires_at: 4_000_000_000,
             },
         )

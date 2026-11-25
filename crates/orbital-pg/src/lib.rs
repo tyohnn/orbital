@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use orbital_core::access::{Access, Privilege};
-use orbital_core::check::{Membership, RoleState, Snapshot, TableState};
+use orbital_core::check::{Membership, RolePolicy, RoleState, Snapshot, TableState};
 use orbital_core::manifest::ValidManifest;
 use orbital_core::name::{Ident, TableRef};
-use orbital_core::plan::{Names, Place, Step, grants, provision};
+use orbital_core::plan::{Names, Place, ROLE_POLICY, Step, grants, provision};
 use postgres::error::SqlState;
 use postgres::{Client, Config, NoTls};
 
@@ -264,8 +264,32 @@ impl Admin {
                     owner: row.get(2),
                     rls: row.get(3),
                     privileges: BTreeMap::new(),
+                    role_policy: None,
                 },
             );
+        }
+        // 역할 제한 정책. Postgres 가 다시 적어 준 조건(`pg_get_expr`)을 그대로 넘기고, 같은지는 core 가 본다
+        let rows = client
+            .query(
+                "SELECT n.nspname, c.relname, NOT p.polpermissive, p.polcmd::text, \
+                 ARRAY(SELECT CASE WHEN r = 0 THEN 'public' ELSE pg_get_userbyid(r)::text END FROM unnest(p.polroles) r ORDER BY 1), \
+                 pg_get_expr(p.polqual, p.polrelid), pg_get_expr(p.polwithcheck, p.polrelid) \
+                 FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE p.polname = $1",
+                &[&ROLE_POLICY],
+            )
+            .map_err(pg(reading))?;
+        for row in rows {
+            let key: (String, String) = (row.get(0), row.get(1));
+            if let Some(state) = tables.get_mut(&key) {
+                state.role_policy = Some(RolePolicy {
+                    restrictive: row.get(2),
+                    command: row.get(3),
+                    roles: row.get(4),
+                    using: row.get(5),
+                    check: row.get(6),
+                });
+            }
         }
         // 권한을 받은 쪽이 0 이면 누구나(PUBLIC)다
         let rows = client

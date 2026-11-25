@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::access::{Access, Privilege, Reach};
+use crate::access::{Access, Privilege, Reach, Rls};
 use crate::manifest::ValidManifest;
 use crate::name::{Ident, InstanceId, TableRef};
 
@@ -134,6 +134,32 @@ pub enum Step {
         role: String,
         privileges: Vec<Privilege>,
     },
+    /// 표에 역할 제한 정책을 (다시) 둔다. 신원에 없는 업무 역할의 연결에서는 어떤 행도 읽고 쓰지 못한다.
+    SetRolePolicy {
+        table: TableRef,
+    },
+    /// 표의 역할 제한 정책을 걷는다. 없으면 아무것도 하지 않는다.
+    DropRolePolicy {
+        table: TableRef,
+    },
+}
+
+/// 역할 제한 정책의 이름. 앱의 마이그레이션은 이 이름을 쓰지 못한다(권한 검사가 잡는다).
+pub const ROLE_POLICY: &str = "orbital_role";
+/// 역할 제한 정책의 조건. 지금 연결의 업무 역할이 서명된 신원에 있는가.
+/// `SELECT` 로 감싸 문장마다 한 번만 검증한다(행마다 서명을 확인하지 않는다).
+pub const ROLE_POLICY_EXPR: &str = "(SELECT orbital.granted() AS granted)";
+
+/// 이 표에 역할 제한 정책을 두는가. `[auth]` 를 선언했고 권한 표에서 행 단위 규칙을 켠 표만이다.
+///
+/// 행 단위 규칙을 끈 표(`rls = "off: 까닭"`)에는 정책이 걸리지 않는다. 그런 표는 [`crate::check::unguarded`] 가 따로 알린다.
+/// `[auth]` 가 없는 인스턴스에는 사용자도 신원도 없으므로 정책을 두지 않는다. 두면 어떤 표도 아무에게도 읽히지 않는다.
+pub fn role_guarded(manifest: &ValidManifest, access: &Access, table: &TableRef) -> bool {
+    manifest.get().auth.is_some()
+        && access
+            .tables
+            .get(table)
+            .is_some_and(|declared| declared.rls == Rls::On)
 }
 
 fn quote(name: &str) -> String {
@@ -250,6 +276,20 @@ impl Step {
                 quote_table(table),
                 quote(role)
             ),
+            Self::SetRolePolicy { table } => {
+                let table = quote_table(table);
+                format!(
+                    "DROP POLICY IF EXISTS {ROLE_POLICY} ON {table}; \
+                     CREATE POLICY {ROLE_POLICY} ON {table} AS RESTRICTIVE FOR ALL TO PUBLIC \
+                     USING ({ROLE_POLICY_EXPR}) WITH CHECK ({ROLE_POLICY_EXPR})"
+                )
+            }
+            Self::DropRolePolicy { table } => {
+                format!(
+                    "DROP POLICY IF EXISTS {ROLE_POLICY} ON {}",
+                    quote_table(table)
+                )
+            }
         }
     }
 }
@@ -433,6 +473,19 @@ pub fn grants(
             }
         }
     }
+
+    // 역할 제한 정책은 권한을 다 준 뒤에 맞춘다. 둘 표에는 다시 두고, 그 밖의 표에서는 걷는다
+    // (앞에서 auth 를 선언했다가 뺐거나 행 단위 규칙을 껐으면 남은 정책이 없어야 한다)
+    let (guarded, open): (Vec<&TableRef>, Vec<&TableRef>) = actual
+        .iter()
+        .copied()
+        .partition(|table| role_guarded(manifest, access, table));
+    steps.extend(open.into_iter().map(|table| Step::DropRolePolicy {
+        table: table.clone(),
+    }));
+    steps.extend(guarded.into_iter().map(|table| Step::SetRolePolicy {
+        table: table.clone(),
+    }));
     steps
 }
 
@@ -712,6 +765,109 @@ pub(crate) mod tests {
         assert_eq!(
             stale_roles(&names(), &manifest(), &existing),
             vec!["i_k3f9x2ab_auth".to_owned()]
+        );
+    }
+
+    #[test]
+    fn auth_를_선언하면_행_단위_규칙을_켠_표마다_역할_제한_정책을_세우고_나머지에서는_걷는다() {
+        let access = crate::access::Access::parse(
+            &toml::from_str::<crate::access::RawAccess>(ACCESS).unwrap(),
+            &with_auth(),
+        )
+        .unwrap();
+        let tables = [
+            table("payroll", "payslip"),
+            table("hr", "department"),
+            table("payroll", "bonus"),
+        ];
+        let steps = grants(&names(), &with_auth(), &access, &tables);
+        let policies: Vec<&Step> = steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step,
+                    Step::SetRolePolicy { .. } | Step::DropRolePolicy { .. }
+                )
+            })
+            .collect();
+        assert_eq!(
+            policies,
+            vec![
+                &Step::DropRolePolicy {
+                    table: table("hr", "department")
+                },
+                &Step::DropRolePolicy {
+                    table: table("payroll", "bonus")
+                },
+                &Step::SetRolePolicy {
+                    table: table("payroll", "payslip")
+                },
+            ]
+        );
+        // 정책은 권한을 다 준 뒤에 세운다
+        let last_grant = steps
+            .iter()
+            .rposition(|step| {
+                matches!(
+                    step,
+                    Step::GrantTable { .. }
+                        | Step::GrantSchemaUsage { .. }
+                        | Step::GrantSequences { .. }
+                )
+            })
+            .unwrap();
+        let first_policy = steps
+            .iter()
+            .position(|step| {
+                matches!(
+                    step,
+                    Step::SetRolePolicy { .. } | Step::DropRolePolicy { .. }
+                )
+            })
+            .unwrap();
+        assert!(last_grant < first_policy);
+    }
+
+    #[test]
+    fn auth_를_선언하지_않으면_역할_제한_정책을_세우지_않는다() {
+        let access = access(ACCESS).unwrap();
+        let tables = [table("payroll", "payslip"), table("hr", "department")];
+        let steps = grants(&names(), &manifest(), &access, &tables);
+        assert!(
+            !steps
+                .iter()
+                .any(|step| matches!(step, Step::SetRolePolicy { .. }))
+        );
+        // 앞에서 auth 를 선언했다가 뺐으면 남은 정책을 걷는다
+        assert!(steps.contains(&Step::DropRolePolicy {
+            table: table("payroll", "payslip")
+        }));
+    }
+
+    #[test]
+    fn 역할_제한_정책은_제한하는_정책이고_모든_명령과_모든_역할에_걸린다() {
+        assert_eq!(
+            Step::SetRolePolicy {
+                table: table("payroll", "payslip")
+            }
+            .sql(),
+            "DROP POLICY IF EXISTS orbital_role ON \"payroll\".\"payslip\"; \
+             CREATE POLICY orbital_role ON \"payroll\".\"payslip\" AS RESTRICTIVE FOR ALL TO PUBLIC \
+             USING ((SELECT orbital.granted() AS granted)) WITH CHECK ((SELECT orbital.granted() AS granted))"
+        );
+        assert_eq!(
+            Step::DropRolePolicy {
+                table: table("payroll", "payslip")
+            }
+            .sql(),
+            "DROP POLICY IF EXISTS orbital_role ON \"payroll\".\"payslip\""
+        );
+        assert_eq!(
+            Step::DropRolePolicy {
+                table: table("payroll", "payslip")
+            }
+            .place(),
+            Place::Database
         );
     }
 

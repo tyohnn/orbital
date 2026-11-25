@@ -62,6 +62,23 @@ impl Secret {
     fn hash(&self) -> Vec<u8> {
         Sha256::digest(self.0).to_vec()
     }
+
+    /// 세션을 가리키는 이름(`s_` 와 hex 24자). 신원의 `sid` 에 싣는다.
+    ///
+    /// 토큰에서 한쪽으로만 지어서 이것으로는 토큰도, DB 에 둔 해시도 되짚지 못한다. 같은 세션이면 늘 같다.
+    pub fn session_id(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"orbital/sid/");
+        digest.update(self.hash());
+        let digest = digest.finalize();
+        format!(
+            "s_{}",
+            digest[..12]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )
+    }
 }
 
 impl fmt::Debug for Secret {
@@ -195,6 +212,8 @@ pub struct User {
     pub name: Option<String>,
     pub roles: Vec<String>,
     pub disabled: bool,
+    /// 마지막으로 세션을 연 때(유닉스 초). 한 번도 들어오지 않았으면 없다.
+    pub last_signed_in_at: Option<u64>,
 }
 
 /// 인스턴스의 database 에 두는 것. 이름이 인스턴스마다 다른 권한은 [`Admin::install_auth`] 가 따로 준다.
@@ -746,7 +765,8 @@ impl AuthStore {
             .query(
                 "SELECT u.id, u.email::text, u.name, \
                  ARRAY(SELECT r.role FROM orbital_auth.user_role r WHERE r.user_id = u.id ORDER BY r.role), \
-                 u.disabled_at IS NOT NULL \
+                 u.disabled_at IS NOT NULL, \
+                 (SELECT extract(epoch FROM max(s.created_at))::bigint FROM orbital_auth.session s WHERE s.user_id = u.id) \
                  FROM orbital_auth.users u ORDER BY u.email",
                 &[],
             )
@@ -759,6 +779,7 @@ impl AuthStore {
                 name: row.get(2),
                 roles: row.get(3),
                 disabled: row.get(4),
+                last_signed_in_at: unix(row.get(5)),
             })
             .collect())
     }

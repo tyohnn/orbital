@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::access::{Access, Privilege, Rls};
 use crate::manifest::ValidManifest;
 use crate::name::{Ident, TableRef};
-use crate::plan::{Names, logins};
+use crate::plan::{Names, ROLE_POLICY_EXPR, logins, role_guarded};
 
 /// 실제 DB 에서 읽어 온 모습.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -36,6 +36,60 @@ pub struct TableState {
     pub rls: bool,
     /// 받은 쪽의 역할 이름마다의 권한. 누구나(PUBLIC)는 `public` 으로 적는다.
     pub privileges: BTreeMap<String, BTreeSet<Privilege>>,
+    /// 이 표의 역할 제한 정책(이름 `orbital_role`). 없으면 `None` 이다.
+    #[serde(default)]
+    pub role_policy: Option<RolePolicy>,
+}
+
+/// 실제 DB 에 있는 역할 제한 정책의 모습. Postgres 가 읽어 준 그대로다(`pg_policy`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolePolicy {
+    /// 제한하는 정책(`AS RESTRICTIVE`)인가.
+    pub restrictive: bool,
+    /// 걸리는 명령. `*` 는 모든 명령이다.
+    pub command: String,
+    /// 걸리는 역할. 누구나(PUBLIC)는 `public` 이다.
+    pub roles: Vec<String>,
+    pub using: Option<String>,
+    pub check: Option<String>,
+}
+
+/// `[auth]` 를 선언했지만 행 단위 규칙을 꺼서 역할 제한 정책이 걸리지 않는 표. 실패는 아니고 알려 줄 것이다.
+pub fn unguarded(manifest: &ValidManifest, access: &Access) -> Vec<TableRef> {
+    if manifest.get().auth.is_none() {
+        return Vec::new();
+    }
+    access
+        .tables
+        .iter()
+        .filter(|(_, declared)| declared.rls != Rls::On)
+        .map(|(table, _)| table.clone())
+        .collect()
+}
+
+/// 공백과 대소문자를 빼고 견준다. Postgres 는 정책의 조건을 제 모양으로 다시 적어 돌려준다.
+fn same_expression(left: &str, right: &str) -> bool {
+    let squeeze = |text: &str| -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    squeeze(left) == squeeze(right)
+}
+
+/// 레이어가 두는 역할 제한 정책과 같은가. 제한하는 정책이고, 모든 명령과 누구에게나 걸리고, 두 조건이 `orbital.granted()` 다.
+fn is_role_policy(policy: &RolePolicy) -> bool {
+    let granted = |expression: &Option<String>| {
+        expression
+            .as_deref()
+            .is_some_and(|text| same_expression(text, ROLE_POLICY_EXPR))
+    };
+    policy.restrictive
+        && policy.command == "*"
+        && policy.roles == ["public"]
+        && granted(&policy.using)
+        && granted(&policy.check)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +166,15 @@ pub enum Finding {
         member: String,
     },
     PublicCanConnect,
+    RolePolicyMissing {
+        table: TableRef,
+    },
+    RolePolicyWrong {
+        table: TableRef,
+    },
+    RolePolicyUnexpected {
+        table: TableRef,
+    },
 }
 
 impl fmt::Display for Finding {
@@ -185,6 +248,18 @@ impl fmt::Display for Finding {
                 write!(f, "`{member}` 가 `{group}` 으로 역할을 바꿔 탈 수 있습니다")
             }
             Self::PublicCanConnect => write!(f, "누구나 이 database 에 접속할 수 있습니다"),
+            Self::RolePolicyMissing { table } => write!(
+                f,
+                "표 `{table}` 에 역할 제한 정책(`orbital_role`)이 없습니다. 마이그레이션이 지웠다면 그 문장을 빼 주세요. 레이어가 권한을 세울 때 다시 둡니다"
+            ),
+            Self::RolePolicyWrong { table } => write!(
+                f,
+                "표 `{table}` 의 역할 제한 정책(`orbital_role`)이 레이어가 둔 것과 다릅니다. 마이그레이션에서 `orbital_role` 이라는 이름의 정책을 만들거나 고치지 말아 주세요"
+            ),
+            Self::RolePolicyUnexpected { table } => write!(
+                f,
+                "표 `{table}` 에 역할 제한 정책(`orbital_role`)이 있지만 계획에 없습니다. 마이그레이션에서 `orbital_role` 이라는 이름의 정책을 만들지 말아 주세요"
+            ),
         }
     }
 }
@@ -272,6 +347,20 @@ pub fn judge(
             findings.push(Finding::RlsOff {
                 table: table.clone(),
             });
+        }
+        match (&state.role_policy, role_guarded(manifest, access, &table)) {
+            (None, true) => findings.push(Finding::RolePolicyMissing {
+                table: table.clone(),
+            }),
+            (Some(policy), true) if !is_role_policy(policy) => {
+                findings.push(Finding::RolePolicyWrong {
+                    table: table.clone(),
+                });
+            }
+            (Some(_), false) => findings.push(Finding::RolePolicyUnexpected {
+                table: table.clone(),
+            }),
+            _ => {}
         }
         for role in &database.roles {
             let wanted: BTreeSet<Privilege> = access
@@ -429,6 +518,7 @@ pub(crate) mod tests {
                 owner: names.owner(),
                 rls: rls_on.contains(target),
                 privileges: BTreeMap::new(),
+                role_policy: None,
             });
         }
         for step in grants(&names, &manifest, &access, tables) {
@@ -719,25 +809,125 @@ pub(crate) mod tests {
         snapshot
     }
 
-    #[test]
-    fn auth_를_선언한_db_는_orbital_auth_와_인증_역할이_있어도_통과한다() {
+    /// Postgres 가 역할 제한 정책을 읽어 줄 때의 모양(`pg_get_expr`). 구현의 상수를 부르지 않고 그대로 적는다.
+    fn deparsed() -> RolePolicy {
+        RolePolicy {
+            restrictive: true,
+            command: "*".to_owned(),
+            roles: vec!["public".to_owned()],
+            using: Some("( SELECT orbital.granted() AS granted)".to_owned()),
+            check: Some("( SELECT orbital.granted() AS granted)".to_owned()),
+        }
+    }
+
+    /// `[auth]` 를 선언한 인스턴스를 계획대로 세운 모습. 행 단위 규칙을 켠 표(payslip)에만 역할 제한 정책이 있다.
+    fn guarded() -> Snapshot {
+        let mut snapshot = with_auth_installed();
+        payslip(&mut snapshot).role_policy = Some(deparsed());
+        snapshot
+    }
+
+    fn with_auth() -> (ValidManifest, Access) {
         let manifest = crate::plan::tests::with_auth();
         let access = Access::parse(
             &toml::from_str::<crate::access::RawAccess>(ACCESS).unwrap(),
             &manifest,
         )
         .unwrap();
-        assert_eq!(
-            judge(&names(), &manifest, &access, &with_auth_installed()),
-            vec![]
-        );
+        (manifest, access)
+    }
+
+    #[test]
+    fn auth_를_선언한_db_는_orbital_auth_와_인증_역할이_있어도_통과한다() {
+        let (manifest, access) = with_auth();
+        assert_eq!(judge(&names(), &manifest, &access, &guarded()), vec![]);
         // 인증 역할이 없으면 모자란 것이다
+        let mut missing = guarded();
+        missing.roles.retain(|state| state.name != names().auth());
         assert_eq!(
-            judge(&names(), &manifest, &access, &standard()),
+            judge(&names(), &manifest, &access, &missing),
             vec![Finding::RoleMissing {
                 role: names().auth()
             }]
         );
+    }
+
+    #[test]
+    fn auth_를_선언한_db_에서_역할_제한_정책이_없거나_다르면_실패한다() {
+        let (manifest, access) = with_auth();
+        let payslip_ref = table("payroll", "payslip");
+        let mut none = guarded();
+        payslip(&mut none).role_policy = None;
+        assert_eq!(
+            judge(&names(), &manifest, &access, &none),
+            vec![Finding::RolePolicyMissing {
+                table: payslip_ref.clone()
+            }]
+        );
+        let changes: [fn(&mut RolePolicy); 5] = [
+            |policy| policy.restrictive = false,
+            |policy| policy.command = "r".to_owned(),
+            |policy| policy.roles = vec!["i_k3f9x2ab_r_employee".to_owned()],
+            |policy| policy.using = Some("true".to_owned()),
+            |policy| policy.check = None,
+        ];
+        for change in changes {
+            let mut wrong = guarded();
+            change(payslip(&mut wrong).role_policy.as_mut().unwrap());
+            assert_eq!(
+                judge(&names(), &manifest, &access, &wrong),
+                vec![Finding::RolePolicyWrong {
+                    table: payslip_ref.clone()
+                }]
+            );
+        }
+        // 공백과 대소문자만 다른 것은 같은 정책이다
+        let mut spaced = guarded();
+        payslip(&mut spaced).role_policy.as_mut().unwrap().using =
+            Some("(SELECT  orbital.granted()  AS granted)".to_owned());
+        assert_eq!(judge(&names(), &manifest, &access, &spaced), vec![]);
+    }
+
+    #[test]
+    fn 행_단위_규칙을_끈_표에_역할_제한_정책이_있으면_실패한다() {
+        // 행 단위 규칙이 꺼진 표에는 정책이 걸리지 않는다. 있어도 듣지 않으니 계획에 없는 것으로 본다
+        let (manifest, access) = with_auth();
+        let mut snapshot = guarded();
+        snapshot
+            .tables
+            .iter_mut()
+            .find(|state| state.table == "department")
+            .unwrap()
+            .role_policy = Some(deparsed());
+        assert_eq!(
+            judge(&names(), &manifest, &access, &snapshot),
+            vec![Finding::RolePolicyUnexpected {
+                table: table("hr", "department")
+            }]
+        );
+    }
+
+    #[test]
+    fn auth_를_선언하지_않은_db_에_역할_제한_정책이_있으면_실패한다() {
+        let mut snapshot = standard();
+        payslip(&mut snapshot).role_policy = Some(deparsed());
+        assert_eq!(
+            run(&snapshot),
+            vec![Finding::RolePolicyUnexpected {
+                table: table("payroll", "payslip")
+            }]
+        );
+    }
+
+    #[test]
+    fn 행_단위_규칙을_끈_표는_역할_제한이_걸리지_않는_표로_알려_준다() {
+        let (declared, access) = with_auth();
+        assert_eq!(
+            unguarded(&declared, &access),
+            vec![table("hr", "department")]
+        );
+        // auth 를 선언하지 않은 인스턴스에는 역할 제한이 없으니 따로 알릴 표도 없다
+        assert_eq!(unguarded(&manifest(), &access), vec![]);
     }
 
     #[test]

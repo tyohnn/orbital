@@ -6,10 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use orbital_core::access::{Access, Grant, Privilege, RawAccess, Reach};
 use orbital_core::check::{
-    Finding, Membership, RoleState, Snapshot, TableState, judge as judge_database,
+    Finding, Membership, RolePolicy, RoleState, Snapshot, TableState, judge as judge_database,
 };
 use orbital_core::manifest::{
-    Database, Manifest, Service, ServiceAuth, ServiceKind, ValidManifest,
+    Auth, Database, Manifest, Service, ServiceAuth, ServiceKind, Signup, ValidManifest,
 };
 use orbital_core::name::{Ident, InstanceId, TableRef};
 use orbital_core::plan::{Names, Step, grants, provision};
@@ -37,6 +37,11 @@ fn names() -> Names {
 
 /// 서비스 둘이 역할의 부분집합을 쓰는 선언.
 fn manifest(api: &[bool; 3], worker: &[bool; 3]) -> ValidManifest {
+    manifest_with(api, worker, false)
+}
+
+/// `auth` 이면 로그인을 레이어에 맡긴다(`[auth]`).
+fn manifest_with(api: &[bool; 3], worker: &[bool; 3], auth: bool) -> ValidManifest {
     let pick = |mask: &[bool; 3]| {
         ROLES
             .iter()
@@ -65,6 +70,13 @@ fn manifest(api: &[bool; 3], worker: &[bool; 3]) -> ValidManifest {
             roles: ROLES.iter().map(|role| ident(role)).collect(),
             ..Database::default()
         },
+        auth: auth.then(|| Auth {
+            methods: vec!["email_link".to_owned()],
+            login_path: "/api/login".to_owned(),
+            signup: Signup::Invite,
+            default_roles: Vec::new(),
+            directory: Vec::new(),
+        }),
         ..Manifest::default()
     }
     .check()
@@ -131,6 +143,10 @@ fn applied(names: &Names, manifest: &ValidManifest, access: &Access) -> Snapshot
             _ => {}
         }
     }
+    // `[auth]` 를 선언했으면 레이어가 `orbital_auth` 를 둔다(`Admin::install_auth`)
+    if manifest.get().auth.is_some() {
+        snapshot.schemas.push("orbital_auth".to_owned());
+    }
     for table in tables() {
         snapshot.tables.push(TableState {
             schema: table.schema.to_string(),
@@ -138,10 +154,34 @@ fn applied(names: &Names, manifest: &ValidManifest, access: &Access) -> Snapshot
             owner: names.owner(),
             rls: true,
             privileges: BTreeMap::new(),
+            role_policy: None,
         });
     }
     for step in grants(names, manifest, access, &tables()) {
         match step {
+            // Postgres 가 정책을 읽어 줄 때의 모양이다(`pg_get_expr`). 구현의 상수를 부르지 않고 그대로 적는다
+            Step::SetRolePolicy { table } => {
+                let state = snapshot
+                    .tables
+                    .iter_mut()
+                    .find(|state| state.table == table.table.as_str())
+                    .unwrap();
+                state.role_policy = Some(RolePolicy {
+                    restrictive: true,
+                    command: "*".to_owned(),
+                    roles: vec!["public".to_owned()],
+                    using: Some("( SELECT orbital.granted() AS granted)".to_owned()),
+                    check: Some("( SELECT orbital.granted() AS granted)".to_owned()),
+                });
+            }
+            Step::DropRolePolicy { table } => {
+                let state = snapshot
+                    .tables
+                    .iter_mut()
+                    .find(|state| state.table == table.table.as_str())
+                    .unwrap();
+                state.role_policy = None;
+            }
             Step::RevokeTable { table, role } => {
                 let state = snapshot
                     .tables
@@ -253,6 +293,34 @@ proptest! {
         let mut snapshot = applied(&names, &manifest, &access);
         snapshot.tables[table].rls = false;
         prop_assert_eq!(judge_database(&names, &manifest, &access, &snapshot).len(), 1);
+    }
+
+    #[test]
+    fn 어떤_선언이든_계획대로_세운_db_는_역할_제한_정책까지_넣어_권한_검사를_통과한다(
+        api in mask(), worker in mask(), words in words(), auth in any::<bool>()
+    ) {
+        let (names, manifest) = (names(), manifest_with(&api, &worker, auth));
+        let access = access(&words, &manifest);
+        let snapshot = applied(&names, &manifest, &access);
+        prop_assert_eq!(judge_database(&names, &manifest, &access, &snapshot), vec![]);
+        // 정책은 auth 를 선언했을 때만, 권한 표의 표마다 있다(생성기의 권한 표는 모든 표의 행 단위 규칙을 켠다)
+        let guarded = snapshot.tables.iter().filter(|state| state.role_policy.is_some()).count();
+        prop_assert_eq!(guarded, if auth { TABLES.len() } else { 0 });
+    }
+
+    #[test]
+    fn 통과한_db_에서_역할_제한_정책을_하나라도_지우면_검사가_실패한다(
+        api in mask(), worker in mask(), words in words(), table in 0usize..4
+    ) {
+        let (names, manifest) = (names(), manifest_with(&api, &worker, true));
+        let access = access(&words, &manifest);
+        let mut snapshot = applied(&names, &manifest, &access);
+        snapshot.tables[table].role_policy = None;
+        let (schema, name) = TABLES[table];
+        prop_assert_eq!(
+            judge_database(&names, &manifest, &access, &snapshot),
+            vec![Finding::RolePolicyMissing { table: TableRef { schema: ident(schema), table: ident(name) } }]
+        );
     }
 }
 
