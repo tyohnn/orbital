@@ -8,7 +8,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
-use orbital_core::release::Rehearsed;
+use orbital_core::release::{Conformed, Rehearsed};
+use orbital_core::rollout::Rollout;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +21,9 @@ pub struct ReleaseRecord {
     /// 선언이 밖에서 넣는다고 적은 비밀의 이름(`[secrets] external`). 에이전트가 요청할 수 있는 이름을 가른다.
     #[serde(default)]
     pub external: Vec<String>,
+    /// 위쪽의 적합성 테스트가 이 release 의 프리뷰에서 어떻게 끝났는가.
+    #[serde(default)]
+    pub conformance: Conformed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,10 +55,20 @@ pub struct InstanceRecord {
     pub preview: Option<String>,
 }
 
+/// rollout 하나. 어느 팩토리의 것인지와 core 가 판정하는 진행.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RolloutRecord {
+    pub organization: String,
+    pub rollout: Rollout,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
     pub instances: BTreeMap<String, InstanceRecord>,
+    /// rollout 의 식별자마다. 끝났거나 거둔 것도 남긴다.
+    #[serde(default)]
+    pub rollouts: BTreeMap<String, RolloutRecord>,
 }
 
 pub struct Registry {

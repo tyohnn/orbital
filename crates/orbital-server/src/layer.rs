@@ -59,6 +59,13 @@ use crate::settings::{Settings, SettingsError};
 use crate::token;
 use crate::vault::{RedeemError, SecretValue, Vault, VaultError};
 
+mod rollout;
+use orbital_core::rollout::Event as RolloutEvent;
+use rollout::refusal_text;
+pub use rollout::{
+    AgentRollout, ApplyReport, ConformanceReport, InstanceProgress, NewRollout, RolloutReport,
+};
+
 /// 일이 안 됐을 때 부른 쪽에 돌려주는 것. 에이전트가 읽고 고칠 수 있게 적는다.
 #[derive(Debug)]
 pub enum Failure {
@@ -364,6 +371,8 @@ pub struct PreviewReport {
     pub notices: Vec<String>,
     /// 밖에서 넣는 비밀 가운데 프리뷰의 값이 없어 환경 변수 없이 선 것의 이름. 사람에게 입력을 요청한다.
     pub missing_secrets: Vec<String>,
+    /// 위쪽이 정한 적합성 테스트의 결과. 위쪽이 선언하지 않았으면 `null` 이다.
+    pub conformance: Option<ConformanceReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -396,6 +405,8 @@ pub struct PendingPromotion {
     pub migrations: Vec<String>,
     /// 이번 변경으로 앱이 새로 받게 되는 밖에서 넣는 비밀의 이름. 지금의 운영과 견준다.
     pub new_secrets: Vec<String>,
+    /// 이 release 가 담은 업데이트의 열린 rollout. 없으면 `null` 이다.
+    pub rollout: Option<String>,
 }
 
 /// 비밀 하나의 모습. 값은 싣지 않는다(지문도 길이도 없다).
@@ -457,6 +468,8 @@ pub struct Options {
     pub hosting: Option<Hosting>,
     /// 비밀의 입력 표와 요청이 읽는 시계. 테스트가 갈아 끼워 표의 만료를 잰다.
     pub clock: Clock,
+    /// 적합성 테스트의 제한 시간(기본 120초). 넘으면 멈추고 실패로 적는다.
+    pub conformance_timeout: Duration,
 }
 
 /// 하위 도메인으로 인스턴스를 가르는 레이어의 설정.
@@ -490,6 +503,7 @@ impl Options {
             wake_timeout: Duration::from_secs(30),
             hosting: None,
             clock: Arc::new(now),
+            conformance_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -514,6 +528,7 @@ pub struct Layer {
     runner: Arc<dyn Runner>,
     sleep_after: Duration,
     wake_timeout: Duration,
+    conformance_timeout: Duration,
     /// 하위 도메인을 쓸 때만 있다.
     hosted: Option<Hosted>,
     runtime: Runtime,
@@ -693,6 +708,7 @@ impl Layer {
             runner: Arc::from(options.runner),
             sleep_after: options.sleep_after,
             wake_timeout: options.wake_timeout,
+            conformance_timeout: options.conformance_timeout,
             hosted,
             runtime,
             token_key,
@@ -873,6 +889,12 @@ impl Layer {
         }
     }
 
+    /// 인스턴스가 길에 없는 일(rollout 을 만들거나 다시 여는 일)을 토큰이 두드렸을 때, 토큰이 발급받은 인스턴스로 판정한다.
+    pub fn authorize_own(&self, bearer: &str, action: Action) -> Outcome<()> {
+        let token = token::verify(&self.token_key, bearer).ok_or(Failure::Unauthorized)?;
+        self.authorize(bearer, &token.instance, action)
+    }
+
     fn owned<'a>(
         inner: &'a mut Inner,
         organization: &str,
@@ -978,15 +1000,26 @@ impl Layer {
     }
 
     pub fn push(&self, instance: &InstanceId, bundle: &[u8]) -> Outcome<Commit> {
-        let _guard = self.lock();
-        self.sources
+        let mut inner = self.lock();
+        let commit = self
+            .sources
             .receive(instance, bundle)
             .map_err(|error| match error {
                 SourceError::BadBundle | SourceError::NotFastForward => {
                     Failure::Problems(vec![error.to_string()])
                 }
                 other => internal(other),
-            })
+            })?;
+        // 에이전트가 업데이트를 합쳐(충돌을 풀어) 올렸으면 적용된 것이다
+        self.track(
+            &mut inner,
+            instance,
+            &commit,
+            &[RolloutEvent::Applied {
+                instance: instance.clone(),
+            }],
+        )?;
+        Ok(commit)
     }
 
     fn assembled(&self, instance: &InstanceId, commit: &Commit) -> Outcome<Assembled> {
@@ -1405,6 +1438,12 @@ impl Layer {
             }
         };
 
+        // 위쪽이 정한 적합성 테스트를 이 프리뷰에 대해 돌린다
+        let conformance = self.conform(instance, &assembled, &launched.origin);
+        let conformed = conformance
+            .as_ref()
+            .map_or(Conformed::NotDeclared, |report| report.outcome);
+
         // 운영에 아직 돌지 않은 마이그레이션이 있으면 리허설이 필요하다
         let rehearsal = match &record.production {
             None => Rehearsed::NotNeeded,
@@ -1446,7 +1485,7 @@ impl Layer {
                     instance,
                     &assembled.manifest,
                 ),
-                conformance: Conformed::NotDeclared,
+                conformance: conformed,
             })
             .iter()
             .map(blocker_text)
@@ -1468,6 +1507,7 @@ impl Layer {
             .iter()
             .map(|name| name.as_str().to_owned())
             .collect(),
+            conformance,
         };
 
         let stored = inner
@@ -1490,9 +1530,29 @@ impl Layer {
                     .iter()
                     .map(|name| name.as_str().to_owned())
                     .collect(),
+                conformance: conformed,
             },
         );
         inner.registry.save().map_err(Failure::Internal)?;
+        // 업데이트를 담은 commit 이면 그 rollout 에 적용 · 프리뷰 · 검사의 결과를 넘긴다
+        self.track(
+            &mut inner,
+            instance,
+            &commit,
+            &[
+                RolloutEvent::Applied {
+                    instance: instance.clone(),
+                },
+                RolloutEvent::Previewed {
+                    instance: instance.clone(),
+                },
+                RolloutEvent::Checked {
+                    instance: instance.clone(),
+                    access_passed: findings.is_empty(),
+                    conformance_passed: conformed.clears(),
+                },
+            ],
+        )?;
         inner.live.insert(
             (instance.as_str().to_owned(), Stage::Preview),
             Live {
@@ -1717,7 +1777,8 @@ impl Layer {
         })?;
         let commit = Commit::parse(&known.commit)
             .ok_or_else(|| internal("release 의 commit 을 읽지 못했습니다"))?;
-        let (access_findings, rehearsal) = (known.access_findings, known.rehearsal);
+        let (access_findings, rehearsal, conformance) =
+            (known.access_findings, known.rehearsal, known.conformance);
         let organization = record.organization.clone();
         let manifest = self.assembled(instance, &commit)?.manifest;
         let found = blockers(&Release {
@@ -1727,7 +1788,7 @@ impl Layer {
             rehearsal,
             missing_keys: self.missing_keys(&organization, &manifest),
             missing_secrets: self.missing_secrets(&organization, instance, &manifest),
-            conformance: Conformed::NotDeclared,
+            conformance,
         });
         if !found.is_empty() {
             return Err(Failure::Denied(PromoteDenied::Blocked { blockers: found }));
@@ -1770,7 +1831,8 @@ impl Layer {
             missing_keys: self.missing_keys(organization, &assembled.manifest),
             // 밖에서 넣는 비밀도 올리는 때의 운영 칸을 본다
             missing_secrets: self.missing_secrets(organization, instance, &assembled.manifest),
-            conformance: Conformed::NotDeclared,
+            // 적합성 테스트는 프리뷰에서 돈 결과를 본다
+            conformance: known.conformance,
         };
         // 승인은 호출에 적힌 release 하나에 묶인다. 승인한 뒤 commit 이 더해졌으면 식별자가 달라 여기서 찾지 못하거나 리허설이 다시 필요하다
         let approval = Approval {
@@ -1778,6 +1840,16 @@ impl Layer {
             by: approved_by,
         };
         judge_promotion(&facts, change, Some(&approval)).map_err(Failure::Denied)?;
+        // 업데이트를 담은 release 면 그 rollout 의 관문(멈춤 · 물결 · 통과 · change)을 지나야 한다
+        let governing = self.governing(&inner, instance, &commit);
+        if let Some(id) = &governing
+            && let Some(record) = inner.registry.state.rollouts.get(id)
+        {
+            record
+                .rollout
+                .may_promote(instance, change)
+                .map_err(|refusal| Failure::Conflict(refusal_text(&refusal)))?;
+        }
 
         let folder = self.build(instance, &assembled)?;
         let names = Names::new(instance.clone());
@@ -1853,7 +1925,18 @@ impl Layer {
                     record: &record,
                     names: &names,
                 };
-                return Err(self.back_out(&mut inner, &prior, point.as_ref(), kind, failure));
+                let failure = self.back_out(&mut inner, &prior, point.as_ref(), kind, failure);
+                // 업데이트를 담은 release 가 서지 못하고 되돌려졌다. 그 인스턴스는 실패로 적히고 rollout 이 멈춘다
+                if let Some(id) = &governing {
+                    let _ = Self::record(
+                        &mut inner,
+                        id,
+                        &[RolloutEvent::RolledBack {
+                            instance: instance.clone(),
+                        }],
+                    );
+                }
+                return Err(failure);
             }
         };
 
@@ -1888,6 +1971,16 @@ impl Layer {
         });
         stored.promotion_requested = None;
         inner.registry.save().map_err(Failure::Internal)?;
+        if let Some(id) = &governing {
+            Self::record(
+                &mut inner,
+                id,
+                &[RolloutEvent::Promoted {
+                    instance: instance.clone(),
+                    change,
+                }],
+            )?;
+        }
         inner.live.insert(
             key,
             Live {
@@ -2098,7 +2191,9 @@ impl Layer {
         };
         let before = self.production_access(instance, &record)?;
         let received = self.production_external(instance, &record)?;
+        let rollout = self.governing(&inner, instance, &commit);
         Ok(Some(PendingPromotion {
+            rollout,
             release,
             commit: commit.to_string(),
             changes: changes(&before, &assembled.access)

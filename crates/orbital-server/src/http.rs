@@ -21,7 +21,7 @@ use orbital_source::Commit;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::layer::{Failure, Layer};
+use crate::layer::{Failure, Layer, NewRollout};
 use crate::vault::SecretValue;
 
 /// 묶음(코드)의 상한.
@@ -356,6 +356,11 @@ fn with_token(
         ("PUT" | "DELETE", ["secrets", _]) | ("POST", ["secrets", _, "entries"]) => {
             allow(Action::SecretsWrite).map(|()| ok(json!({})))
         }
+        // 자기 인스턴스가 든 열린 rollout 의 진행. 다른 인스턴스는 싣지 않는다
+        ("GET", ["rollout"]) => {
+            allow(Action::RolloutView)?;
+            Ok(ok(json!(layer.instance_rollout(&instance)?)))
+        }
         // 사용자를 초대하는 길(`users`)은 service key 에만 있다. 토큰에는 없는 길이라 없는 것으로 답한다
         _ => Err(Failure::NotFound),
     }
@@ -381,6 +386,29 @@ fn with_service_key(
         ("PUT", ["apps", app]) => {
             layer.put_app(&organization, app, body)?;
             Ok(ok(json!({ "app": app })))
+        }
+        ("POST", ["apps", app, "rollouts"]) => {
+            let request: NewRollout = parse(body)?;
+            Ok(ok(json!(layer.create_rollout(
+                &organization,
+                app,
+                request
+            )?)))
+        }
+        ("GET", ["rollouts", id]) => Ok(ok(json!(layer.rollout(&organization, id)?))),
+        ("POST", ["rollouts", id, "instances", instance, "apply"]) => {
+            let instance = InstanceId::parse(instance).map_err(|_| Failure::NotFound)?;
+            Ok(ok(json!(layer.apply_update(
+                &organization,
+                id,
+                &instance
+            )?)))
+        }
+        ("POST", ["rollouts", id, "resume"]) => {
+            Ok(ok(json!(layer.resume_rollout(&organization, id)?)))
+        }
+        ("POST", ["rollouts", id, "cancel"]) => {
+            Ok(ok(json!(layer.cancel_rollout(&organization, id)?)))
         }
         ("POST", ["instances"]) => {
             let request: NewInstance = parse(body)?;
@@ -528,6 +556,10 @@ pub fn handle(layer: &Layer, method: &str, path: &str, bearer: Option<&str>, bod
     let result = if bearer.starts_with("orb1.") {
         match rest {
             ["instances", tail @ ..] => with_token(layer, method, tail, bearer, body),
+            // rollout 을 만들고 · 합치고 · 다시 열고 · 거두는 길을 토큰으로 두드리면 core 가 「service key 로만」이라고 답한다
+            ["apps", _, "rollouts"] | ["rollouts", ..] => layer
+                .authorize_own(bearer, Action::RolloutManage)
+                .map(|()| ok(json!({}))),
             _ => Err(Failure::NotFound),
         }
     } else {
