@@ -133,6 +133,13 @@ export interface Orbital
         /** 사용자를 뺀다. 막고 그 사용자의 세션을 모두 거둔다. */
         remove(input: { instance: string; user: string }): Promise<void>;
     };
+    oauthClients: {
+        /**
+         * MCP 의 OAuth 클라이언트를 미리 등록한다(`[auth.mcp]` 를 선언한 인스턴스만). redirect 는 `https` 이거나 `localhost` 여야 한다.
+         * 클라이언트는 받은 `clientId` 로 인가를 받는다. 비밀(client_secret)은 없다(공개 클라이언트).
+         */
+        register(input: { instance: string; name: string; redirectUris: readonly string[] }): Promise<{ clientId: string }>;
+    };
 }
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
@@ -300,6 +307,13 @@ export function createOrbital(options: OrbitalOptions): Orbital
             async remove({ instance, user })
             {
                 await call("DELETE", at(instance, `/users/${encodeURIComponent(user)}`));
+            },
+        },
+        oauthClients: {
+            async register({ instance, name, redirectUris })
+            {
+                const reply = await call("POST", at(instance, "/oauth-clients"), { name, redirect_uris: [...redirectUris] });
+                return { clientId: text(isRecord(reply) ? reply.client_id : undefined) };
             },
         },
     };

@@ -137,6 +137,12 @@ struct NewIdentity {
 }
 
 #[derive(Deserialize)]
+struct NewOauthClient {
+    name: String,
+    redirect_uris: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct NewRoles {
     roles: Vec<String>,
 }
@@ -277,6 +283,16 @@ fn with_service_key(
                 ))),
                 ("GET", ["production"]) => {
                     Ok(ok(json!(layer.production(&organization, &instance)?)))
+                }
+                ("POST", ["oauth-clients"]) => {
+                    let request: NewOauthClient = parse(body)?;
+                    let client_id = layer.register_oauth_client(
+                        &organization,
+                        &instance,
+                        &request.name,
+                        &request.redirect_uris,
+                    )?;
+                    Ok(ok(json!({ "client_id": client_id })))
                 }
                 ("GET", ["users"]) => Ok(ok(
                     json!({ "users": layer.users(&organization, &instance)? }),

@@ -263,6 +263,11 @@ test("팩토리의 서버가 인스턴스를 세워 토큰을 내고 에이전�
     assert.equal((await fetch(`${live}/_orbital/auth/me`, { headers: { cookie: u8 } })).status, 401);
     assert.equal((await orbital.users.list(instance.id)).find((user) => user.id === u8id)?.disabled, true);
 
+    // MCP 를 선언하지 않은 앱에는 OAuth 클라이언트를 미리 등록하지 못하고 까닭이 돌아온다
+    const noMcp = await rejection(orbital.oauthClients.register({ instance: instance.id, name: "팩토리의 앱", redirectUris: ["https://factory.example/callback"] }));
+    assert.deepEqual([noMcp.status, noMcp.code], [422, "problems"]);
+    assert.match(noMcp.details.join("\n"), /auth\.mcp/);
+
     // 밖에서 신원 머리말을 실어 보내도 앱에는 닿지 않는다
     assert.equal((await (await fetch(`${live}/cards`, { headers: { "x-orbital-identity": "v1.00.00" } })).json() as unknown[]).length, 0);
 });
@@ -280,6 +285,7 @@ test("다른 팩토리의 service key 로는 인스턴스가 없는 것으로 �
         () => stranger.instances.destroy(instance.id),
         () => stranger.users.invite({ instance: instance.id, email: "kim@example.test", roles: ["member"] }),
         () => stranger.users.list(instance.id),
+        () => stranger.oauthClients.register({ instance: instance.id, name: "x", redirectUris: ["https://factory.example/callback"] }),
         () => stranger.users.setRoles({ instance: instance.id, user: "u_aaaaaaaaaaaaaaaaaaaa", roles: [] }),
         () => stranger.users.remove({ instance: instance.id, user: "u_aaaaaaaaaaaaaaaaaaaa" }),
     ];

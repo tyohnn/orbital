@@ -96,6 +96,16 @@ http.createServer(async (request, response) => {
         }
         // 앱에 닿은 머리말을 그대로 돌려준다. router 가 무엇을 지우고 붙였는지 테스트가 본다
         if (request.url === "/echo") return send(200, { headers: request.headers });
+        // MCP 의 자리. 인가는 레이어가 하고, 앱은 router 가 붙인 신원으로 자기 카드만 읽는다. 받은 머리말을 함께 돌려준다
+        if (request.url.split("?")[0] === "/mcp") {
+            const sets = await query("member", withIdentity(request, "SELECT to_jsonb(c) - 'owner' FROM todo.card c ORDER BY id"));
+            return send(200, { cards: sets[1].map((row) => JSON.parse(row[0])), headers: request.headers });
+        }
+        // 동의 화면. 화면만 그리고, 요청을 읽고 승인하는 일은 레이어(/_orbital/oauth/…)가 한다
+        if (request.url.split("?")[0] === "/oauth/consent") {
+            response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+            return response.end("<!doctype html><title>연결 승인</title><button>승인</button><button>거절</button>");
+        }
         if (request.url === "/env") return send(200, { names: Object.keys(process.env).sort() });
         if (request.url === "/cards" && request.method === "GET") {
             const sets = await query("member", withIdentity(request, "SELECT to_jsonb(c) - 'owner' FROM todo.card c ORDER BY id"));

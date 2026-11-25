@@ -34,6 +34,7 @@ use orbital_core::auth::{
     static_file, wants_page,
 };
 use orbital_core::manifest::ValidManifest;
+use orbital_core::oauth::is_mcp_path;
 use orbital_core::plan::Names;
 use orbital_pg::auth::{AuthError, AuthStore, Secret, SessionUser};
 use orbital_pg::identity::{Claims, sign};
@@ -69,6 +70,8 @@ const HOP_BY_HOP: [&str; 9] = [
     "transfer-encoding",
     "upgrade",
 ];
+
+mod oauth;
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
@@ -162,6 +165,107 @@ impl Mailer for Outbox {
     }
 }
 
+// ---- Client ID Metadata Documents 받아 오기 ----
+
+/// metadata 문서를 받아 오지 못한 까닭. 어느 것이든 그 클라이언트를 모르는 것으로 다룬다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchError {
+    /// 주소가 사설망 · 이 기계 · 링크 로컬을 가리키거나 `https` 가 아니다.
+    Refused,
+    /// 닿지 못했거나 시간이 넘었다.
+    Unreachable,
+    /// 200 이 아니다(넘겨주기도 따라가지 않는다).
+    NotOk,
+    /// 상한(64KB)을 넘는다.
+    TooLarge,
+}
+
+/// metadata 문서를 받아 오는 자리. 갈아 끼운다. 테스트는 가짜를, `orbitald` 는 [`HttpsFetcher`] 를 쓴다.
+pub trait DocumentFetcher: Send + Sync {
+    fn fetch(&self, url: &str) -> Result<Vec<u8>, FetchError>;
+}
+
+/// 실제로 받아 오는 것. `https` 만, 넘겨주기(redirect)를 따라가지 않고, 5초, 64KB 까지.
+///
+/// 주소의 모양은 core 의 `document_url` 이 먼저 본다. 이름이 실제로 가리키는 주소는 여기서 이름을 풀 때 다시 본다.
+/// 사설망 · 이 기계 · 링크 로컬로 풀리는 주소는 버리고 남은 주소로만 붙는다(이름을 푼 뒤 바꿔치는 공격을 막는다).
+#[derive(Debug, Default)]
+pub struct HttpsFetcher;
+
+/// 문서의 상한.
+const DOCUMENT_LIMIT: u64 = 64 * 1024;
+
+/// 공인 주소로만 풀어 준다.
+struct PublicResolver;
+
+/// 이 주소가 사설망 · 이 기계 · 링크 로컬 · 예약된 것인가.
+pub fn private_address(address: &std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(v4) => orbital_core::oauth::private_ipv4(v4.octets()),
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| orbital_core::oauth::private_ipv4(v4.octets()))
+        }
+    }
+}
+
+impl ureq::Resolver for PublicResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::net::ToSocketAddrs as _;
+        let public: Vec<std::net::SocketAddr> = netloc
+            .to_socket_addrs()?
+            .filter(|address| !private_address(&address.ip()))
+            .collect();
+        if public.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "사설 주소로만 풀린다",
+            ));
+        }
+        Ok(public)
+    }
+}
+
+impl DocumentFetcher for HttpsFetcher {
+    fn fetch(&self, url: &str) -> Result<Vec<u8>, FetchError> {
+        use std::io::Read as _;
+        if orbital_core::oauth::document_url(url).is_err() {
+            return Err(FetchError::Refused);
+        }
+        let agent = ureq::AgentBuilder::new()
+            .https_only(true)
+            .redirects(0)
+            .timeout(std::time::Duration::from_secs(5))
+            .resolver(PublicResolver)
+            .build();
+        let response = match agent.get(url).set("Accept", "application/json").call() {
+            Ok(response) => response,
+            Err(ureq::Error::Status(_, _)) => return Err(FetchError::NotOk),
+            Err(ureq::Error::Transport(_)) => return Err(FetchError::Unreachable),
+        };
+        if response.status() != 200 {
+            return Err(FetchError::NotOk);
+        }
+        let mut body = Vec::new();
+        response
+            .into_reader()
+            .take(DOCUMENT_LIMIT + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| FetchError::Unreachable)?;
+        if body.len() as u64 > DOCUMENT_LIMIT {
+            return Err(FetchError::TooLarge);
+        }
+        Ok(body)
+    }
+}
+
 // ---- 설정 ----
 
 /// router 가 선 자리. 씨앗 사용자로 들어가는 길은 미리보기에만 있다.
@@ -197,14 +301,17 @@ pub struct Config {
     pub seed_users: Vec<String>,
     /// 요청마다 한 줄(메서드, 질의를 뗀 경로, 상태)을 적는 파일.
     pub log: Option<PathBuf>,
+    /// Client ID Metadata Documents 를 받아 오는 것.
+    pub documents: Arc<dyn DocumentFetcher>,
 }
 
 // ---- 인증 역할의 연결 풀 ----
 
-/// 세션을 확인한 요청. 사용자와, 신원의 `sid` 에 실을 세션의 이름이다.
+/// 누구의 요청인지 확인한 것. 브라우저의 세션이면 세션의 이름(`sid`)이, MCP 의 토큰이면 클라이언트(`cid`)가 있다.
 struct Signed {
     user: SessionUser,
-    session: String,
+    session: Option<String>,
+    client: Option<String>,
 }
 
 /// 인증 역할의 연결을 열지 못했다. 503 으로 답한다.
@@ -523,6 +630,10 @@ impl State {
 
     async fn answer(&self, request: Request<Incoming>) -> Response<Body> {
         let path = request.uri().path().to_owned();
+        // 인가 서버와 자원 서버의 메타데이터는 서비스로 보내지 않고 router 가 답한다
+        if path.starts_with("/.well-known/oauth-") {
+            return self.well_known(&path);
+        }
         if path == "/_orbital" || path.starts_with("/_orbital/") {
             return self.layer(request).await;
         }
@@ -533,6 +644,12 @@ impl State {
         let Some(target) = self.config.targets.get(service.name.as_str()) else {
             return error(StatusCode::NOT_FOUND, "not_found");
         };
+        // MCP 의 주소는 쿠키를 보지 않고 Bearer 토큰만 본다. 다른 사이트가 사용자의 쿠키로 MCP 를 부르지 못하게 한다
+        if is_mcp_path(manifest, &path)
+            && let Target::Server { port } = target
+        {
+            return self.mcp_request(request, *port).await;
+        }
         let user = match self.signed_in(request.headers()).await {
             Ok(user) => user,
             Err(Unavailable) => return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
@@ -570,7 +687,11 @@ impl State {
         };
         let session = token.session_id();
         match pool.run(move |store| store.session(&token, now())).await {
-            Ok(user) => Ok(user.map(|user| Signed { user, session })),
+            Ok(user) => Ok(user.map(|user| Signed {
+                user,
+                session: Some(session),
+                client: None,
+            })),
             Err(StoreError::Refused(_)) => Ok(None),
             Err(StoreError::Unavailable) => Err(Unavailable),
         }
@@ -629,7 +750,12 @@ impl State {
     ) -> Response<Body> {
         let (mut parts, body) = request.into_parts();
         clean_request_headers(&mut parts.headers);
-        if let Some(Signed { user, session }) = signed {
+        if let Some(Signed {
+            user,
+            session,
+            client,
+        }) = signed
+        {
             // 업무 역할은 이번 요청에서 표로 읽은 것이다. 역할을 거두면 다음 요청의 신원에서 빠진다
             let identity = sign(
                 &self.config.identity_key,
@@ -637,7 +763,8 @@ impl State {
                 &Claims {
                     subject: Some(user.id.clone()),
                     roles: user.roles.clone(),
-                    session: Some(session.clone()),
+                    session: session.clone(),
+                    client: client.clone(),
                     expires_at: now() + IDENTITY_TTL,
                 },
             );
@@ -673,6 +800,9 @@ impl State {
         };
         let method = request.method().clone();
         let path = request.uri().path().to_owned();
+        if path.starts_with("/_orbital/oauth/") {
+            return self.oauth(request, pool).await;
+        }
         let preview = self.config.stage == Stage::Preview;
         let posting =
             matches!(
@@ -923,6 +1053,46 @@ mod tests {
         clean_response_headers(&mut headers);
         let left: Vec<_> = headers.get_all(header::SET_COOKIE).iter().collect();
         assert_eq!(left, vec!["theme=dark"]);
+    }
+
+    #[test]
+    fn metadata_문서를_받아_오는_실제_구현은_https_가_아니거나_사설_주소면_붙지도_않는다() {
+        for refused in [
+            "http://client.example/c.json",
+            "https://127.0.0.1/c.json",
+            "https://10.0.0.5/c.json",
+            "https://169.254.169.254/latest/meta-data",
+            "https://localhost/c.json",
+            "https://client.example/",
+        ] {
+            assert_eq!(
+                HttpsFetcher.fetch(refused),
+                Err(FetchError::Refused),
+                "{refused}"
+            );
+        }
+        // 이름이 이 기계로 풀리면 붙지 않는다(이름을 푼 뒤에도 본다)
+        assert!(ureq::Resolver::resolve(&PublicResolver, "localhost:443").is_err());
+        for (address, private) in [
+            ("127.0.0.1", true),
+            ("10.1.2.3", true),
+            ("172.20.0.1", true),
+            ("192.168.0.1", true),
+            ("169.254.169.254", true),
+            ("100.64.0.1", true),
+            ("::1", true),
+            ("fd12::1", true),
+            ("fe80::1", true),
+            ("::ffff:10.0.0.1", true),
+            ("8.8.8.8", false),
+            ("2001:4860:4860::8888", false),
+        ] {
+            assert_eq!(
+                private_address(&address.parse().unwrap()),
+                private,
+                "{address}"
+            );
+        }
     }
 
     #[test]

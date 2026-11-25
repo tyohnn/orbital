@@ -12,7 +12,11 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use orbital_router::{Mail, Outbox};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use orbital_core::oauth::s256;
+use orbital_router::{DocumentFetcher, FetchError, Mail, Outbox};
 use orbital_run::LocalRunner;
 use orbital_server::http::handle;
 use orbital_server::layer::{Layer, OUTBOX, Options};
@@ -192,7 +196,37 @@ struct Bench {
     scratch: PathBuf,
     pg_url: String,
     layer: Layer,
+    /// 가짜로 받아 오는 metadata 문서. 실제 네트워크에는 나가지 않는다.
+    documents: Arc<FakeDocuments>,
     instances: Vec<String>,
+}
+
+/// 주소마다 돌려줄 문서를 테스트가 적어 두는 가짜 가져오기.
+#[derive(Default)]
+struct FakeDocuments {
+    documents: Mutex<BTreeMap<String, String>>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl FakeDocuments {
+    fn put(&self, url: &str, document: &Value) {
+        self.documents
+            .lock()
+            .unwrap()
+            .insert(url.to_owned(), document.to_string());
+    }
+}
+
+impl DocumentFetcher for FakeDocuments {
+    fn fetch(&self, url: &str) -> Result<Vec<u8>, FetchError> {
+        self.asked.lock().unwrap().push(url.to_owned());
+        self.documents
+            .lock()
+            .unwrap()
+            .get(url)
+            .map(|text| text.as_bytes().to_vec())
+            .ok_or(FetchError::Unreachable)
+    }
 }
 
 impl Bench {
@@ -205,6 +239,7 @@ impl Bench {
         ));
         fs::create_dir_all(&scratch).unwrap();
         let home = scratch.join("home");
+        let documents = Arc::new(FakeDocuments::default());
         let layer = Layer::open(Options {
             home: home.clone(),
             pg_url: pg_url.clone(),
@@ -214,18 +249,34 @@ impl Bench {
             ],
             runner: Box::new(LocalRunner::default()),
         })
-        .expect("레이어를 열지 못했습니다");
+        .expect("레이어를 열지 못했습니다")
+        .with_document_fetcher(documents.clone());
         let bench = Self {
             home,
             scratch,
             pg_url,
             layer,
+            documents,
             instances: Vec::new(),
         };
         bench.upload("cards", &Self::cards_scaffold);
         bench.upload("plain", &Self::plain_scaffold);
         bench.upload("payroll", &|folder: &Path| {
             copy_tree(&fixture("payroll"), folder)
+        });
+        bench.upload("mcp", &|folder: &Path| {
+            copy_tree(&fixture("todo"), folder);
+            copy_tree(&fixture("mcp"), folder);
+        });
+        bench.upload("mcpclosed", &|folder: &Path| {
+            copy_tree(&fixture("todo"), folder);
+            copy_tree(&fixture("mcp"), folder);
+            let manifest = fs::read_to_string(folder.join("orbital.toml")).unwrap();
+            fs::write(
+                folder.join("orbital.toml"),
+                format!("{manifest}dynamic_registration = false\n"),
+            )
+            .unwrap();
         });
         Some(bench)
     }
@@ -1356,5 +1407,773 @@ fn 운영이_서지_않은_인스턴스의_사용자를_부르면_409_로_까닭
     for (status, body) in manage(&bench, &instance, FACTORY, "u_aaaaaaaaaaaaaaaaaaaa") {
         assert_eq!(status, 409, "{body}");
         assert!(body["message"].as_str().unwrap().contains("운영"), "{body}");
+    }
+}
+
+// ---- MCP 의 인가(OAuth 2.1) ----
+//
+// 테스트가 규격대로 움직이는 클라이언트 노릇을 한다: 401 → 자원 메타데이터 → 인가 서버 메타데이터 → 등록 → 인가 → 로그인 → 동의 → 토큰 → MCP 호출 → 갱신.
+
+const CALLBACK: &str = "http://localhost:7777/callback";
+const VERIFIER: &str = "a-verifier-that-is-long-enough-for-pkce-0123456789";
+
+/// 질의와 폼의 값을 감싼다.
+fn enc(text: &str) -> String {
+    text.bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                char::from(byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
+fn form(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(key, value)| format!("{key}={}", enc(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// 주소의 질의에서 값 하나를 풀어 읽는다.
+fn param(url: &str, name: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then(|| {
+            let bytes = value.as_bytes();
+            let mut out = Vec::new();
+            let mut at = 0;
+            while at < bytes.len() {
+                if bytes[at] == b'%' {
+                    out.push(u8::from_str_radix(&value[at + 1..at + 3], 16).unwrap());
+                    at += 3;
+                } else {
+                    out.push(bytes[at]);
+                    at += 1;
+                }
+            }
+            String::from_utf8(out).unwrap()
+        })
+    })
+}
+
+/// 받은 토큰 한 벌.
+struct Tokens {
+    access: String,
+    refresh: String,
+}
+
+impl Bench {
+    /// MCP 가 있는 인스턴스를 운영에 세우고 사람 하나를 초대해 들여보낸다. (인스턴스, 주소, 세션 쿠키).
+    fn mcp_instance(&mut self, app: &str, email: &str) -> (String, String, String) {
+        let (instance, live) = self.ship(app);
+        self.invite(&instance, email);
+        let cookie = self.sign_in(&live, email);
+        (instance, live, cookie)
+    }
+
+    /// 동적 등록으로 클라이언트를 등록한다.
+    fn register(origin: &str) -> String {
+        let reply = http(
+            "POST",
+            origin,
+            "/_orbital/oauth/register",
+            &[("Content-Type", "application/json")],
+            &json!({ "client_name": "테스트 클라이언트", "redirect_uris": [CALLBACK], "application_type": "native", "token_endpoint_auth_method": "none" }).to_string(),
+        );
+        assert_eq!(reply.status, 201, "{}", reply.everything());
+        reply.json()["client_id"].as_str().unwrap().to_owned()
+    }
+
+    fn authorize(origin: &str, cookie: Option<&str>, client_id: &str, state: &str) -> Reply {
+        let query = form(&[
+            ("response_type", "code"),
+            ("client_id", client_id),
+            ("redirect_uri", CALLBACK),
+            ("code_challenge", &s256(VERIFIER)),
+            ("code_challenge_method", "S256"),
+            ("resource", &format!("{origin}/mcp")),
+            ("scope", "mcp"),
+            ("state", state),
+        ]);
+        let mut headers = vec![PAGE];
+        if let Some(cookie) = cookie {
+            headers.push(("Cookie", cookie));
+        }
+        http(
+            "GET",
+            origin,
+            &format!("/_orbital/oauth/authorize?{query}"),
+            &headers,
+            "",
+        )
+    }
+
+    /// 인가 요청을 열어 동의 화면으로 가는 요청의 식별자를 받는다.
+    fn open_request(origin: &str, cookie: &str, client_id: &str) -> String {
+        let reply = Self::authorize(origin, Some(cookie), client_id, "s1");
+        assert_eq!(reply.status, 302, "{}", reply.everything());
+        let location = reply.header("location").unwrap();
+        assert!(
+            location.starts_with("/oauth/consent?request="),
+            "{location}"
+        );
+        param(location, "request").unwrap()
+    }
+
+    fn decide(origin: &str, cookie: &str, request: &str, verb: &str) -> Reply {
+        http(
+            "POST",
+            origin,
+            &format!("/_orbital/oauth/requests/{request}/{verb}"),
+            &[("Origin", origin), ("Cookie", cookie)],
+            "",
+        )
+    }
+
+    fn token_request(origin: &str, pairs: &[(&str, &str)]) -> Reply {
+        http(
+            "POST",
+            origin,
+            "/_orbital/oauth/token",
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            &form(pairs),
+        )
+    }
+
+    fn exchange(origin: &str, client_id: &str, code: &str) -> Reply {
+        Self::token_request(
+            origin,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("code_verifier", VERIFIER),
+                ("client_id", client_id),
+                ("redirect_uri", CALLBACK),
+                ("resource", &format!("{origin}/mcp")),
+            ],
+        )
+    }
+
+    fn refresh(origin: &str, client_id: &str, refresh: &str) -> Reply {
+        Self::token_request(
+            origin,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh),
+                ("client_id", client_id),
+            ],
+        )
+    }
+
+    /// 승인해 코드를 받는다.
+    fn code(origin: &str, cookie: &str, client_id: &str) -> String {
+        let request = Self::open_request(origin, cookie, client_id);
+        let approved = Self::decide(origin, cookie, &request, "approve");
+        assert_eq!(approved.status, 200, "{}", approved.everything());
+        let redirect = approved.json()["redirect"].as_str().unwrap().to_owned();
+        param(&redirect, "code").unwrap()
+    }
+
+    /// 등록부터 토큰까지 한 바퀴. (client_id, 토큰).
+    fn connect(origin: &str, cookie: &str) -> (String, Tokens) {
+        let client_id = Self::register(origin);
+        let code = Self::code(origin, cookie, &client_id);
+        let issued = Self::exchange(origin, &client_id, &code);
+        assert_eq!(issued.status, 200, "{}", issued.everything());
+        let body = issued.json();
+        (
+            client_id,
+            Tokens {
+                access: body["access_token"].as_str().unwrap().to_owned(),
+                refresh: body["refresh_token"].as_str().unwrap().to_owned(),
+            },
+        )
+    }
+
+    fn mcp(origin: &str, access: &str) -> Reply {
+        http(
+            "POST",
+            origin,
+            "/mcp",
+            &[
+                ("Authorization", &format!("Bearer {access}")),
+                ("Content-Type", "application/json"),
+            ],
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}",
+        )
+    }
+
+    fn superuser_rows(&self, instance: &str, sql: &str) -> Vec<String> {
+        let mut config: postgres::Config = self.pg_url.parse().unwrap();
+        let mut client = config
+            .dbname(&format!("i_{instance}"))
+            .connect(postgres::NoTls)
+            .unwrap();
+        client
+            .query(sql, &[])
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect()
+    }
+}
+
+#[test]
+fn 토큰_없이_mcp_주소에_오면_401_과_함께_인가_서버의_자리를_알려_준다() {
+    let mut bench = bench!();
+    let (_, live) = bench.ship("mcp");
+    let bare = http("POST", &live, "/mcp", &[JSON], "{}");
+    assert_eq!(bare.status, 401, "{}", bare.everything());
+    let challenge = bare.header("www-authenticate").unwrap().to_owned();
+    let metadata_url = format!("{live}/.well-known/oauth-protected-resource/mcp");
+    assert_eq!(
+        challenge,
+        format!("Bearer resource_metadata=\"{metadata_url}\", scope=\"mcp\"")
+    );
+    for path in [
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-protected-resource",
+    ] {
+        let metadata = http("GET", &live, path, &[JSON], "");
+        assert_eq!(metadata.status, 200, "{path}");
+        assert_eq!(
+            metadata.json(),
+            json!({
+                "resource": format!("{live}/mcp"),
+                "authorization_servers": [live],
+                "scopes_supported": ["mcp"],
+                "bearer_methods_supported": ["header"],
+            }),
+            "{path}"
+        );
+    }
+    // 토큰이 있는데 틀렸으면 그렇다고 알린다
+    let wrong = http(
+        "POST",
+        &live,
+        "/mcp",
+        &[("Authorization", "Bearer abc"), JSON],
+        "{}",
+    );
+    assert_eq!(wrong.status, 401);
+    assert!(
+        wrong
+            .header("www-authenticate")
+            .unwrap()
+            .contains("error=\"invalid_token\"")
+    );
+}
+
+#[test]
+fn 인가_서버의_metadata_는_규격이_요구하는_칸을_모두_싣는다() {
+    let mut bench = bench!();
+    let (_, live) = bench.ship("mcp");
+    let metadata = http(
+        "GET",
+        &live,
+        "/.well-known/oauth-authorization-server",
+        &[JSON],
+        "",
+    );
+    assert_eq!(metadata.status, 200);
+    assert_eq!(
+        metadata.json(),
+        json!({
+            "issuer": live,
+            "authorization_endpoint": format!("{live}/_orbital/oauth/authorize"),
+            "token_endpoint": format!("{live}/_orbital/oauth/token"),
+            "registration_endpoint": format!("{live}/_orbital/oauth/register"),
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "scopes_supported": ["mcp"],
+            "authorization_response_iss_parameter_supported": true,
+            "client_id_metadata_document_supported": true,
+        })
+    );
+}
+
+#[test]
+fn 사용자가_승인하지_않으면_코드가_나오지_않는다() {
+    let mut bench = bench!();
+    let (instance, live, cookie) = bench.mcp_instance("mcp", "kim@example.com");
+    let client_id = Bench::register(&live);
+    let request = Bench::open_request(&live, &cookie, &client_id);
+    let denied = Bench::decide(&live, &cookie, &request, "deny");
+    assert_eq!(denied.status, 200, "{}", denied.everything());
+    let redirect = denied.json()["redirect"].as_str().unwrap().to_owned();
+    assert!(redirect.starts_with(CALLBACK), "{redirect}");
+    assert_eq!(param(&redirect, "error").as_deref(), Some("access_denied"));
+    assert_eq!(param(&redirect, "state").as_deref(), Some("s1"));
+    assert_eq!(param(&redirect, "iss").as_deref(), Some(live.as_str()));
+    assert_eq!(param(&redirect, "code"), None);
+    // 정한 요청은 다시 정하지 못한다
+    assert_eq!(
+        Bench::decide(&live, &cookie, &request, "approve").status,
+        404
+    );
+    let codes = bench.superuser_rows(
+        &instance,
+        "SELECT count(*)::text FROM orbital_auth.oauth_code",
+    );
+    assert_eq!(codes, vec!["0"]);
+}
+
+#[test]
+fn 승인은_그_요청을_연_사용자의_세션에서만_받는다() {
+    let mut bench = bench!();
+    let (instance, live, kim) = bench.mcp_instance("mcp", "kim@example.com");
+    bench.invite(&instance, "lee@example.com");
+    let lee = bench.sign_in(&live, "lee@example.com");
+    let client_id = Bench::register(&live);
+
+    // 세션이 없으면 로그인 화면으로 보낸다. 돌아올 곳은 이 인가 요청이다
+    let anonymous = Bench::authorize(&live, None, &client_id, "s1");
+    assert_eq!(anonymous.status, 302);
+    let location = anonymous.header("location").unwrap();
+    assert!(location.starts_with("/login?next="), "{location}");
+    assert!(
+        param(location, "next")
+            .unwrap()
+            .starts_with("/_orbital/oauth/authorize?")
+    );
+
+    let request = Bench::open_request(&live, &kim, &client_id);
+    let seen = http(
+        "GET",
+        &live,
+        &format!("/_orbital/oauth/requests/{request}"),
+        &[("Cookie", &kim), JSON],
+        "",
+    );
+    assert_eq!(seen.status, 200, "{}", seen.everything());
+    assert_eq!(seen.json()["client"]["id"], client_id.as_str());
+    assert_eq!(seen.json()["client"]["name"], "테스트 클라이언트");
+    assert_eq!(seen.json()["client"]["redirect_host"], "localhost:7777");
+    assert_eq!(seen.json()["scopes"], json!(["mcp"]));
+    assert_eq!(seen.json()["resource"], format!("{live}/mcp"));
+    // 남의 요청과 없는 요청은 같은 404 다
+    let theirs = http(
+        "GET",
+        &live,
+        &format!("/_orbital/oauth/requests/{request}"),
+        &[("Cookie", &lee), JSON],
+        "",
+    );
+    let missing = http(
+        "GET",
+        &live,
+        &format!("/_orbital/oauth/requests/{}", "0".repeat(64)),
+        &[("Cookie", &lee), JSON],
+        "",
+    );
+    assert_eq!((theirs.status, &theirs.body), (404, &missing.body));
+    assert_eq!(Bench::decide(&live, &lee, &request, "approve").status, 404);
+    assert_eq!(
+        Bench::decide(&live, "theme=dark", &request, "approve").status,
+        404
+    );
+    // Origin 이 다르면 받지 않는다
+    let elsewhere = http(
+        "POST",
+        &live,
+        &format!("/_orbital/oauth/requests/{request}/approve"),
+        &[("Origin", "http://evil.example"), ("Cookie", &kim)],
+        "",
+    );
+    assert_eq!(elsewhere.status, 403);
+    // 연 사람은 승인한다
+    let approved = Bench::decide(&live, &kim, &request, "approve");
+    assert_eq!(approved.status, 200);
+    let redirect = approved.json()["redirect"].as_str().unwrap().to_owned();
+    assert!(param(&redirect, "code").is_some());
+    assert_eq!(param(&redirect, "state").as_deref(), Some("s1"));
+    assert_eq!(param(&redirect, "iss").as_deref(), Some(live.as_str()));
+}
+
+#[test]
+fn 한_번_쓴_코드를_다시_쓰면_그_코드로_낸_토큰이_모두_거둬진다() {
+    let mut bench = bench!();
+    let (_, live, cookie) = bench.mcp_instance("mcp", "kim@example.com");
+    let client_id = Bench::register(&live);
+    let code = Bench::code(&live, &cookie, &client_id);
+    let first = Bench::exchange(&live, &client_id, &code);
+    assert_eq!(first.status, 200, "{}", first.everything());
+    assert_eq!(first.header("cache-control"), Some("no-store"));
+    let body = first.json();
+    assert_eq!(body["token_type"], "Bearer");
+    assert_eq!(body["expires_in"], 3600);
+    assert_eq!(body["scope"], "mcp");
+    let access = body["access_token"].as_str().unwrap().to_owned();
+    let refresh = body["refresh_token"].as_str().unwrap().to_owned();
+    assert_eq!(Bench::mcp(&live, &access).status, 200);
+
+    let again = Bench::exchange(&live, &client_id, &code);
+    assert_eq!(again.status, 400);
+    assert_eq!(again.json()["error"], "invalid_grant");
+    assert_eq!(Bench::mcp(&live, &access).status, 401);
+    assert_eq!(
+        Bench::refresh(&live, &client_id, &refresh).json()["error"],
+        "invalid_grant"
+    );
+}
+
+#[test]
+fn refresh_토큰은_쓸_때마다_바뀌고_쓴_것을_다시_쓰면_그_승인_전체가_거둬진다() {
+    let mut bench = bench!();
+    let (_, live, cookie) = bench.mcp_instance("mcp", "kim@example.com");
+    let (client_id, first) = Bench::connect(&live, &cookie);
+    let renewed = Bench::refresh(&live, &client_id, &first.refresh);
+    assert_eq!(renewed.status, 200, "{}", renewed.everything());
+    let second = Tokens {
+        access: renewed.json()["access_token"].as_str().unwrap().to_owned(),
+        refresh: renewed.json()["refresh_token"].as_str().unwrap().to_owned(),
+    };
+    assert_ne!(second.refresh, first.refresh);
+    assert_ne!(second.access, first.access);
+    assert_eq!(Bench::mcp(&live, &second.access).status, 200);
+    // 다른 클라이언트로는 갈지 못한다
+    let other = Bench::register(&live);
+    assert_eq!(
+        Bench::refresh(&live, &other, &second.refresh).json()["error"],
+        "invalid_grant"
+    );
+
+    // 쓴 refresh 토큰이 다시 왔다: 훔쳐 간 쪽이 있다고 보고 승인 전체를 거둔다
+    let replay = Bench::refresh(&live, &client_id, &first.refresh);
+    assert_eq!(replay.status, 400);
+    assert_eq!(replay.json()["error"], "invalid_grant");
+    assert_eq!(Bench::mcp(&live, &second.access).status, 401);
+    assert_eq!(
+        Bench::refresh(&live, &client_id, &second.refresh).json()["error"],
+        "invalid_grant"
+    );
+}
+
+#[test]
+fn access_토큰과_refresh_토큰은_해시로만_저장된다() {
+    let mut bench = bench!();
+    let (instance, live, cookie) = bench.mcp_instance("mcp", "kim@example.com");
+    let (_, tokens) = Bench::connect(&live, &cookie);
+    for table in [
+        "oauth_token",
+        "oauth_code",
+        "oauth_request",
+        "oauth_grant",
+        "oauth_client",
+    ] {
+        for row in bench.superuser_rows(
+            &instance,
+            &format!("SELECT t::text FROM orbital_auth.{table} t"),
+        ) {
+            assert!(!row.contains(&tokens.access), "{table}");
+            assert!(!row.contains(&tokens.refresh), "{table}");
+        }
+    }
+    // 저장된 해시를 그대로 토큰으로 내밀어도 들어가지 못한다
+    for stored in bench.superuser_rows(
+        &instance,
+        "SELECT encode(token_hash, 'hex') FROM orbital_auth.oauth_token",
+    ) {
+        assert_eq!(Bench::mcp(&live, &stored).status, 401);
+    }
+    assert_eq!(Bench::mcp(&live, &tokens.access).status, 200);
+}
+
+#[test]
+fn 다른_인스턴스용으로_낸_토큰은_받지_않는다() {
+    let mut bench = bench!();
+    let (_, ours, our_cookie) = bench.mcp_instance("mcp", "kim@example.com");
+    let (_, theirs, _) = bench.mcp_instance("mcp", "kim@example.com");
+    let (client_id, tokens) = Bench::connect(&ours, &our_cookie);
+    assert_eq!(Bench::mcp(&ours, &tokens.access).status, 200);
+    assert_eq!(Bench::mcp(&theirs, &tokens.access).status, 401);
+    assert_eq!(
+        Bench::refresh(&theirs, &client_id, &tokens.refresh).status,
+        400
+    );
+    // 다른 인스턴스의 MCP 주소를 대상으로 인가를 받으려 해도 받지 않는다
+    let query = form(&[
+        ("response_type", "code"),
+        ("client_id", &client_id),
+        ("redirect_uri", CALLBACK),
+        ("code_challenge", &s256(VERIFIER)),
+        ("code_challenge_method", "S256"),
+        ("resource", &format!("{theirs}/mcp")),
+        ("state", "s1"),
+    ]);
+    let asked = http(
+        "GET",
+        &ours,
+        &format!("/_orbital/oauth/authorize?{query}"),
+        &[("Cookie", &our_cookie)],
+        "",
+    );
+    assert_eq!(asked.status, 302);
+    assert_eq!(
+        param(asked.header("location").unwrap(), "error").as_deref(),
+        Some("invalid_target")
+    );
+}
+
+#[test]
+fn mcp_요청은_그_사용자의_신원으로_앱에_닿고_authorization_머리말은_앱에_닿지_않는다() {
+    let mut bench = bench!();
+    let (_, live, cookie) = bench.mcp_instance("mcp", "kim@example.com");
+    let kim = Bench::me(&live, &cookie).json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (client_id, tokens) = Bench::connect(&live, &cookie);
+    let reply = Bench::mcp(&live, &tokens.access);
+    assert_eq!(reply.status, 200, "{}", reply.everything());
+    let headers = &reply.json()["headers"];
+    assert_eq!(headers["authorization"], Value::Null);
+    assert!(!reply.body.contains(&tokens.access));
+    let claims = claims_of(headers["x-orbital-identity"].as_str().unwrap());
+    assert_eq!(claims["sub"], kim.as_str());
+    assert_eq!(claims["cid"], client_id.as_str());
+    assert_eq!(claims["roles"], json!(["member"]));
+}
+
+#[test]
+fn mcp_로_들어온_사용자도_자기_행만_본다() {
+    let mut bench = bench!();
+    let (instance, live, kim) = bench.mcp_instance("mcp", "kim@example.com");
+    bench.invite(&instance, "lee@example.com");
+    let lee = bench.sign_in(&live, "lee@example.com");
+    for (cookie, title) in [(&kim, "김의 일"), (&lee, "이의 일")] {
+        let made = http("POST", &live, "/cards", &[("Cookie", cookie), JSON], title);
+        assert_eq!(made.status, 201, "{}", made.everything());
+    }
+    let (_, tokens) = Bench::connect(&live, &kim);
+    let reply = Bench::mcp(&live, &tokens.access);
+    let body = reply.json();
+    let titles: Vec<&str> = body["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, vec!["김의 일"]);
+}
+
+#[test]
+fn mcp_주소는_세션_쿠키로는_열리지_않는다() {
+    let mut bench = bench!();
+    let (_, live, cookie) = bench.mcp_instance("mcp", "kim@example.com");
+    let with_cookie = http("POST", &live, "/mcp", &[("Cookie", &cookie), JSON], "{}");
+    assert_eq!(with_cookie.status, 401);
+    assert!(
+        with_cookie
+            .header("www-authenticate")
+            .unwrap()
+            .starts_with("Bearer resource_metadata=")
+    );
+    // 같은 앱의 다른 경로는 쿠키로 열린다
+    assert_eq!(Bench::cards(&live, &cookie).status, 200);
+}
+
+#[test]
+fn 사용자가_승인을_거두면_그_클라이언트의_토큰이_다음_요청부터_끊긴다() {
+    let mut bench = bench!();
+    let (_, live, cookie) = bench.mcp_instance("mcp", "kim@example.com");
+    let (client_id, tokens) = Bench::connect(&live, &cookie);
+    let grants = http(
+        "GET",
+        &live,
+        "/_orbital/oauth/grants",
+        &[("Cookie", &cookie), JSON],
+        "",
+    );
+    assert_eq!(grants.status, 200, "{}", grants.everything());
+    let listed = grants.json()["grants"].as_array().unwrap().clone();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["client"]["id"], client_id.as_str());
+    let grant = listed[0]["id"].as_str().unwrap().to_owned();
+    // Origin 이 없으면 받지 않는다
+    let refused = http(
+        "DELETE",
+        &live,
+        &format!("/_orbital/oauth/grants/{grant}"),
+        &[("Cookie", &cookie)],
+        "",
+    );
+    assert_eq!(refused.status, 403);
+    assert_eq!(Bench::mcp(&live, &tokens.access).status, 200);
+    let revoked = http(
+        "DELETE",
+        &live,
+        &format!("/_orbital/oauth/grants/{grant}"),
+        &[("Origin", &live), ("Cookie", &cookie)],
+        "",
+    );
+    assert_eq!(revoked.status, 204);
+    assert_eq!(Bench::mcp(&live, &tokens.access).status, 401);
+    assert_eq!(
+        Bench::refresh(&live, &client_id, &tokens.refresh).json()["error"],
+        "invalid_grant"
+    );
+    let after = http(
+        "GET",
+        &live,
+        "/_orbital/oauth/grants",
+        &[("Cookie", &cookie), JSON],
+        "",
+    );
+    assert_eq!(after.json()["grants"], json!([]));
+}
+
+#[test]
+fn 사용자를_빼면_그_사용자의_토큰이_모두_끊긴다() {
+    let mut bench = bench!();
+    let (instance, live, cookie) = bench.mcp_instance("mcp", "kim@example.com");
+    let kim = Bench::me(&live, &cookie).json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (client_id, tokens) = Bench::connect(&live, &cookie);
+    let (_, more) = Bench::connect(&live, &cookie);
+    let (status, _) = bench.call(
+        "DELETE",
+        &format!("/v1/instances/{instance}/users/{kim}"),
+        FACTORY,
+        &[],
+    );
+    assert_eq!(status, 200);
+    for access in [&tokens.access, &more.access] {
+        assert_eq!(Bench::mcp(&live, access).status, 401);
+    }
+    assert_eq!(
+        Bench::refresh(&live, &client_id, &tokens.refresh).json()["error"],
+        "invalid_grant"
+    );
+}
+
+#[test]
+fn 동적_등록을_끈_인스턴스에는_등록_주소가_없고_metadata_에도_나오지_않는다() {
+    let mut bench = bench!();
+    let (instance, live, cookie) = bench.mcp_instance("mcpclosed", "kim@example.com");
+    let metadata = http(
+        "GET",
+        &live,
+        "/.well-known/oauth-authorization-server",
+        &[JSON],
+        "",
+    )
+    .json();
+    assert_eq!(metadata["registration_endpoint"], Value::Null);
+    assert_eq!(metadata["client_id_metadata_document_supported"], true);
+    let register = http(
+        "POST",
+        &live,
+        "/_orbital/oauth/register",
+        &[("Content-Type", "application/json")],
+        &json!({ "client_name": "x", "redirect_uris": [CALLBACK] }).to_string(),
+    );
+    assert_eq!(register.status, 404);
+    // 팩토리가 미리 등록한 클라이언트로는 들어온다
+    let (status, body) = bench.post(
+        &format!("/v1/instances/{instance}/oauth-clients"),
+        FACTORY,
+        &json!({ "name": "팩토리의 앱", "redirect_uris": [CALLBACK] }),
+    );
+    assert_eq!(status, 200, "{body}");
+    let client_id = body["client_id"].as_str().unwrap().to_owned();
+    let code = Bench::code(&live, &cookie, &client_id);
+    assert_eq!(Bench::exchange(&live, &client_id, &code).status, 200);
+    // 미리 등록할 때도 redirect 는 https 이거나 localhost 여야 한다
+    let (status, _) = bench.post(
+        &format!("/v1/instances/{instance}/oauth-clients"),
+        FACTORY,
+        &json!({ "name": "x", "redirect_uris": ["http://client.example/cb"] }),
+    );
+    assert_eq!(status, 422);
+    // 에이전트의 토큰에는 이 길이 없다
+    let token = bench.token(&instance);
+    assert_eq!(
+        bench
+            .post(
+                &format!("/v1/instances/{instance}/oauth-clients"),
+                &token,
+                &json!({ "name": "x", "redirect_uris": [CALLBACK] })
+            )
+            .0,
+        404
+    );
+}
+
+#[test]
+fn metadata_문서로_자신을_밝힌_클라이언트가_등록_없이_인가를_받는다() {
+    let mut bench = bench!();
+    let (_, live, cookie) = bench.mcp_instance("mcpclosed", "kim@example.com");
+    let url = "https://client.example/oauth/client.json";
+    bench.documents.put(
+        url,
+        &json!({ "client_id": url, "client_name": "문서로 밝힌 클라이언트", "redirect_uris": [CALLBACK] }),
+    );
+    let request = Bench::open_request(&live, &cookie, url);
+    let seen = http(
+        "GET",
+        &live,
+        &format!("/_orbital/oauth/requests/{request}"),
+        &[("Cookie", &cookie), JSON],
+        "",
+    );
+    assert_eq!(seen.json()["client"]["name"], "문서로 밝힌 클라이언트");
+    let approved = Bench::decide(&live, &cookie, &request, "approve");
+    let code = param(approved.json()["redirect"].as_str().unwrap(), "code").unwrap();
+    let issued = Bench::exchange(&live, url, &code);
+    assert_eq!(issued.status, 200, "{}", issued.everything());
+    let access = issued.json()["access_token"].as_str().unwrap().to_owned();
+    assert_eq!(Bench::mcp(&live, &access).status, 200);
+    // 다시 와도 24시간 안에는 문서를 또 받아 오지 않는다
+    Bench::open_request(&live, &cookie, url);
+    assert_eq!(bench.documents.asked.lock().unwrap().len(), 1);
+
+    // 문서의 식별자가 받아 온 주소와 다르면, 그 문서의 redirect 로 보내지 않고 여기서 멈춘다
+    let liar = "https://liar.example/client.json";
+    bench.documents.put(
+        liar,
+        &json!({ "client_id": "https://client.example/oauth/client.json", "client_name": "거짓말", "redirect_uris": [CALLBACK] }),
+    );
+    let refused = Bench::authorize(&live, Some(&cookie), liar, "s1");
+    assert_eq!(refused.status, 400, "{}", refused.everything());
+    assert_eq!(refused.header("location"), None);
+    // 사설 주소의 문서는 받아 오지도 않는다
+    let private = Bench::authorize(&live, Some(&cookie), "https://10.0.0.5/client.json", "s1");
+    assert_eq!(private.status, 400);
+    assert!(
+        !bench
+            .documents
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|asked| asked.contains("10.0.0.5"))
+    );
+}
+
+#[test]
+fn mcp_를_선언하지_않은_인스턴스에는_인가_서버의_주소가_없다() {
+    let mut bench = bench!();
+    let (_, live) = bench.ship("cards");
+    for (method, path) in [
+        ("GET", "/.well-known/oauth-authorization-server"),
+        ("GET", "/.well-known/oauth-protected-resource"),
+        ("GET", "/.well-known/oauth-protected-resource/mcp"),
+        ("GET", "/_orbital/oauth/authorize?response_type=code"),
+        ("POST", "/_orbital/oauth/token"),
+        ("POST", "/_orbital/oauth/register"),
+        ("GET", "/_orbital/oauth/grants"),
+    ] {
+        let reply = http(method, &live, path, &[JSON], "");
+        assert_eq!(reply.status, 404, "{method} {path}: {}", reply.everything());
     }
 }

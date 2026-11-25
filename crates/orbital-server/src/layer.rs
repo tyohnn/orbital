@@ -16,6 +16,7 @@ use orbital_core::check::{judge as judge_access, unguarded};
 use orbital_core::describe::changes;
 use orbital_core::manifest::{ServiceKind, ValidManifest};
 use orbital_core::name::{Ident, InstanceId};
+use orbital_core::oauth::registrable_redirect;
 use orbital_core::plan::Names;
 use orbital_core::release::{
     Aftermath, Approval, Approver, BuiltBy, Change, Migrations, PromoteDenied, Rehearsed, Release,
@@ -29,8 +30,8 @@ use orbital_pg::auth::AuthStore;
 use orbital_pg::rehearsal::RestorePoint;
 use orbital_proxy::{Route, serve};
 use orbital_router::{
-    Config as RouterConfig, Connect, Mailer, Outbox, SESSION_COOKIE, Stage as RouterStage,
-    Target as RouterTarget, serve as serve_router,
+    Config as RouterConfig, Connect, DocumentFetcher, HttpsFetcher, Mailer, Outbox, SESSION_COOKIE,
+    Stage as RouterStage, Target as RouterTarget, serve as serve_router,
 };
 use orbital_run::{Job, Runner, Running, free_port, wait_for_port};
 use orbital_source::assemble::{AssembleError, Assembled, assemble};
@@ -264,6 +265,8 @@ pub struct Layer {
     pg_url: String,
     /// 로그인 링크를 보내는 것. 실제 발송기가 붙기 전까지는 `ORBITAL_HOME/outbox.jsonl` 에 쌓는다.
     mailer: Arc<dyn Mailer>,
+    /// Client ID Metadata Documents 를 받아 오는 것. 갈아 끼운다(테스트는 가짜를 쓴다).
+    documents: Arc<dyn DocumentFetcher>,
     upstream: String,
     sources: SourceStore,
     runner: Box<dyn Runner>,
@@ -329,6 +332,13 @@ fn blocker_text(blocker: &orbital_core::release::Blocker) -> String {
 }
 
 impl Layer {
+    /// metadata 문서를 받아 오는 것을 갈아 끼운다. 테스트가 실제 네트워크에 나가지 않으려고 쓴다.
+    #[must_use]
+    pub fn with_document_fetcher(mut self, documents: Arc<dyn DocumentFetcher>) -> Self {
+        self.documents = documents;
+        self
+    }
+
     pub fn open(options: Options) -> Result<Self, String> {
         fs::create_dir_all(&options.home)
             .map_err(|_| "레이어의 폴더를 만들지 못했습니다".to_owned())?;
@@ -362,6 +372,7 @@ impl Layer {
         Ok(Self {
             sources: SourceStore::new(options.home.join("sources")),
             mailer: Arc::new(Outbox::new(options.home.join(OUTBOX))),
+            documents: Arc::new(HttpsFetcher),
             pg_url: options.pg_url,
             upstream,
             runner: options.runner,
@@ -772,6 +783,7 @@ impl Layer {
             },
             seed_users: Self::seed_ids(assembled, stage),
             log: Some(log),
+            documents: Arc::clone(&self.documents),
         };
         let router = RouterTask(self.runtime.spawn(serve_router(listener, config)));
         Ok(Launched { services, router })
@@ -1544,6 +1556,48 @@ impl Layer {
         let mut store = self.production_auth(organization, instance)?;
         let roles = role_names(roles)?;
         store.invite(email, &roles, now()).map_err(auth_failure)
+    }
+
+    /// MCP 의 클라이언트를 미리 등록한다(팩토리의 service key 만). redirect 는 `https` 이거나 `localhost` 여야 한다.
+    pub fn register_oauth_client(
+        &self,
+        organization: &str,
+        instance: &InstanceId,
+        name: &str,
+        redirect_uris: &[String],
+    ) -> Outcome<String> {
+        let mut store = self.production_auth(organization, instance)?;
+        let declared = self
+            .lock()
+            .live
+            .get(&(instance.as_str().to_owned(), Stage::Production))
+            .is_some_and(|live| orbital_core::oauth::mcp(&live.manifest).is_some());
+        if !declared {
+            return Err(Failure::Problems(vec![
+                "이 앱은 MCP 의 인가를 선언하지 않았습니다. `orbital.toml` 에 `[auth.mcp]` 를 적어 주세요".to_owned(),
+            ]));
+        }
+        if redirect_uris.is_empty() {
+            return Err(Failure::Problems(vec![
+                "redirect_uris 를 하나 이상 적어 주세요".to_owned(),
+            ]));
+        }
+        let problems: Vec<String> = redirect_uris
+            .iter()
+            .filter(|uri| registrable_redirect(uri).is_err())
+            .map(|uri| format!("redirect `{uri}` 는 https 이거나 localhost 의 http 여야 하고 조각을 쓸 수 없습니다. 주소를 고쳐 주세요"))
+            .collect();
+        if !problems.is_empty() {
+            return Err(Failure::Problems(problems));
+        }
+        if name.trim().is_empty() {
+            return Err(Failure::Problems(vec![
+                "클라이언트의 이름(name)을 적어 주세요".to_owned(),
+            ]));
+        }
+        store
+            .register_client("registered", name, redirect_uris, None, now())
+            .map_err(auth_failure)
     }
 
     /// 운영의 사용자 목록. 막힌 사용자도 함께 돌려준다. 토큰이나 세션은 싣지 않는다.
