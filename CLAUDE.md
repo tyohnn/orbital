@@ -35,7 +35,7 @@
 ## 구조 규약
 
 ```
-도메인(orbital-core) ← 어댑터(orbital-pg · orbital-proxy) ← 앱(orbital-cli)
+도메인(orbital-core) ← 어댑터(orbital-pg · orbital-proxy · orbital-source · orbital-run) ← 앱(orbital-server · orbital-cli)
 ```
 
 - 의존은 한 방향입니다. 층은 `scripts/check-layers.mjs` 의 `LAYER` 표가 정하고, **새 crate 는 그 표에 줄을 더하는 것이 첫 작업입니다.**
@@ -44,6 +44,8 @@
 - ⚠ **Orbital 은 host 를 모릅니다.** 팩토리의 고객, 그 고객의 사람, 에이전트 플랫폼(Harmony · Claude)의 코드 · 표 · 용어를 가져오지 않습니다.
   누가 무엇을 할 수 있는지는 host 가 정해 토큰으로 넘기고, Orbital 은 요청이 토큰의 범위 안인지만 봅니다.
 - ⚠ **값은 레이어 밖으로 나가지 않습니다.** 비밀번호 · 키 · 운영 데이터의 행은 API 응답, 로그, 오류 문구에 싣지 않습니다. 이름과 숫자만 나갑니다.
+- ⚠ **에이전트가 쓴 것은 관리 권한으로 돌리지 않습니다.** 마이그레이션은 마이그레이션 역할로 따로 접속해 돌리고, 빌드와 서버는 환경을 비운 실행기에서 돌립니다.
+  관리 연결에서 역할만 바꿔 돌리면 `RESET ROLE` 한 줄로 관리 권한을 되찾습니다.
 - ⚠ **SQL 에 들어가는 이름은 검증된 타입(`Ident`)에서만 옵니다.** 글자열을 이어 붙여 SQL 을 만들 때 선언에서 읽은 날것을 넣지 않습니다.
 
 ## 명령
@@ -73,7 +75,7 @@ npm run pr:check                       # fmt · clippy · test · 층 검사 · 
 ## 커밋
 
 한 커밋은 한 가지 책임만 바꾸고 각 커밋이 `pr:check` 를 통과합니다. 형식은 `<타입>(<스코프>): <한 줄>` 입니다.
-타입은 feat · fix · refactor · test · chore · docs, 스코프는 crate 이름에서 `orbital-` 을 뺀 것(`core` · `pg` · `proxy` · `cli`)이나 `repo` 입니다.
+타입은 feat · fix · refactor · test · chore · docs, 스코프는 crate 이름에서 `orbital-` 을 뺀 것(`core` · `pg` · `proxy` · `source` · `run` · `server` · `cli`)이나 `repo` 입니다.
 
 ## 찾아볼 자리
 
