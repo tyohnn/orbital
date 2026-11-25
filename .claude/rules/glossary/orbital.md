@@ -59,7 +59,7 @@ paths:
 | 승격 | 사람이 승인한 release 를 운영에 올리는 일. 팩토리의 서버만 부른다 | `release::promote`, `Layer::promote` |
 | 되돌릴 지점 | 승격 직전의 운영 DB 를 떠 둔 것 | `RestorePoint`, `Admin::mark` · `restore` |
 | service key | 팩토리의 서버가 쓰는 열쇠. 운영을 바꾸는 길은 이 열쇠에만 있다 | `Layer::organization` |
-| 실행기 | 빌드 명령을 돌리고 서버를 띄우는 자리. 갈아 끼운다 | `Runner`, `LocalRunner` |
+| 실행기 | 빌드 명령을 돌리고 서버를 띄우는 자리. 갈아 끼운다. 빌드에만 운영자가 정한 환경과 인스턴스마다의 홈(캐시의 자리)을 건넨다 | `Runner`, `LocalRunner`, `build_env`(`ORBITAL_BUILD_ENV`), `Job::home` |
 | 업데이트 | 팩토리가 스캐폴드(위쪽)에 올린 commit 하나. 인스턴스의 release 가 이 commit 을 조상으로 담으면 「적용됐다」고 본다 | `Rollout::update`, `SourceStore::fetch_upstream` · `descends` |
 | 밀기 · 당기기 | 업데이트를 인스턴스에 들이는 두 길. 법 · 보안 · 핵심 패키지는 팩토리가 밀고 팩토리가 승인한다. 기능 업데이트는 고객이 당기고 고객이 승인한다. 같은 기계다 | `Change`, `Change::approver` |
 | rollout | 업데이트 하나가 인스턴스마다 어디까지 갔는지(`waiting` → `applied` → `previewed` → `passed` → `promoted`, 어디서든 `failed`)를 갖고 관문을 지키는 것. 한 곳이 실패하면 멈추고(`halted`) 팩토리가 다시 열어야 이어진다. 레이어는 에이전트를 돌리지 않는다 | `Rollout`, `Progress`, `Event`, `Rollout::step` |

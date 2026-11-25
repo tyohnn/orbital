@@ -1063,7 +1063,7 @@ function frontmatter(body: string): Record<string, string>
 test("패키지는 MCP 서버 하나와 스킬 하나를 묶고 훅이 없다 — 하모니와 클로드가 같은 ZIP 을 받는다", () =>
 {
     const files = unzip(zip(packageFiles()));
-    assert.deepEqual([...files.keys()].sort(), [".claude-plugin/plugin.json", ".mcp.json", "plugin.json", "skills/orbital-dev/SKILL.md", "skills/orbital-dev/references/auth.md", "skills/orbital-dev/references/secrets.md"]);
+    assert.deepEqual([...files.keys()].sort(), [".claude-plugin/plugin.json", ".mcp.json", "plugin.json", "skills/orbital-dev/SKILL.md", "skills/orbital-dev/references/auth.md", "skills/orbital-dev/references/frameworks.md", "skills/orbital-dev/references/secrets.md"]);
     assert.ok(![...files.keys()].some((path) => path.startsWith("hooks/")));
 
     // 하모니(os-playground 의 `readBundle`)가 보는 것: 앱 번호와 버전, 훅이 없음, MCP 서버 하나의 원격 주소

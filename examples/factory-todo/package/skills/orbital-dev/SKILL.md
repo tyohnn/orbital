@@ -25,6 +25,7 @@ description: "사용자의 할 일 앱을 고쳐 달라는 요청을 받았을 �
    - 권한을 넓히는 변경은 승인 카드에 문장으로 서고 사용자가 읽습니다. 요청에 필요한 만큼만 바꿉니다.
    - 로그인 · 사용자 · 동의 화면 · 행의 주인을 건드리면 먼저 `references/auth.md` 를 읽습니다.
    - 앱이 바깥 서비스의 키(API 키 같은 비밀)를 써야 하면 먼저 `references/secrets.md` 를 읽습니다. 값은 사람이 `secret_request` 의 카드에서 넣습니다.
+   - 앱이 npm 의 의존성을 쓰거나 프레임워크(Next.js · NestJS · Vite)로 빌드하면 먼저 `references/frameworks.md` 를 읽습니다.
 4. **commit.** `main` 브랜치에서 `git add -A && git commit -m "<무엇을 왜>"`.
 5. **올리기.** 같은 머리말로 `git push origin main`. 받는 것은 `main` 하나이고, 앞의 이력을 잇는 commit 만 받습니다.
    거절되면 `git pull --no-rebase origin main` 으로 합친 뒤 다시 올립니다. 억지로 올리기(`--force`)는 받지 않습니다.
