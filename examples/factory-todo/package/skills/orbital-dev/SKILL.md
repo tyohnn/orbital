@@ -11,8 +11,13 @@ description: "사용자의 할 일 앱을 고쳐 달라는 요청을 받았을 �
 ## 차례
 
 1. **작업 열기.** `workspace_open` 도구를 부릅니다. 답에 git 원격(`remote`)과 그 원격에만 쓰는 자격(`credential`), 끝나는 때(`expires_at`, Unix 초)가 옵니다.
-   자격은 두 시간 뒤 끝납니다. git 이 `401` 이나 `Authentication failed` 로 멈추면 `workspace_open` 을 다시 불러 새 자격을 받습니다.
-   같은 사용자에게는 언제나 같은 앱의 사본이 옵니다.
+   자격은 두 시간 뒤 끝나고, 앱의 서버가 다시 떠도 사라집니다. 같은 사용자에게는 언제나 같은 앱의 사본이 옵니다.
+   - **git 이 `remote: This git remote's workspace has ended …` 나 `403` · `401` 로 멈추면** `workspace_open` 을 다시 불러 새 원격과 자격을 받고,
+     받던 폴더에서 원격만 바꾼 뒤 같은 명령을 다시 합니다. 다시 받지(clone) 않습니다. 올리지 않은 commit 은 폴더에 그대로 있습니다.
+     ```sh
+     git remote set-url origin "$NEW_REMOTE"
+     git -c http.extraHeader="Authorization: Bearer $NEW_CREDENTIAL" push origin main
+     ```
 2. **받기.** 자격은 원격의 주소에 넣지 않습니다. 명령 한 번에만 머리말로 건넵니다.
    ```sh
    git -c http.extraHeader="Authorization: Bearer $CREDENTIAL" clone "$REMOTE" todo && cd todo
@@ -26,9 +31,11 @@ description: "사용자의 할 일 앱을 고쳐 달라는 요청을 받았을 �
    - 로그인 · 사용자 · 동의 화면 · 행의 주인을 건드리면 먼저 `references/auth.md` 를 읽습니다.
    - 앱이 바깥 서비스의 키(API 키 같은 비밀)를 써야 하면 먼저 `references/secrets.md` 를 읽습니다. 값은 사람이 `secret_request` 의 카드에서 넣습니다.
    - 앱이 npm 의 의존성을 쓰거나 프레임워크(Next.js · NestJS · Vite)로 빌드하면 먼저 `references/frameworks.md` 를 읽습니다.
+     저장소에서 한 번 도는 빌드(`[build]`), 로그인 없이 내줄 경로(`public`), 화면 안의 경로(`fallback`), 정해진 때에 도는 일(`[[schedule]]`)도 거기에 있습니다.
 4. **commit.** `main` 브랜치에서 `git add -A && git commit -m "<무엇을 왜>"`.
 5. **올리기.** 같은 머리말로 `git push origin main`. 받는 것은 `main` 하나이고, 앞의 이력을 잇는 commit 만 받습니다.
    거절되면 `git pull --no-rebase origin main` 으로 합친 뒤 다시 올립니다. 억지로 올리기(`--force`)는 받지 않습니다.
+   `HTTP 413` 으로 멈추면 한 번에 올리는 것이 한도(64MiB)를 넘었습니다. 큰 이진 파일(빌드 결과 · 동영상 · `node_modules`)을 commit 에서 빼고 다시 올립니다.
 6. **프리뷰.** `preview` 도구를 부릅니다. 올린 `main` 을 직접 빌드하고, 씨앗 데이터의 DB 로 서버를 띄워 주소를 돌려줍니다.
    답의 `release` 를 적어 둡니다. 「권한 검사에서 어긋난 것」이나 「승격을 막는 것」이 있으면 고쳐서 4번부터 다시 합니다.
    - 빌드나 서버가 뜨지 않으면 `preview_logs` 로 로그의 끝을 봅니다.
