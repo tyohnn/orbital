@@ -237,6 +237,24 @@ export interface GoogleSettings
     clientSecret: string;
 }
 
+/** 팩토리의 service key 한 줄. 비밀은 실리지 않는다. */
+export interface ServiceKey
+{
+    id: string;
+    /** 사람이 붙인 이름(「배포 서버」 같은). */
+    label: string;
+    /** 만든 때(Unix 초). */
+    createdAt: number;
+    /** 폐기한 때(Unix 초). 살아 있으면 `null` 이다. 폐기한 키는 다음 요청부터 거절된다. */
+    revokedAt: number | null;
+}
+
+/** 막 만든 키. `secret` 은 이 답에서 한 번만 보인다. 다시 받을 길은 없다. */
+export interface IssuedKey extends ServiceKey
+{
+    secret: string;
+}
+
 export interface OrbitalOptions
 {
     /** 관리 서버의 주소. */
@@ -249,6 +267,14 @@ export interface OrbitalOptions
 
 export interface Orbital
 {
+    keys: {
+        /** 제 조직의 키를 만든 차례로. 폐기한 키도 오고, 비밀은 오지 않는다. 환경 변수의 키는 보이지 않는다. */
+        list(): Promise<ServiceKey[]>;
+        /** 새 키를 만든다. 비밀은 돌아온 값에서 한 번만 보인다. */
+        create(input?: { label?: string }): Promise<IssuedKey>;
+        /** 키를 폐기한다. 조직의 마지막 살아 있는 키는 폐기하지 못한다(409). 다른 조직의 키는 없는 키와 같다(404). */
+        revoke(id: string): Promise<ServiceKey>;
+    };
     apps: {
         /** 스캐폴드를 올린다. `bundle` 은 버전마다 태그를 단 저장소의 git bundle 이다. */
         put(app: string, bundle: Uint8Array): Promise<void>;
@@ -441,34 +467,29 @@ function toRollout(value: unknown): Rollout
     };
 }
 
-function toAuthSettings(value: unknown): AuthSettings
+function toKey(value: unknown): ServiceKey
 {
     const record = isRecord(value) ? value : {};
-    const mail = isRecord(record.mail) ? record.mail : {};
-    const google = isRecord(record.google) ? record.google : {};
     return {
-        mail: {
-            configured: mail.configured === true,
-            provider: mail.provider === "resend" ? "resend" : null,
-            from: typeof mail.from === "string" ? mail.from : null,
-            fromName: typeof mail.from_name === "string" ? mail.from_name : null,
-        },
-        google: {
-            configured: google.configured === true,
-            clientId: typeof google.client_id === "string" ? google.client_id : null,
-            redirectUri: text(google.redirect_uri),
-        },
+        id: text(record.id),
+        label: text(record.label),
+        createdAt: number(record.created_at),
+        revokedAt: typeof record.revoked_at === "number" ? record.revoked_at : null,
     };
 }
 
-export function createOrbital(options: OrbitalOptions): Orbital
+function toIssuedKey(value: unknown): IssuedKey
 {
-    const base = options.url.replace(/\/+$/, "");
-    const send = options.fetch ?? fetch;
+    return { ...toKey(value), secret: text(isRecord(value) ? value.secret : undefined) };
+}
 
-    async function call(method: string, path: string, body?: Json | Uint8Array): Promise<unknown>
+/** 열쇠 하나로 관리 서버를 부르는 함수를 짓는다. 실패하면 `OrbitalError` 를 던진다. */
+function caller(url: string, bearer: string, send: typeof fetch)
+{
+    const base = url.replace(/\/+$/, "");
+    return async function call(method: string, path: string, body?: Json | Uint8Array): Promise<unknown>
     {
-        const headers: Record<string, string> = { authorization: `Bearer ${options.serviceKey}` };
+        const headers: Record<string, string> = { authorization: `Bearer ${bearer}` };
         const init: RequestInit = { method, headers };
         if (body instanceof Uint8Array)
         {
@@ -494,11 +515,52 @@ export function createOrbital(options: OrbitalOptions): Orbital
             text(problem.message) || `관리 서버가 ${response.status} 로 답했습니다`,
             texts(problem.details),
         );
-    }
+    };
+}
+
+function toAuthSettings(value: unknown): AuthSettings
+{
+    const record = isRecord(value) ? value : {};
+    const mail = isRecord(record.mail) ? record.mail : {};
+    const google = isRecord(record.google) ? record.google : {};
+    return {
+        mail: {
+            configured: mail.configured === true,
+            provider: mail.provider === "resend" ? "resend" : null,
+            from: typeof mail.from === "string" ? mail.from : null,
+            fromName: typeof mail.from_name === "string" ? mail.from_name : null,
+        },
+        google: {
+            configured: google.configured === true,
+            clientId: typeof google.client_id === "string" ? google.client_id : null,
+            redirectUri: text(google.redirect_uri),
+        },
+    };
+}
+
+export function createOrbital(options: OrbitalOptions): Orbital
+{
+    const call = caller(options.url, options.serviceKey, options.fetch ?? fetch);
 
     const at = (instance: string, tail: string): string => `instances/${encodeURIComponent(instance)}${tail}`;
 
     return {
+        keys: {
+            async list()
+            {
+                const reply = await call("GET", "keys");
+                const keys = isRecord(reply) && Array.isArray(reply.keys) ? reply.keys : [];
+                return keys.map(toKey);
+            },
+            async create(input = {})
+            {
+                return toIssuedKey(await call("POST", "keys", input.label === undefined ? {} : { label: input.label }));
+            },
+            async revoke(id)
+            {
+                return toKey(await call("POST", `keys/${encodeURIComponent(id)}/revoke`));
+            },
+        },
         apps: {
             async put(app, bundle)
             {
@@ -709,6 +771,56 @@ export function createOrbital(options: OrbitalOptions): Orbital
             {
                 const reply = await call("POST", at(instance, "/oauth-clients"), { name, redirect_uris: [...redirectUris] });
                 return { clientId: text(isRecord(reply) ? reply.client_id : undefined) };
+            },
+        },
+    };
+}
+
+export interface OrbitalAdminOptions
+{
+    /** 관리 서버의 주소. */
+    url: string;
+    /** 운영자 키(`ORBITAL_ADMIN_KEY`). Orbital 의 대시보드 서버에만 둔다. 팩토리에 건네지 않는다. */
+    adminKey: string;
+    /** 테스트에서 갈아 끼운다. */
+    fetch?: typeof fetch;
+}
+
+/**
+ * Orbital 의 대시보드가 쓰는 운영자의 client. 팩토리 제작자가 가입하면 조직을 만들고 첫 키를 받는다.
+ * 운영자 키로는 살아 있는 팩토리의 인스턴스에 닿지 못한다. 키가 하나도 살아 있지 않은 조직을 되살리는 길만 있다.
+ */
+export interface OrbitalAdmin
+{
+    organizations: {
+        /** 조직을 만들고 첫 키를 낸다. 이름은 소문자 · 숫자로 시작하고 소문자 · 숫자 · `-` · `_` 로 64글자까지다. 이미 있으면 409 다. */
+        create(input: { id: string; label?: string }): Promise<{ organization: string; key: IssuedKey }>;
+        /** 살아 있는 키가 없는 조직에 키를 하나 낸다. 살아 있는 키가 있으면 409 다. */
+        issueKey(organization: string, input?: { label?: string }): Promise<IssuedKey>;
+        /** 조직의 키를 모두 폐기하고 새 키 하나를 낸다. 키의 비밀을 모두 잃은 조직을 되살린다. */
+        resetKeys(organization: string): Promise<IssuedKey>;
+    };
+}
+
+export function createOrbitalAdmin(options: OrbitalAdminOptions): OrbitalAdmin
+{
+    const call = caller(options.url, options.adminKey, options.fetch ?? fetch);
+    const at = (organization: string, tail: string): string => `admin/organizations/${encodeURIComponent(organization)}${tail}`;
+    return {
+        organizations: {
+            async create({ id, label })
+            {
+                const reply = await call("POST", "admin/organizations", label === undefined ? { id } : { id, label });
+                const record = isRecord(reply) ? reply : {};
+                return { organization: text(record.organization), key: toIssuedKey(record.key) };
+            },
+            async issueKey(organization, input = {})
+            {
+                return toIssuedKey(await call("POST", at(organization, "/keys"), input.label === undefined ? {} : { label: input.label }));
+            },
+            async resetKeys(organization)
+            {
+                return toIssuedKey(await call("POST", at(organization, "/reset-keys")));
             },
         },
     };
