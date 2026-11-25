@@ -33,8 +33,10 @@ paths:
 | 인가 서버 · 자원 서버 | MCP 의 인가에서 Orbital Auth 가 토큰을 내는 쪽(발급자는 router 의 주소), router 가 MCP 주소에서 토큰을 확인하는 쪽 | `orbital_core::oauth`, `orbital_router::oauth` |
 | 승인(grant) | 사용자가 클라이언트 하나에 준 허락. 코드와 토큰은 승인에 딸리고, 승인을 거두면 함께 끊긴다 | `oauth_grant`, `AuthStore::decide` · `revoke_grant` |
 | 인가 코드 · access 토큰 · refresh 토큰 | 5분 한 번 · 1시간 · 30일(쓸 때마다 간다). 해시로만 둔다 | `oauth_code`, `oauth_token`, `judge_code` · `judge_token` |
-| metadata 문서 | `https` 주소를 `client_id` 로 쓰는 클라이언트가 자신을 밝힌 문서. 받아 와서 24시간 기억한다 | `DocumentFetcher`, `judge_document` |
+| metadata 문서 | `https` 주소를 `client_id` 로 쓰는 클라이언트가 자신을 밝힌 문서. 받아 와서 그 답의 `max-age` 만큼(5분에서 하루 사이) 기억한다 | `DocumentFetcher`, `judge_document`, `document_lifetime` |
 | 인증 역할 | `orbital_auth` 의 표만 읽고 쓰는 Postgres 역할. 앱의 스키마에는 닿지 못한다 | `Names::auth` |
+| 인증의 주인 | `orbital_auth` 의 표와 `orbital.me` · `orbital.users` 뷰의 주인. 로그인하지 못하고 아무도 이 역할이 되지 못하며 앱의 표에 닿지 못한다 | `Names::auth_owner` |
+| 동적 등록의 한도 | 인스턴스마다 1분에 열 번, 살아 있는 동적 클라이언트 200개. 한 번도 승인받지 못한 것은 하루 뒤에 지운다 | `registration_wait`, `AuthStore::register_dynamic` |
 | 스캐폴드 | 팩토리가 올린 앱의 원본. 버전(태그)이 있고 인스턴스가 그 하나에서 갈라진다 | `receive_scaffold`, `SourceStore::create` |
 | 묶음 | 코드를 주고받는 git bundle. 에이전트가 받아 가서 고친 뒤 올린다 | `SourceStore::bundle` · `receive` |
 | release | commit 하나와 거기서 읽은 선언 · 권한 표 · 마이그레이션. 식별자가 commit 에 묶인다 | `ReleaseId`, `Assembled`, `release_id` |
