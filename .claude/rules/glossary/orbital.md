@@ -63,3 +63,15 @@ paths:
 | 물결 | rollout 의 인스턴스를 나눈 순서 있는 묶음. 앞 물결이 모두 오른 뒤에 뒤 물결이 오른다 | `Rollout::waves`, `Refusal::EarlierWave` |
 | 합치기 | 레이어가 인스턴스의 `main` 에 업데이트를 기계적으로 합치는 일(`git merge` 의 판정). 충돌하면 인스턴스를 건드리지 않고 충돌한 파일의 이름만 알린다 | `SourceStore::merge`, `Merged`, `Layer::apply_update` |
 | 적합성 테스트 | 인스턴스가 어떻게 고쳐졌든 통과해야 하는, 팩토리가 정한 테스트(`[conformance] run` · `files`). 위쪽의 선언과 폴더로 모든 프리뷰에서 돌고, 프리뷰의 주소만 받는다. 통과하지 못하면 오르지 못한다 | `Conformance`, `Conformed`, `Blocker::ConformanceFailed`, `Runner::check` |
+| 기반 백업 | 운영 클러스터 전체를 뜬 것(`pg_basebackup`). 레이어의 기록 묶음이 함께 든다. 다 뜬 때(`finished_at`) 뒤의 시점으로만 되살린다 | `BaseBackup`, `Store::base_backup` |
+| WAL 보관 | 운영 클러스터가 다 찬 WAL 조각을 `archive_command` 로 백업의 폴더(`<ORBITAL_BACKUP_DIR>/wal`)에 복사해 두는 것 | `Archive`, `LocalStore::archive_command` |
+| 보관의 표시 | commit 하나를 적고 WAL 을 넘겨 그 조각이 보관된 것을 본 뒤 적는 「이 시각까지는 되살릴 수 있다」 | `Seal`, `Store::seal` |
+| 시점 복구 | 기반 백업과 보관한 WAL 로 정한 시각의 클러스터를 되살리는 일. **옆에 세운 클러스터에만** 한다 | `judge_restore`, `Store::recover` |
+| 옆의 클러스터 | 시점 복구로 따로 세운 클러스터. 유닉스 소켓에서만 듣고 TCP 를 듣지 않으며 WAL 을 보관하지 않는다. 쓰고 나면 프로세스와 폴더를 걷는다 | `Cluster` |
+| 인스턴스 되살리기 | 옆에 그 시점의 클러스터를 세우고 인스턴스 하나의 database 를 운영 클러스터의 옆 이름에 레이어의 계획으로 다시 세워 바꿔 넣는 일. 앱의 정의는 마이그레이션 역할로, 로그인의 행은 인증 역할로 넣고 관리 권한으로는 풀지 않는다. 직전의 DB 는 되돌릴 지점으로 남는다. service key 로만 | `Layer::restore_instance`, `backup::rebuild`, `load_database`, `Names::staged`, `Action::RestoreInstance` |
+| 복구 훈련 | 표식 → 시점 → 표식 → 옆에 되살리기 → 확인 → 인스턴스 하나를 되살리기와 같은 절차로 임시 database 에 세워 보기 → 걷기 → 기록을 사람 손 없이 도는 한 번. 확인이 하나라도 어긋나면 실패다 | `drill`, `Check`, `judge_drill`, `DrillRecord`, `orbitald drill` |
+| 지문 | database 하나의 스키마 해시와 표마다의 행 수. 이름과 숫자만 있고 행의 값은 없다 | `Fingerprint`, `fingerprint` |
+| 잃을 수 있는 구간 | 훈련을 시작한 때 − 마지막으로 보관된 WAL 의 시각(초). 운영 클러스터를 잃으면 이만큼을 잃는다 | `DrillRecord::exposure_seconds` |
+| 낡은 훈련 | 마지막으로 통과한 훈련이 여드레를 넘겼거나 한 번도 통과하지 않은 것. 켠 레이어(`ORBITAL_REQUIRE_DRILL=1`)는 그동안 새 인스턴스만 받지 않는다 | `Freshness`, `freshness`, `DRILL_FRESH_FOR` |
+| 기록 묶음 | 기반 백업에 함께 넣는 레이어의 기록(`registry.json` · `settings.json` · `vault.json` · `sources` · `apps`). 열쇠(봉인 · service key · 토큰)는 넣지 않는다 | `RECORDS`, `pack` |
+| 보관 기간 | 기반 백업을 두는 기간(14일). 지난 것과 거기에만 딸린 WAL 을 지우되 마지막 기반 백업은 언제나 남긴다 | `prune`, `Pruning`, `KEEP_FOR` |
