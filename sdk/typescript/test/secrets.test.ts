@@ -14,7 +14,7 @@ import { join, resolve } from "node:path";
 import { after, before, test } from "node:test";
 
 import { OrbitalError, createOrbital } from "../src/server.ts";
-import type { Orbital } from "../src/server.ts";
+import type { Orbital, Work } from "../src/server.ts";
 
 const root = resolve(import.meta.dirname, "../../..");
 const bin = (name: string): string => join(process.env.CARGO_TARGET_DIR ?? join(root, "target"), "debug", name);
@@ -41,21 +41,6 @@ function git(folder: string, ...args: string[]): string
         ["-c", "user.name=agent", "-c", "user.email=agent@example.invalid", "-c", "commit.gpgsign=false", ...args],
         { cwd: folder, encoding: "utf8" },
     ).trim();
-}
-
-/** 에이전트의 sandbox 에는 주소 · 인스턴스 · 토큰만 있다. */
-function agent(folder: string, instance: string, token: string, ...args: string[]): string
-{
-    return execFileSync(bin("orbital"), args, {
-        cwd: folder,
-        encoding: "utf8",
-        env: { PATH: process.env.PATH ?? "", ORBITAL_URL: url, ORBITAL_INSTANCE: instance, ORBITAL_TOKEN: token },
-    });
-}
-
-function wordAfter(text: string, marker: string): string
-{
-    return text.split(marker)[1]?.trim().split(/\s+/)[0] ?? "";
 }
 
 async function freePort(): Promise<number>
@@ -152,30 +137,32 @@ after(async () =>
     }
 });
 
-/** 인스턴스를 세우고 에이전트가 코드를 받아 프리뷰를 세운다. (인스턴스, 토큰, 작업 폴더, 프리뷰의 답) */
-async function previewed(folder: string): Promise<{ instance: string; token: string; work: string; preview: string }>
+/** 인스턴스를 세우고 작업을 열어 프리뷰를 세운다. (인스턴스, 작업, 프리뷰의 release) */
+async function previewed(): Promise<{ instance: string; work: Work; release: string }>
 {
     const { id: instance } = await orbital.instances.create({ app: "vault", from: "v1" });
     instances.push(instance);
-    const { token } = await orbital.sessions.open({ instance, can: ["source", "preview", "rehearse", "secrets_request"] });
-    agent(scratch, instance, token, "clone", folder);
-    const work = join(scratch, folder);
-    return { instance, token, work, preview: agent(work, instance, token, "preview") };
+    const work = await orbital.works.open({ instance, can: ["source", "preview", "rehearse", "secrets_request"] });
+    const preview = await work.preview();
+    // 프리뷰의 값이 없어 환경 변수 없이 섰다. 사람에게 입력을 요청할 이름이다
+    assert.deepEqual(preview.missingSecrets, ["BANK_API_KEY"]);
+    return { instance, work, release: preview.release };
 }
 
 test("비밀을 요청하고 사람이 입력 표로 넣으면 운영에 오른다", { skip }, async () =>
 {
-    const { instance, token, work, preview } = await previewed("work");
-    const release = wordAfter(preview, "release ");
+    const { instance, work, release } = await previewed();
 
-    // 팩토리가 사람에게 입력을 요청한다. 아직 값이 없어 승격 요청이 거절된다
-    await orbital.secrets.request(instance, "BANK_API_KEY", { reason: "송금 기능이 은행 API 를 부릅니다" });
+    // 에이전트의 요청을 팩토리의 서버가 작업으로 적는다. 아직 값이 없어 승격 요청이 거절된다
+    await work.secrets.request("BANK_API_KEY", { reason: "송금 기능이 은행 API 를 부릅니다" });
+    assert.deepEqual((await work.secrets.list()).map((secret) => secret.name), ["BANK_API_KEY"]);
     const [asked] = await orbital.secrets.list(instance);
     assert.equal(asked?.name, "BANK_API_KEY");
     assert.equal(asked?.declared, true);
     assert.equal(asked?.requested?.reason, "송금 기능이 은행 API 를 부릅니다");
     assert.deepEqual([asked?.preview, asked?.production], [{ set: false, setAt: null }, { set: false, setAt: null }]);
-    assert.throws(() => agent(work, instance, token, "request-promotion", release), /BANK_API_KEY/);
+    const blocked = await rejection(work.requestPromotion(release));
+    assert.match([blocked.message, ...blocked.details].join("\n"), /BANK_API_KEY/);
     // 선언하지 않은 이름은 무엇을 고칠지와 함께 거절된다
     const undeclared = await rejection(orbital.secrets.request(instance, "MAP_KEY", { reason: "지도" }));
     assert.deepEqual([undeclared.status, undeclared.code], [422, "problems"]);
@@ -198,7 +185,7 @@ test("비밀을 요청하고 사람이 입력 표로 넣으면 운영에 오른�
     assert.equal(filled?.preview.set, false);
 
     // 승인 화면은 새로 받게 되는 비밀의 이름을 보인다
-    agent(work, instance, token, "request-promotion", release);
+    await work.requestPromotion(release);
     const pending = await orbital.releases.pending(instance);
     assert.deepEqual(pending?.newSecrets, ["BANK_API_KEY"]);
     const production = await orbital.releases.promote({ instance, release, change: "customer_request", approvedBy: "customer" });
@@ -209,8 +196,7 @@ test("비밀을 요청하고 사람이 입력 표로 넣으면 운영에 오른�
 
 test("비밀의 값은 SDK 의 어떤 답에도 돌아오지 않는다", { skip }, async () =>
 {
-    const { instance, token, work, preview } = await previewed("leak");
-    const release = wordAfter(preview, "release ");
+    const { instance, work, release } = await previewed();
     const errors: OrbitalError[] = [];
 
     await orbital.secrets.set(instance, "BANK_API_KEY", { stage: "preview", value: BANK_PREVIEW });
@@ -222,7 +208,7 @@ test("비밀의 값은 SDK 의 어떤 답에도 돌아오지 않는다", { skip 
     const listed = await orbital.secrets.list(instance);
     assert.deepEqual(listed.map((secret) => [secret.name, secret.preview.set, secret.production.set]), [["BANK_API_KEY", true, true]]);
 
-    agent(work, instance, token, "request-promotion", release);
+    await work.requestPromotion(release);
     await orbital.releases.pending(instance);
     const production = await orbital.releases.promote({ instance, release, change: "customer_request", approvedBy: "customer" });
     await orbital.production.get(instance);

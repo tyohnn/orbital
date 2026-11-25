@@ -43,15 +43,6 @@ function git(folder: string, ...args: string[]): string
     ).trim();
 }
 
-function agent(folder: string, token: string, ...args: string[]): string
-{
-    return execFileSync(bin("orbital"), args, {
-        cwd: folder,
-        encoding: "utf8",
-        env: { PATH: process.env.PATH ?? "", ORBITAL_URL: url, ORBITAL_INSTANCE: instance, ORBITAL_TOKEN: token },
-    });
-}
-
 async function freePort(): Promise<number>
 {
     const probe = createServer();
@@ -179,12 +170,9 @@ before(async () =>
 
     // 운영까지 세운다
     instance = (await orbital.instances.create({ app: "todo", from: "v1" })).id;
-    const session = await orbital.sessions.open({ instance, can: ["source", "preview", "rehearse"], ttlSeconds: 600 });
-    agent(scratch, session.token, "clone", "work");
-    const work = join(scratch, "work");
-    const preview = agent(work, session.token, "preview");
-    const release = preview.split("release ")[1]?.trim().split(/\s+/)[0] ?? "";
-    agent(work, session.token, "request-promotion", release);
+    const work = await orbital.works.open({ instance, can: ["source", "preview", "rehearse"], ttlSeconds: 600 });
+    const { release } = await work.preview();
+    await work.requestPromotion(release);
     const production = await orbital.releases.promote({
         instance,
         release,

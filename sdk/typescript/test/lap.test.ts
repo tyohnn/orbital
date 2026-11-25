@@ -1,4 +1,5 @@
-// 팩토리의 서버가 하듯이 SDK 를 쓰고, 에이전트가 하듯이 `orbital` CLI 를 쓴다. 둘 다 실제 `orbitald` 에 실제 HTTP 로 붙는다.
+// 팩토리의 서버가 하듯이 SDK 를 쓴다. 에이전트는 레이어를 직접 부르지 않는다: 팩토리의 서버가 작업을 열어 그 함수로 프리뷰와
+// 승격 요청을 부르고, 에이전트의 `git` 은 팩토리의 주소(`relay.ts` 의 흉내)로 붙어 `git.relay` 를 지난다. 실제 `orbitald` 에 실제 HTTP 로 붙는다.
 //
 // `ORBITAL_PG` 가 없으면 건너뛰었다고 찍고 통과한다. 실행 파일은 `cargo build` 가 만든 것을 쓴다(`npm run test:sdk` 가 먼저 빌드한다).
 
@@ -14,6 +15,8 @@ import { after, before, test } from "node:test";
 
 import { OrbitalError, createOrbital } from "../src/server.ts";
 import type { Orbital } from "../src/server.ts";
+import { git as agentGit, startRelay } from "./relay.ts";
+import type { Relay } from "./relay.ts";
 
 const root = resolve(import.meta.dirname, "../../..");
 const bin = (name: string): string => join(process.env.CARGO_TARGET_DIR ?? join(root, "target"), "debug", name);
@@ -27,6 +30,7 @@ let scratch = "";
 let url = "";
 let server: ChildProcess | undefined;
 let orbital: Orbital;
+let relay: Relay | undefined;
 const instances: string[] = [];
 
 function git(folder: string, ...args: string[]): string
@@ -36,21 +40,6 @@ function git(folder: string, ...args: string[]): string
         ["-c", "user.name=agent", "-c", "user.email=agent@example.invalid", "-c", "commit.gpgsign=false", ...args],
         { cwd: folder, encoding: "utf8" },
     ).trim();
-}
-
-/** 에이전트의 sandbox 에는 주소 · 인스턴스 · 토큰만 있다. */
-function agent(folder: string, instance: string, token: string, ...args: string[]): string
-{
-    return execFileSync(bin("orbital"), args, {
-        cwd: folder,
-        encoding: "utf8",
-        env: { PATH: process.env.PATH ?? "", ORBITAL_URL: url, ORBITAL_INSTANCE: instance, ORBITAL_TOKEN: token },
-    });
-}
-
-function wordAfter(text: string, marker: string): string
-{
-    return text.split(marker)[1]?.trim().split(/\s+/)[0] ?? "";
 }
 
 async function freePort(): Promise<number>
@@ -150,6 +139,7 @@ before(async () =>
         },
     });
     orbital = createOrbital({ url, serviceKey: FACTORY });
+    relay = await startRelay();
 
     // 팩토리가 스캐폴드를 만들어 v1 을 달고 올린다. 서버가 듣기 시작할 때까지 잠깐 되풀이한다
     const scaffold = join(scratch, "scaffold");
@@ -184,6 +174,7 @@ after(async () =>
     {
         await orbital.instances.destroy(instance).catch(() => undefined);
     }
+    await relay?.close();
     server?.kill();
     if (scratch !== "")
     {
@@ -191,7 +182,7 @@ after(async () =>
     }
 });
 
-test("팩토리의 서버가 인스턴스를 세워 토큰을 내고 에이전트가 올린 것을 승인받아 운영에 올린다", { skip }, async () =>
+test("팩토리의 서버가 인스턴스를 세워 작업을 열고 에이전트가 git 으로 올린 것을 승인받아 운영에 올린다", { skip }, async () =>
 {
     // 고객이 가입한다
     const instance = await orbital.instances.create({ app: "todo", from: "v1" });
@@ -200,32 +191,41 @@ test("팩토리의 서버가 인스턴스를 세워 토큰을 내고 에이전�
     assert.equal(await orbital.production.get(instance.id), null);
     assert.equal(await orbital.releases.pending(instance.id), null);
 
-    // 에이전트의 작업을 연다. 토큰은 두 시간짜리로 달라고 했다
+    // 에이전트의 작업을 연다. 두 시간짜리로 달라고 했다
     const asked = Math.floor(Date.now() / 1000);
-    const session = await orbital.sessions.open({
+    const work = await orbital.works.open({
         instance: instance.id,
         can: ["source", "preview", "rehearse"],
         ttlSeconds: 7200,
     });
-    assert.ok(session.token.startsWith("orb1."));
-    assert.ok(session.expiresAt >= asked + 7200 && session.expiresAt <= asked + 7260);
+    assert.equal(work.instance, instance.id);
+    assert.ok(work.expiresAt >= asked + 7200 && work.expiresAt <= asked + 7260);
 
-    // 에이전트가 코드를 받아 고쳐 올리고, 프리뷰를 세우고, 승격을 요청한다
-    agent(scratch, instance.id, session.token, "clone", "work");
-    const work = join(scratch, "work");
-    const source = readFileSync(join(work, "server.js"), "utf8");
-    writeFileSync(join(work, "server.js"), source.replace("version: 1", "version: 2"));
-    git(work, "commit", "--quiet", "-am", "버전을 올린다");
-    agent(work, instance.id, session.token, "push");
-    const preview = agent(work, instance.id, session.token, "preview");
-    const release = wordAfter(preview, "release ");
-    agent(work, instance.id, session.token, "request-promotion", release);
+    // 에이전트가 팩토리의 주소에서 코드를 받아 고쳐 올린다. 팩토리의 서버가 프리뷰를 세우고 승격을 요청한다
+    const folder = join(scratch, "work");
+    await agentGit(scratch, "clone", "--quiet", relay?.remote(work) ?? "", folder);
+    const source = readFileSync(join(folder, "server.js"), "utf8");
+    writeFileSync(join(folder, "server.js"), source.replace("version: 1", "version: 2"));
+    await agentGit(folder, "commit", "--quiet", "-am", "버전을 올린다");
+    await agentGit(folder, "push", "--quiet", "origin", "main");
+    const preview = await work.preview();
+    assert.equal(preview.commit, await agentGit(folder, "rev-parse", "HEAD"));
+    assert.deepEqual(preview.blockers, []);
+    const release = preview.release;
+    // 프리뷰에 씨앗 사용자로 들어가 본다
+    const previewUrl = preview.services[0]?.url ?? "";
+    const { cookie } = await work.previewSignIn("u1");
+    assert.equal(((await (await fetch(`${previewUrl}/cards`, { headers: { cookie } })).json()) as unknown[]).length, 2);
+    assert.ok((await work.previewLogs()).logs.some((log) => log.name === "preview-web"));
+    // 리허설은 운영이 아직 없어 필요 없다
+    assert.equal((await work.rehearse(release)).needed, false);
+    await work.requestPromotion(release);
 
     // 승인 화면에 세울 것이 온다
     const pending = await orbital.releases.pending(instance.id);
     assert.deepEqual(pending, {
         release,
-        commit: git(work, "rev-parse", "HEAD"),
+        commit: await agentGit(folder, "rev-parse", "HEAD"),
         changes: ["`member` 역할이 `todo.card` 표를 자기 행을 읽을 수 있게 됩니다 그리고 자기 행을 고칠 수 있게 됩니다"],
         migrations: ["001_card.sql"],
         newSecrets: [],
@@ -303,6 +303,80 @@ test("팩토리의 서버가 인스턴스를 세워 토큰을 내고 에이전�
     assert.equal((await (await fetch(`${live}/cards`, { headers: { "x-orbital-identity": "v1.00.00" } })).json() as unknown[]).length, 0);
 });
 
+test("git 을 이어 주면 clone 과 push 가 팩토리의 주소로 된다", { skip }, async () =>
+{
+    const instance = (await orbital.instances.create({ app: "todo", from: "v1" })).id;
+    instances.push(instance);
+    const work = await orbital.works.open({ instance, can: ["source", "preview"] });
+    const remote = relay?.remote(work) ?? "";
+    assert.ok(!remote.startsWith(url), "원격은 팩토리의 주소여야 합니다");
+
+    // 받는다: 이력째
+    const folder = join(scratch, "relayed");
+    await agentGit(scratch, "clone", "--quiet", remote, folder);
+    assert.equal(await agentGit(folder, "log", "--format=%s"), "스캐폴드 v1");
+    assert.equal(await agentGit(folder, "remote", "get-url", "origin"), remote);
+    // 올린다: 레이어의 main 이 그 commit 이 되고 프리뷰가 그 commit 으로 선다
+    writeFileSync(join(folder, "NOTES.md"), "팩토리를 거쳐 올린다\n");
+    await agentGit(folder, "add", "-A");
+    await agentGit(folder, "commit", "--quiet", "-m", "메모");
+    await agentGit(folder, "push", "--quiet", "origin", "main");
+    const head = await agentGit(folder, "rev-parse", "HEAD");
+    assert.equal((await work.preview()).commit, head);
+    // 다른 폴더가 이어 받는다
+    const other = join(scratch, "relayed-other");
+    await agentGit(scratch, "clone", "--quiet", remote, other);
+    assert.equal(await agentGit(other, "rev-parse", "HEAD"), head);
+    // 레이어가 받지 않는 올리기는 그 까닭이 팩토리의 주소를 지나 git 에 그대로 보인다
+    await agentGit(other, "checkout", "--quiet", "-b", "feature");
+    await assert.rejects(agentGit(other, "push", "origin", "feature"), /`main` 브랜치 하나만/);
+    // 셋 가운데 하나의 길만 지났다
+    const paths = new Set((relay?.seen ?? []).map((seen) => seen.replace(/^\/git\/[0-9a-f]+/, "")));
+    for (const path of paths)
+    {
+        assert.match(path, /^\/(info\/refs\?service=git-(upload|receive)-pack|git-upload-pack|git-receive-pack)$/, path);
+    }
+});
+
+test("작업의 토큰으로는 승격하지 못한다", { skip }, async () =>
+{
+    const instance = (await orbital.instances.create({ app: "todo", from: "v1" })).id;
+    instances.push(instance);
+    // 팩토리의 서버가 보내는 것을 엿본다. 작업의 토큰은 작업 밖으로 나오지 않으므로 요청에서 꺼낸다
+    let workToken = "";
+    const watched = createOrbital({
+        url,
+        serviceKey: FACTORY,
+        fetch: async (input, init) =>
+        {
+            const authorization = new Headers(init?.headers).get("authorization") ?? "";
+            if (authorization.startsWith("Bearer orb1."))
+            {
+                workToken = authorization.slice("Bearer ".length);
+            }
+            return await fetch(input, init);
+        },
+    });
+    const work = await watched.works.open({ instance, can: ["source", "source_read", "preview", "rehearse", "secrets_request"] });
+    const { release } = await work.preview();
+    await work.requestPromotion(release);
+    assert.ok(workToken.startsWith("orb1."));
+    assert.ok(!("promote" in work));
+
+    // 능력을 모두 실어도 운영을 바꾸는 길은 열리지 않는다
+    const tried = await fetch(`${url}/v1/instances/${instance}/promotions`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${workToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ release, change: "customer_request", approved_by: "customer" }),
+    });
+    assert.equal(tried.status, 403);
+    // 운영을 바꾸는 능력은 적어 달라고 해도 실리지 않는다
+    const widened = await rejection(orbital.works.open({ instance, can: ["source", "promote" as "source"] }));
+    assert.equal(widened.status, 422);
+    assert.equal(await orbital.production.get(instance), null);
+    assert.equal((await orbital.releases.pending(instance))?.release, release);
+});
+
 test("다른 팩토리의 service key 로는 인스턴스가 없는 것으로 보인다", { skip }, async () =>
 {
     const instance = await orbital.instances.create({ app: "todo", from: "v1" });
@@ -313,6 +387,7 @@ test("다른 팩토리의 service key 로는 인스턴스가 없는 것으로 �
         () => stranger.production.get(instance.id),
         () => stranger.releases.pending(instance.id),
         () => stranger.sessions.open({ instance: instance.id, can: ["source"] }),
+        () => stranger.works.open({ instance: instance.id, can: ["source"] }),
         () => stranger.instances.destroy(instance.id),
         () => stranger.users.invite({ instance: instance.id, email: "kim@example.test", roles: ["member"] }),
         () => stranger.users.list(instance.id),

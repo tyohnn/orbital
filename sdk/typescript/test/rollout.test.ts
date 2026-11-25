@@ -1,4 +1,4 @@
-// 팩토리의 서버가 SDK 로 앱의 업데이트 하나를 포크 셋에 밀고, 에이전트가 `orbital` CLI 로 각 포크의 프리뷰를 세운다.
+// 팩토리의 서버가 SDK 로 앱의 업데이트 하나를 포크 셋에 밀고, 포크마다 작업을 열어 프리뷰를 세운다. 에이전트의 `git` 은 팩토리의 주소로 붙는다.
 // 한 곳이 적합성 테스트에서 떨어지면 rollout 이 멈추고, 통과한 곳만 오른다. 실제 `orbitald` 에 실제 HTTP 로 붙는다.
 //
 // `ORBITAL_PG` 가 없으면 건너뛰었다고 찍고 통과한다. 실행 파일은 `cargo build` 가 만든 것을 쓴다(`npm run test:sdk` 가 먼저 빌드한다).
@@ -14,7 +14,9 @@ import { join, resolve } from "node:path";
 import { after, before, test } from "node:test";
 
 import { OrbitalError, createOrbital } from "../src/server.ts";
-import type { Orbital } from "../src/server.ts";
+import type { Orbital, PreviewReport, Work } from "../src/server.ts";
+import { git as agentGit, startRelay } from "./relay.ts";
+import type { Relay } from "./relay.ts";
 
 const root = resolve(import.meta.dirname, "../../..");
 const bin = (name: string): string => join(process.env.CARGO_TARGET_DIR ?? join(root, "target"), "debug", name);
@@ -28,6 +30,7 @@ let scratch = "";
 let url = "";
 let server: ChildProcess | undefined;
 let orbital: Orbital;
+let relay: Relay | undefined;
 const instances: string[] = [];
 
 function git(folder: string, ...args: string[]): string
@@ -37,21 +40,6 @@ function git(folder: string, ...args: string[]): string
         ["-c", "user.name=agent", "-c", "user.email=agent@example.invalid", "-c", "commit.gpgsign=false", ...args],
         { cwd: folder, encoding: "utf8" },
     ).trim();
-}
-
-/** 에이전트의 sandbox 에는 주소 · 인스턴스 · 토큰만 있다. */
-function agent(folder: string, instance: string, token: string, ...args: string[]): string
-{
-    return execFileSync(bin("orbital"), args, {
-        cwd: folder,
-        encoding: "utf8",
-        env: { PATH: process.env.PATH ?? "", ORBITAL_URL: url, ORBITAL_INSTANCE: instance, ORBITAL_TOKEN: token },
-    });
-}
-
-function wordAfter(text: string, marker: string): string
-{
-    return text.split(marker)[1]?.trim().split(/\s+/)[0] ?? "";
 }
 
 async function freePort(): Promise<number>
@@ -117,6 +105,7 @@ before(async () =>
         },
     });
     orbital = createOrbital({ url, serviceKey: FACTORY });
+    relay = await startRelay();
     const upstream = join(scratch, "upstream");
     cpSync(join(fixtures, "fleet"), upstream, { recursive: true });
     git(upstream, "init", "--quiet", "--initial-branch", "main");
@@ -132,6 +121,7 @@ after(async () =>
     {
         await orbital.instances.destroy(instance).catch(() => undefined);
     }
+    await relay?.close();
     server?.kill();
     if (scratch !== "")
     {
@@ -142,29 +132,36 @@ after(async () =>
 interface Fork
 {
     instance: string;
-    token: string;
+    session: Work;
     work: string;
 }
 
-/** 고객 하나의 인스턴스를 세우고, 에이전트가 `custom.json` 을 고쳐 올린다. */
+/** 고객 하나의 인스턴스를 세우고 작업을 연다. 에이전트가 `custom.json` 을 고쳐 git 으로 올린다. */
 async function fork(name: string, custom: Record<string, unknown>): Promise<Fork>
 {
     const { id: instance } = await orbital.instances.create({ app: "fleet", from: "v1" });
     instances.push(instance);
-    const { token } = await orbital.sessions.open({ instance, can: ["source", "preview"] });
-    agent(scratch, instance, token, "clone", name);
+    const session = await orbital.works.open({ instance, can: ["source", "preview"] });
     const work = join(scratch, name);
+    await agentGit(scratch, "clone", "--quiet", relay?.remote(session) ?? "", work);
     writeFileSync(join(work, "custom.json"), JSON.stringify(custom));
-    git(work, "commit", "--quiet", "-am", "고객의 손길");
-    agent(work, instance, token, "push");
-    return { instance, token, work };
+    await agentGit(work, "commit", "--quiet", "-am", "고객의 손길");
+    await agentGit(work, "push", "--quiet", "origin", "main");
+    return { instance, session, work };
 }
 
-/** 에이전트가 레이어가 합친 commit 을 받아 프리뷰를 세운다. 프리뷰의 출력을 돌려준다. */
-function preview(fork: Fork): string
+/** 에이전트가 레이어가 합친 commit 을 받고, 팩토리의 서버가 프리뷰를 세운다. */
+async function preview(fork: Fork): Promise<PreviewReport>
 {
-    agent(fork.work, fork.instance, fork.token, "pull");
-    return agent(fork.work, fork.instance, fork.token, "preview");
+    await agentGit(fork.work, "pull", "--quiet", "--no-rebase", "--no-edit", "origin", "main");
+    return await fork.session.preview();
+}
+
+/** 거절의 글과 까닭을 한 글로. */
+async function refusalText(work: Promise<unknown>): Promise<string>
+{
+    const refused = await rejection(work);
+    return [refused.message, ...refused.details].join("\n");
 }
 
 test("포크 셋에 업데이트를 밀어 통과한 곳만 오른다", { skip }, async () =>
@@ -198,10 +195,11 @@ test("포크 셋에 업데이트를 밀어 통과한 곳만 오른다", { skip }
     }
 
     // 앞 물결: 통과하고 팩토리의 승인으로 오른다. 승인 화면은 어느 rollout 의 것인지 안다
-    const shown = preview(a);
-    assert.match(shown, /막는 것이 없습니다/);
-    const releaseA = wordAfter(shown, "release ");
-    agent(a.work, a.instance, a.token, "request-promotion", releaseA);
+    const shown = await preview(a);
+    assert.deepEqual(shown.blockers, []);
+    assert.equal(shown.conformance?.passed, true);
+    const releaseA = shown.release;
+    await a.session.requestPromotion(releaseA);
     assert.equal((await orbital.releases.pending(a.instance))?.rollout, rollout.id);
     const productionA = await orbital.releases.promote({ instance: a.instance, release: releaseA, change: "security_update", approvedBy: "factory" });
     const live = productionA.services[0]?.url ?? "";
@@ -209,11 +207,12 @@ test("포크 셋에 업데이트를 밀어 통과한 곳만 오른다", { skip }
     assert.deepEqual(await (await fetch(`${live}/greeting`)).json(), { greeting: "A사입니다" });
 
     // 뒤 물결: c 가 적합성 테스트에서 떨어져 rollout 이 멈추고, 통과한 b 도 오르지 못한다
-    const releaseB = wordAfter(preview(b), "release ");
-    agent(b.work, b.instance, b.token, "request-promotion", releaseB);
-    const shownC = preview(c);
-    assert.match(shownC, /적합성 테스트/);
-    assert.throws(() => agent(c.work, c.instance, c.token, "request-promotion", wordAfter(shownC, "release ")), /적합성 테스트/);
+    const releaseB = (await preview(b)).release;
+    await b.session.requestPromotion(releaseB);
+    const shownC = await preview(c);
+    assert.match(shownC.blockers.join("\n"), /적합성 테스트/);
+    assert.equal(shownC.conformance?.passed, false);
+    assert.match(await refusalText(c.session.requestPromotion(shownC.release)), /적합성 테스트/);
     const halted = await orbital.rollouts.get(rollout.id);
     assert.equal(halted.status, "halted");
     assert.deepEqual(halted.instances.find((entry) => entry.instance === c.instance), {
@@ -232,10 +231,10 @@ test("포크 셋에 업데이트를 밀어 통과한 곳만 오른다", { skip }
     assert.equal((await orbital.rollouts.resume(rollout.id)).status, "running");
     await orbital.releases.promote({ instance: b.instance, release: releaseB, change: "security_update", approvedBy: "factory" });
     writeFileSync(join(c.work, "custom.json"), JSON.stringify({ greeting: "C사입니다" }));
-    git(c.work, "commit", "--quiet", "-am", "새 기능을 깨뜨리던 설정을 걷는다");
-    agent(c.work, c.instance, c.token, "push");
-    const releaseC = wordAfter(preview(c), "release ");
-    agent(c.work, c.instance, c.token, "request-promotion", releaseC);
+    await agentGit(c.work, "commit", "--quiet", "-am", "새 기능을 깨뜨리던 설정을 걷는다");
+    await agentGit(c.work, "push", "--quiet", "origin", "main");
+    const releaseC = (await preview(c)).release;
+    await c.session.requestPromotion(releaseC);
     await orbital.releases.promote({ instance: c.instance, release: releaseC, change: "security_update", approvedBy: "factory" });
 
     const done = await orbital.rollouts.get(rollout.id);

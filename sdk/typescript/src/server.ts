@@ -1,11 +1,13 @@
 // 팩토리의 서버가 쓰는 client. service key 로 관리 서버의 HTTP API 를 부른다.
 //
-// 운영을 바꾸는 길은 여기에만 있다. 에이전트는 토큰과 `orbital` CLI 를 쓰고, 그 토큰에는 승격하는 능력이 없다.
+// 운영을 바꾸는 길은 여기에만 있다. 에이전트는 레이어를 직접 부르지 않는다. 팩토리의 도구와 git 만 쓰고, 그 뒤에서
+// 팩토리의 서버가 작업(`works.open`)을 열어 작업의 토큰으로 프리뷰 · 리허설 · 승격 요청을 부르고 git 을 이어 준다.
+// 작업의 토큰에는 운영을 바꾸는 능력이 아예 없다. 그래서 작업의 함수와 git 을 이어 주는 코드에 버그가 있어도 운영은 바뀌지 않는다.
 // 타입은 관리 서버가 주고받는 JSON 의 모양을 옮긴 것이다. Rust 쪽의 serde 모양을 바꾸면 같은 PR 에서 함께 고친다.
 // 누가 승인할 자격이 있는지는 팩토리가 정한다. Orbital 은 승인이 어느 쪽(고객 · 팩토리)의 것인지만 받는다.
 
-/** 토큰에 실을 수 있는 능력. 운영을 바꾸는 능력은 없다. */
-export type Capability = "source" | "preview" | "rehearse" | "secrets_request";
+/** 토큰에 실을 수 있는 능력. 운영을 바꾸는 능력은 없다. `source_read` 는 코드를 받기만 한다. */
+export type Capability = "source" | "source_read" | "preview" | "rehearse" | "secrets_request";
 
 /** 무엇 때문에 올리는가. 누가 승인해야 하는지가 여기서 갈린다. */
 export type Change =
@@ -50,7 +52,7 @@ export interface Production
 
 export interface Session
 {
-    /** 에이전트의 sandbox 에 `ORBITAL_TOKEN` 으로 넣는다. */
+    /** 작업의 토큰. 팩토리의 서버 안에만 둔다. 에이전트에게 건네지 않는다(보통은 `works.open` 이 감싸 쓴다). */
     token: string;
     /** 만료되는 때(Unix 초). */
     expiresAt: number;
@@ -194,6 +196,102 @@ export interface Restored
     restorePoint: string;
 }
 
+/** 위쪽(앱)이 정한 적합성 테스트의 결과. */
+export interface Conformance
+{
+    passed: boolean;
+    outcome: "not_declared" | "passed" | "failed" | "not_run" | "timed_out";
+    millis: number;
+    /** 출력의 끝부분. */
+    output: string;
+    /** 테스트를 가져온 위쪽 commit. */
+    upstream: string;
+}
+
+/** 프리뷰를 세운 결과. 승격을 요청하기 전에 에이전트가 읽는다. */
+export interface PreviewReport
+{
+    release: string;
+    commit: string;
+    /** 프리뷰의 주소. 고객과 에이전트가 여는 주소다. */
+    services: Service[];
+    /** 권한 검사가 찾은 어긋남. 비어 있어야 승격을 요청할 수 있다. */
+    findings: string[];
+    /** 지금의 운영과 견준 권한의 변화. 승인 카드에 설 문장이다. */
+    changes: string[];
+    /** 승격을 막는 것. */
+    blockers: string[];
+    /** 실패는 아니지만 알아 둘 것. */
+    notices: string[];
+    /** 프리뷰의 값이 없어 환경 변수 없이 선 밖에서 넣는 비밀의 이름. 사람에게 입력을 요청한다. */
+    missingSecrets: string[];
+    /** 위쪽이 선언하지 않았으면 `null` 이다. */
+    conformance: Conformance | null;
+}
+
+/** 떠 있는 프리뷰의 로그. 서비스마다 빌드(`build-<서비스>`)와 서버(`preview-<서비스>`)의 끝이다. */
+export interface PreviewLogs
+{
+    release: string;
+    logs: { name: string; text: string }[];
+}
+
+/** 운영 사본에 마이그레이션을 미리 돌린 결과. 숫자만 있다. */
+export interface Rehearsal
+{
+    release: string;
+    /** 운영에 돌릴 마이그레이션이 없으면 `false` 이고 리허설이 필요 없다. */
+    needed: boolean;
+    passed: boolean;
+    millis: number;
+    failedAt: string | null;
+    sqlstate: string | null;
+    /** 표마다의 행 수(앞, 뒤). */
+    tables: { table: string; before: number | null; after: number | null }[];
+}
+
+/** 작업의 인스턴스가 든 열린 rollout. 다른 인스턴스는 싣지 않는다. 받은 저장소에서 업데이트는 `origin/update` 다. */
+export interface WorkRollout
+{
+    rollout: string;
+    update: string;
+    change: Change;
+    halted: boolean;
+    state: RolloutState;
+}
+
+/**
+ * 에이전트의 작업 하나. 팩토리의 서버가 `works.open` 으로 열고, 작업의 토큰으로만 부른다(service key 를 싣지 않는다).
+ * 토큰은 이 객체 밖으로 나오지 않는다. 운영을 바꾸는 함수는 없다.
+ */
+export interface Work
+{
+    readonly instance: string;
+    /** 만료되는 때(Unix 초). 그 뒤의 부름은 401 로 거절된다. */
+    readonly expiresAt: number;
+    /** 레이어의 `main` 의 끝(또는 `commit`)을 빌드해 프리뷰를 세운다. */
+    preview(input?: { commit?: string }): Promise<PreviewReport>;
+    previewLogs(): Promise<PreviewLogs>;
+    /** 프리뷰에 씨앗 사용자로 들어간다. 요청에 그대로 붙일 `Cookie` 머리말의 값을 돌려준다. 프리뷰에만 있고 운영에는 없다. */
+    previewSignIn(user: string): Promise<{ cookie: string }>;
+    rehearse(release: string): Promise<Rehearsal>;
+    /** 승격을 요청한다. 승인은 사람이 하고, 운영에 올리는 일은 service key 의 `releases.promote` 만 한다. */
+    requestPromotion(release: string): Promise<void>;
+    rollout(): Promise<WorkRollout | null>;
+    secrets: {
+        list(): Promise<Secret[]>;
+        request(name: string, input: { reason: string }): Promise<void>;
+    };
+    git: {
+        /**
+         * 팩토리의 서버가 받은 git 의 smart HTTP 요청을 이 작업의 토큰으로 레이어에 이어 준다. 주소의 끝은 셋 가운데 하나여야 한다:
+         * `GET …/info/refs?service=git-upload-pack|git-receive-pack`, `POST …/git-upload-pack`, `POST …/git-receive-pack`.
+         * 밖에서 온 `Authorization` 과 쿠키는 버리고, 본문은 스트림으로 넘긴다. 그 밖의 길은 레이어에 닿지 않고 404 다.
+         */
+        relay(request: Request): Promise<Response>;
+    };
+}
+
 /** 관리 서버가 받지 않은 요청. `code` 로 갈라 다루고 `message` 와 `details` 는 사람과 에이전트에게 보여 준다. */
 export class OrbitalError extends Error
 {
@@ -269,8 +367,12 @@ export interface Orbital
         get(): Promise<Backup>;
     };
     sessions: {
-        /** 에이전트의 작업을 열 때: 팩토리가 판정한 범위로 토큰을 받는다. */
+        /** 작업의 토큰을 받는다. 보통은 이것을 감싼 `works.open` 을 쓴다. 토큰은 에이전트에게 건네지 않는다. */
         open(input: { instance: string; can: readonly Capability[]; ttlSeconds?: number }): Promise<Session>;
+    };
+    works: {
+        /** 에이전트의 작업을 연다: 팩토리가 판정한 범위로 작업의 토큰을 받아 감싼다. 누가 이 인스턴스를 고칠 수 있는지는 팩토리가 이미 판정했다. */
+        open(input: { instance: string; can: readonly Capability[]; ttlSeconds?: number }): Promise<Work>;
     };
     releases: {
         /** 에이전트가 승격을 요청해 사람의 승인을 기다리는 release. 없으면 `null` 이다. */
@@ -461,14 +563,90 @@ function toAuthSettings(value: unknown): AuthSettings
     };
 }
 
+function toServices(value: unknown): Service[]
+{
+    return toProduction({ services: value }).services;
+}
+
+const CONFORMED: readonly Conformance["outcome"][] = ["not_declared", "passed", "failed", "not_run", "timed_out"];
+
+function toPreview(value: unknown): PreviewReport
+{
+    const record = isRecord(value) ? value : {};
+    const conformance = isRecord(record.conformance) ? record.conformance : null;
+    return {
+        release: text(record.release),
+        commit: text(record.commit),
+        services: toServices(record.services),
+        findings: texts(record.findings),
+        changes: texts(record.changes),
+        blockers: texts(record.blockers),
+        notices: texts(record.notices),
+        missingSecrets: texts(record.missing_secrets),
+        conformance: conformance === null
+            ? null
+            : {
+                passed: conformance.passed === true,
+                outcome: oneOf(CONFORMED, conformance.outcome, "not_run"),
+                millis: number(conformance.millis),
+                output: text(conformance.output),
+                upstream: text(conformance.upstream),
+            },
+    };
+}
+
+const orNull = (value: unknown): number | null => (typeof value === "number" ? value : null);
+
+function toRehearsal(value: unknown): Rehearsal
+{
+    const record = isRecord(value) ? value : {};
+    const tables = Array.isArray(record.tables) ? record.tables.filter(Array.isArray) : [];
+    return {
+        release: text(record.release),
+        needed: record.needed === true,
+        passed: record.passed === true,
+        millis: number(record.millis),
+        failedAt: typeof record.failed_at === "string" ? record.failed_at : null,
+        sqlstate: typeof record.sqlstate === "string" ? record.sqlstate : null,
+        tables: tables.map((row: unknown[]) => ({ table: text(row[0]), before: orNull(row[1]), after: orNull(row[2]) })),
+    };
+}
+
+/** git 의 길 셋. 주소의 끝과 방법으로 고르고, 레이어의 `…/git/` 뒤에 붙일 것을 돌려준다. 셋이 아니면 `undefined` 다. */
+function gitTail(method: string, url: URL): string | undefined
+{
+    const path = url.pathname;
+    if (method === "GET" && path.endsWith("/info/refs"))
+    {
+        const service = url.searchParams.get("service");
+        const only = [...url.searchParams.keys()].length === 1;
+        return only && (service === "git-upload-pack" || service === "git-receive-pack") ? `info/refs?service=${service}` : undefined;
+    }
+    if (method === "POST" && url.search === "")
+    {
+        for (const service of ["git-upload-pack", "git-receive-pack"])
+        {
+            if (path.endsWith(`/${service}`))
+            {
+                return service;
+            }
+        }
+    }
+    return undefined;
+}
+
+/** git 이 주고받는 데 쓰는 머리말만 넘긴다. `Authorization` · 쿠키 · `Git-Protocol` 은 넘기지 않는다. */
+const GIT_REQUEST_HEADERS = ["content-type", "content-encoding", "accept"];
+const GIT_ANSWER_HEADERS = ["content-type", "cache-control"];
+
 export function createOrbital(options: OrbitalOptions): Orbital
 {
     const base = options.url.replace(/\/+$/, "");
     const send = options.fetch ?? fetch;
 
-    async function call(method: string, path: string, body?: Json | Uint8Array): Promise<unknown>
+    async function call(method: string, path: string, body?: Json | Uint8Array, bearer: string = options.serviceKey): Promise<unknown>
     {
-        const headers: Record<string, string> = { authorization: `Bearer ${options.serviceKey}` };
+        const headers: Record<string, string> = { authorization: `Bearer ${bearer}` };
         const init: RequestInit = { method, headers };
         if (body instanceof Uint8Array)
         {
@@ -497,6 +675,125 @@ export function createOrbital(options: OrbitalOptions): Orbital
     }
 
     const at = (instance: string, tail: string): string => `instances/${encodeURIComponent(instance)}${tail}`;
+
+    async function openSession(input: { instance: string; can: readonly Capability[]; ttlSeconds?: number }): Promise<Session>
+    {
+        const body: { [key: string]: Json } = { can: [...input.can] };
+        if (input.ttlSeconds !== undefined)
+        {
+            body.ttl_seconds = input.ttlSeconds;
+        }
+        const reply = await call("POST", at(input.instance, "/sessions"), body);
+        const record = isRecord(reply) ? reply : {};
+        return {
+            token: text(record.token),
+            expiresAt: typeof record.expires_at === "number" ? record.expires_at : 0,
+        };
+    }
+
+    /** 작업 하나. 모든 부름이 작업의 토큰을 싣는다. service key 는 이 안에서 쓰지 않는다. */
+    function work(instance: string, session: Session): Work
+    {
+        const token = session.token;
+        const as = (method: string, tail: string, body?: Json): Promise<unknown> => call(method, at(instance, tail), body, token);
+        const notFound = (): Response => new Response(
+            JSON.stringify({ error: "not_found", message: "git 의 길이 아닙니다" }),
+            { status: 404, headers: { "content-type": "application/json" } },
+        );
+        return {
+            instance,
+            expiresAt: session.expiresAt,
+            async preview(input = {})
+            {
+                return toPreview(await as("POST", "/previews", input.commit === undefined ? undefined : { commit: input.commit }));
+            },
+            async previewLogs()
+            {
+                const reply = await as("GET", "/previews/logs");
+                const record = isRecord(reply) ? reply : {};
+                const logs = Array.isArray(record.logs) ? record.logs.filter(isRecord) : [];
+                return { release: text(record.release), logs: logs.map((log) => ({ name: text(log.name), text: text(log.text) })) };
+            },
+            async previewSignIn(user)
+            {
+                const reply = await as("POST", "/previews/identities", { user });
+                return { cookie: text(isRecord(reply) ? reply.cookie : undefined) };
+            },
+            async rehearse(release)
+            {
+                return toRehearsal(await as("POST", "/rehearsals", { release }));
+            },
+            async requestPromotion(release)
+            {
+                await as("POST", "/promotion-requests", { release });
+            },
+            async rollout()
+            {
+                const reply = await as("GET", "/rollout");
+                if (!isRecord(reply))
+                {
+                    return null;
+                }
+                return {
+                    rollout: text(reply.rollout),
+                    update: text(reply.update),
+                    change: oneOf(CHANGES, reply.change, "customer_request"),
+                    halted: reply.halted === true,
+                    state: oneOf(ROLLOUT_STATES, reply.state, "waiting"),
+                };
+            },
+            secrets: {
+                async list()
+                {
+                    const reply = await as("GET", "/secrets");
+                    const secrets = isRecord(reply) && Array.isArray(reply.secrets) ? reply.secrets.filter(isRecord) : [];
+                    return secrets.map(toSecret);
+                },
+                async request(name, { reason })
+                {
+                    await as("POST", `/secrets/${encodeURIComponent(name)}/request`, { reason });
+                },
+            },
+            git: {
+                async relay(request)
+                {
+                    const tail = gitTail(request.method, new URL(request.url));
+                    if (tail === undefined)
+                    {
+                        return notFound();
+                    }
+                    const headers: Record<string, string> = { authorization: `Bearer ${token}` };
+                    for (const name of GIT_REQUEST_HEADERS)
+                    {
+                        const value = request.headers.get(name);
+                        if (value !== null)
+                        {
+                            headers[name] = value;
+                        }
+                    }
+                    const init: RequestInit & { duplex?: "half" } = { method: request.method, headers };
+                    if (request.method === "POST" && request.body !== null)
+                    {
+                        // 본문을 모아 두지 않고 흘려 넘긴다
+                        init.body = request.body;
+                        init.duplex = "half";
+                    }
+                    const answer = await send(`${base}/v1/${at(instance, `/git/${tail}`)}`, init);
+                    const passed = new Headers();
+                    for (const name of GIT_ANSWER_HEADERS)
+                    {
+                        const value = answer.headers.get(name);
+                        if (value !== null)
+                        {
+                            passed.set(name, value);
+                        }
+                    }
+                    // 레이어의 `WWW-Authenticate` 는 넘기지 않는다. 자격을 묻는 일은 팩토리의 길이 한다
+                    return new Response(answer.body, { status: answer.status, headers: passed });
+                },
+            },
+        };
+    }
 
     return {
         apps: {
@@ -553,19 +850,12 @@ export function createOrbital(options: OrbitalOptions): Orbital
             },
         },
         sessions: {
-            async open({ instance, can, ttlSeconds })
+            open: openSession,
+        },
+        works: {
+            async open(input)
             {
-                const body: { [key: string]: Json } = { can: [...can] };
-                if (ttlSeconds !== undefined)
-                {
-                    body.ttl_seconds = ttlSeconds;
-                }
-                const reply = await call("POST", at(instance, "/sessions"), body);
-                const record = isRecord(reply) ? reply : {};
-                return {
-                    token: text(record.token),
-                    expiresAt: typeof record.expires_at === "number" ? record.expires_at : 0,
-                };
+                return work(input.instance, await openSession(input));
             },
         },
         releases: {
