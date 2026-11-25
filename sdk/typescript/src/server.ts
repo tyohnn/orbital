@@ -84,6 +84,32 @@ export class OrbitalError extends Error
     }
 }
 
+/**
+ * 팩토리의 로그인 설정(팩토리마다 한 벌, 그 팩토리의 모든 인스턴스의 운영이 쓴다). 비밀(`apiKey` · `clientSecret`)은 돌아오지 않는다.
+ * `configured` 는 레이어가 그 키를 풀어 쓸 수 있는지다. `google.redirectUri` 는 Google 콘솔에 등록할 레이어의 콜백 주소다.
+ */
+export interface AuthSettings
+{
+    mail: { configured: boolean; provider: "resend" | null; from: string | null; fromName: string | null };
+    google: { configured: boolean; clientId: string | null; redirectUri: string };
+}
+
+/** 메일 발송의 설정. 보내는 주소는 팩토리가 Resend 에서 확인한 도메인의 것이어야 한다. */
+export interface MailSettings
+{
+    provider: "resend";
+    apiKey: string;
+    from: string;
+    fromName?: string;
+}
+
+/** 팩토리의 Google 클라이언트(OAuth 웹 애플리케이션). redirect 로 `AuthSettings.google.redirectUri` 하나를 등록한다. */
+export interface GoogleSettings
+{
+    clientId: string;
+    clientSecret: string;
+}
+
 export interface OrbitalOptions
 {
     /** 관리 서버의 주소. */
@@ -132,6 +158,17 @@ export interface Orbital
         setRoles(input: { instance: string; user: string; roles: readonly string[] }): Promise<void>;
         /** 사용자를 뺀다. 막고 그 사용자의 세션을 모두 거둔다. */
         remove(input: { instance: string; user: string }): Promise<void>;
+    };
+    settings: {
+        auth: {
+            /** 팩토리의 로그인 설정. 비밀은 돌아오지 않는다. */
+            get(): Promise<AuthSettings>;
+            /**
+             * 키를 넣는다. 적지 않은 칸은 그대로 두고, `null` 이면 지운다. 레이어에 봉인의 열쇠가 없으면 409 로 거절된다.
+             * 키가 없으면 그 로그인 방법(`email_link` · `google`)을 선언한 release 는 운영에 오르지 못한다. 미리보기는 선다.
+             */
+            set(input: { mail?: MailSettings | null; google?: GoogleSettings | null }): Promise<AuthSettings>;
+        };
     };
     oauthClients: {
         /**
@@ -183,6 +220,26 @@ function toUser(value: Record<string, unknown>): User
         roles: texts(value.roles),
         disabled: value.disabled === true,
         lastSignedInAt: typeof value.last_signed_in_at === "number" ? value.last_signed_in_at : null,
+    };
+}
+
+function toAuthSettings(value: unknown): AuthSettings
+{
+    const record = isRecord(value) ? value : {};
+    const mail = isRecord(record.mail) ? record.mail : {};
+    const google = isRecord(record.google) ? record.google : {};
+    return {
+        mail: {
+            configured: mail.configured === true,
+            provider: mail.provider === "resend" ? "resend" : null,
+            from: typeof mail.from === "string" ? mail.from : null,
+            fromName: typeof mail.from_name === "string" ? mail.from_name : null,
+        },
+        google: {
+            configured: google.configured === true,
+            clientId: typeof google.client_id === "string" ? google.client_id : null,
+            redirectUri: text(google.redirect_uri),
+        },
     };
 }
 
@@ -307,6 +364,29 @@ export function createOrbital(options: OrbitalOptions): Orbital
             async remove({ instance, user })
             {
                 await call("DELETE", at(instance, `/users/${encodeURIComponent(user)}`));
+            },
+        },
+        settings: {
+            auth: {
+                async get()
+                {
+                    return toAuthSettings(await call("GET", "settings/auth"));
+                },
+                async set({ mail, google })
+                {
+                    const body: { [key: string]: Json } = {};
+                    if (mail !== undefined)
+                    {
+                        body.mail = mail === null
+                            ? null
+                            : { provider: mail.provider, api_key: mail.apiKey, from: mail.from, from_name: mail.fromName ?? null };
+                    }
+                    if (google !== undefined)
+                    {
+                        body.google = google === null ? null : { client_id: google.clientId, client_secret: google.clientSecret };
+                    }
+                    return toAuthSettings(await call("PUT", "settings/auth", body));
+                },
             },
         },
         oauthClients: {

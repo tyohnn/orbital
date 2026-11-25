@@ -2,6 +2,8 @@
 //!
 //! 요청마다 `Authorization: Bearer …` 를 본다. `orb1.` 로 시작하면 에이전트의 토큰이고, 아니면 팩토리의 service key 다.
 //! 토큰으로 되는 일과 service key 로 되는 일은 길이 다르다. 운영을 바꾸는 길은 service key 쪽에만 있다.
+//! 열쇠 없이 오는 길은 Google 의 콜백(`GET /v1/auth/google/callback`) 하나다. 무엇을 할지는 레이어가 서명한 `state` 가 정한다.
+//! 팩토리의 로그인 설정(`/v1/settings/auth`)은 service key 에만 있고, 넣은 비밀은 어떤 답에도 싣지 않는다.
 //! 무엇이 허락되는지는 여기서 정하지 않는다. 토큰은 core 의 `scope::judge` 가, 승격은 core 의 `release::promote` 가 판정한다.
 
 use std::collections::BTreeSet;
@@ -24,6 +26,8 @@ pub struct Reply {
     pub status: u16,
     pub content_type: &'static str,
     pub body: Vec<u8>,
+    /// 302 로 보낼 곳. Google 의 콜백만 쓴다.
+    pub location: Option<String>,
 }
 
 fn ok(value: Value) -> Reply {
@@ -31,6 +35,16 @@ fn ok(value: Value) -> Reply {
         status: 200,
         content_type: "application/json",
         body: value.to_string().into_bytes(),
+        location: None,
+    }
+}
+
+fn found(location: String) -> Reply {
+    Reply {
+        status: 302,
+        content_type: "application/json",
+        body: b"{}".to_vec(),
+        location: Some(location),
     }
 }
 
@@ -40,6 +54,7 @@ fn problem(status: u16, code: &str, message: &str, details: Vec<String>) -> Repl
         status,
         content_type: "application/json",
         body: body.to_string().into_bytes(),
+        location: None,
     }
 }
 
@@ -57,6 +72,7 @@ fn denied(denied: &PromoteDenied) -> Reply {
                     }
                     Blocker::RehearsalNotRun => "마이그레이션의 예행연습을 아직 돌리지 않았습니다. `orbital rehearse` 로 돌려 주세요".to_owned(),
                     Blocker::RehearsalFailed => "마이그레이션의 예행연습이 실패했습니다".to_owned(),
+                    Blocker::KeyMissing { key } => crate::layer::key_text(*key),
                 })
                 .collect(),
         ),
@@ -95,6 +111,7 @@ fn failure(failure: Failure) -> Reply {
             vec![log],
         ),
         Failure::MigrationFailed(message) => problem(422, "migration_failed", &message, Vec::new()),
+        Failure::Invalid(message) => problem(400, "invalid", &message, Vec::new()),
         Failure::Denied(why) => denied(&why),
         Failure::Conflict(message) => problem(409, "conflict", &message, Vec::new()),
         Failure::Internal(message) => problem(500, "internal", &message, Vec::new()),
@@ -181,6 +198,7 @@ fn with_token(
                 status: 200,
                 content_type: "application/octet-stream",
                 body: layer.source_bundle(&instance)?,
+                location: None,
             })
         }
         ("POST", ["source"]) => {
@@ -245,6 +263,12 @@ fn with_service_key(
 ) -> Result<Reply, Failure> {
     let organization = layer.organization(key)?;
     match (method, path) {
+        // 팩토리마다 한 벌. 비밀은 답에 싣지 않는다
+        ("GET", ["settings", "auth"]) => Ok(ok(layer.auth_settings(&organization))),
+        ("PUT", ["settings", "auth"]) => {
+            layer.put_auth_settings(&organization, body)?;
+            Ok(ok(layer.auth_settings(&organization)))
+        }
         ("PUT", ["apps", app]) => {
             layer.put_app(&organization, app, body)?;
             Ok(ok(json!({ "app": app })))
@@ -324,6 +348,7 @@ fn with_service_key(
 
 /// 요청 하나를 처리한다.
 pub fn handle(layer: &Layer, method: &str, path: &str, bearer: Option<&str>, body: &[u8]) -> Reply {
+    let whole = path;
     let path: Vec<&str> = path
         .split('?')
         .next()
@@ -334,6 +359,14 @@ pub fn handle(layer: &Layer, method: &str, path: &str, bearer: Option<&str>, bod
     let ["v1", rest @ ..] = path.as_slice() else {
         return failure(Failure::NotFound);
     };
+    // Google 이 브라우저를 돌려보내는 곳. 열쇠 없이 오고, 무엇을 할지는 레이어가 서명한 `state` 가 정한다
+    if method == "GET" && rest == ["auth", "google", "callback"] {
+        let query = whole.split_once('?').map_or("", |(_, query)| query);
+        return match layer.google_callback(query) {
+            Ok(location) => found(location),
+            Err(error) => failure(error),
+        };
+    }
     let Some(bearer) = bearer else {
         return failure(Failure::Unauthorized);
     };
@@ -373,9 +406,21 @@ pub fn serve(layer: Arc<Layer>, server: tiny_http::Server) {
             };
             let header = tiny_http::Header::from_bytes("Content-Type", reply.content_type)
                 .expect("고정된 머리말이다");
-            let response = tiny_http::Response::from_data(reply.body)
+            let mut response = tiny_http::Response::from_data(reply.body)
                 .with_status_code(reply.status)
                 .with_header(header);
+            if let Some(location) = reply.location {
+                // 한 번 쓰는 표가 든 주소가 기록이나 다음 화면의 Referer 로 남지 않게 한다
+                for (name, value) in [
+                    ("Location", location.as_str()),
+                    ("Cache-Control", "no-store"),
+                    ("Referrer-Policy", "no-referrer"),
+                ] {
+                    if let Ok(header) = tiny_http::Header::from_bytes(name, value) {
+                        response.add_header(header);
+                    }
+                }
+            }
             let _ = request.respond(response);
         });
     }

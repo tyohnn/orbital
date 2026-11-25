@@ -33,7 +33,7 @@ use orbital_core::auth::{
     Admission, InvitationRefusal, LinkRefusal, SESSION_TTL, admit, route, safe_next, same_origin,
     static_file, wants_page,
 };
-use orbital_core::manifest::ValidManifest;
+use orbital_core::manifest::{Auth, ValidManifest};
 use orbital_core::oauth::is_mcp_path;
 use orbital_core::plan::Names;
 use orbital_pg::auth::{AuthError, AuthStore, Secret, SessionUser};
@@ -90,9 +90,31 @@ pub struct Mail {
     pub link: String,
 }
 
-/// 로그인 링크를 보내는 것. 실제 발송기는 아직 없고, 개발용은 보내는 대신 쌓는다.
+/// 메일을 보내지 못한 까닭. router 의 기록에는 이 갈래와 상태만 적는다(키 · 받는 주소 · 링크는 적지 않는다).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailFailure {
+    /// 팩토리가 메일 발송의 키를 넣지 않았다(넣었다가 지웠다).
+    NotConfigured,
+    /// 발송기에 닿지 못했거나 시간이 넘었다.
+    Unreachable,
+    /// 발송기가 거절했다. HTTP 상태다.
+    Rejected { status: u16 },
+}
+
+impl std::fmt::Display for MailFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConfigured => f.write_str("not_configured"),
+            Self::Unreachable => f.write_str("unreachable"),
+            Self::Rejected { status } => write!(f, "rejected {status}"),
+        }
+    }
+}
+
+/// 로그인 링크를 보내는 것. 운영에서는 팩토리의 키로 보내고([`Resend`]), 개발용은 보내는 대신 쌓는다. 미리보기의 router 는 부르지 않는다.
 pub trait Mailer: Send + Sync {
-    fn send(&self, mail: Mail);
+    /// 한 통을 보낸다. 실패해도 링크 요청의 답은 같고, router 는 까닭의 갈래만 기록에 남긴다.
+    fn send(&self, mail: Mail) -> Result<(), MailFailure>;
 }
 
 /// 메모리에 쌓는 메일함. 테스트가 꺼내 본다.
@@ -111,10 +133,11 @@ impl Mailbox {
 }
 
 impl Mailer for Mailbox {
-    fn send(&self, mail: Mail) {
+    fn send(&self, mail: Mail) -> Result<(), MailFailure> {
         if let Ok(mut mails) = self.mails.lock() {
             mails.push(mail);
         }
+        Ok(())
     }
 }
 
@@ -150,20 +173,24 @@ impl Outbox {
 }
 
 impl Mailer for Outbox {
-    fn send(&self, mail: Mail) {
+    fn send(&self, mail: Mail) -> Result<(), MailFailure> {
         let _guard = self.lock.lock();
         let line = json!({ "to": mail.to, "link": mail.link }).to_string();
-        // 메일이 쌓이지 않아도 요청의 답은 같아야 한다. 실패는 삼킨다
-        if let Ok(mut file) = OpenOptions::new()
+        OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
             .open(&self.path)
-        {
-            let _ = writeln!(file, "{line}");
-        }
+            .and_then(|mut file| writeln!(file, "{line}"))
+            .map_err(|_| MailFailure::Unreachable)
     }
 }
+
+mod resend;
+pub use resend::{LoginMail, Resend, ResendKey, login_mail};
+
+mod google;
+pub use google::GoogleDoor;
 
 // ---- Client ID Metadata Documents 받아 오기 ----
 
@@ -315,6 +342,8 @@ pub struct Config {
     pub log: Option<PathBuf>,
     /// Client ID Metadata Documents 를 받아 오는 것.
     pub documents: Arc<dyn DocumentFetcher>,
+    /// Google 로 들어가는 문. 운영에서 `google` 을 선언했을 때만 있다. 팩토리의 키는 문을 열 때마다 읽는다.
+    pub google: Option<Arc<dyn GoogleDoor>>,
 }
 
 // ---- 인증 역할의 연결 풀 ----
@@ -653,6 +682,26 @@ impl State {
         }
     }
 
+    /// 메일을 보내지 못했을 때 한 줄. 갈래와 상태만 적는다.
+    fn record_mail(&self, failure: MailFailure) {
+        let Some(log) = &self.config.log else {
+            return;
+        };
+        let _guard = self.log.lock();
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log) {
+            let _ = writeln!(file, "MAIL {failure}");
+        }
+    }
+
+    fn declares(&self, method: &str) -> bool {
+        self.config
+            .manifest
+            .get()
+            .auth
+            .as_ref()
+            .is_some_and(|auth| auth.uses(method))
+    }
+
     async fn answer(&self, request: Request<Incoming>) -> Response<Body> {
         // 쿠키를 보지 않는 주소만 다른 주소의 브라우저에 연다. 자격 증명(credentials)은 열지 않으니 쿠키는 실리지 않는다
         let Some(methods) = cross_origin_methods(request.uri().path()) else {
@@ -879,8 +928,16 @@ impl State {
             }
         }
         match (method, path.as_str()) {
-            (Method::POST, "/_orbital/auth/email-link") => self.email_link(request, pool).await,
+            (Method::POST, "/_orbital/auth/email-link") if self.declares(Auth::EMAIL_LINK) => {
+                self.email_link(request, pool).await
+            }
             (Method::GET, "/_orbital/auth/callback") => self.callback(&request, pool).await,
+            (Method::GET, "/_orbital/auth/google/start") if self.declares(Auth::GOOGLE) => {
+                self.google_start(request.headers(), request.uri().query())
+            }
+            (Method::GET, "/_orbital/auth/google/finish") if self.declares(Auth::GOOGLE) => {
+                self.google_finish(&request, pool).await
+            }
             (Method::GET, "/_orbital/auth/me") => self.me(request.headers()).await,
             (Method::POST, "/_orbital/auth/logout") => Self::logout(request.headers(), pool).await,
             (Method::POST, "/_orbital/preview/sign-in") if preview => {
@@ -900,7 +957,9 @@ impl State {
     }
 
     async fn email_link(&self, request: Request<Incoming>, pool: Arc<Pool>) -> Response<Body> {
-        let known = cookie(request.headers(), BROWSER_COOKIE).and_then(|text| Secret::parse(&text));
+        let Some((browser, planted)) = Self::browser(request.headers()) else {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+        };
         let Some(body) = read_json(request).await else {
             return error(StatusCode::BAD_REQUEST, "bad_request");
         };
@@ -909,29 +968,31 @@ impl State {
         };
         let next = body["next"].as_str().unwrap_or("/").to_owned();
         // 표식이 없으면 심는다. 초대됐는지와 상관없이 같은 머리말이 나간다
-        let (browser, planted) = match known {
-            Some(browser) => (browser, None),
-            None => match Secret::generate() {
-                Ok(browser) => {
-                    let cookie = browser_cookie(&browser);
-                    (browser, Some(cookie))
-                }
-                Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
-            },
-        };
         let asked = email.clone();
         let made = pool
             .run(move |store| store.request_link(&asked, &next, &browser, now()))
             .await;
         match made {
-            Ok(Some(token)) => self.config.mailer.send(Mail {
-                to: email,
-                link: format!(
-                    "{}/_orbital/auth/callback?token={}",
-                    self.config.origin,
-                    token.to_text()
-                ),
-            }),
+            // 미리보기에서는 메일을 보내지 않는다. 미리보기의 사람은 씨앗 사용자로 들어간다
+            Ok(Some(_)) if self.config.stage == Stage::Preview => {}
+            Ok(Some(token)) => {
+                let mail = Mail {
+                    to: email,
+                    link: format!(
+                        "{}/_orbital/auth/callback?token={}",
+                        self.config.origin,
+                        token.to_text()
+                    ),
+                };
+                let mailer = Arc::clone(&self.config.mailer);
+                // 발송기는 동기 HTTP 라 일꾼을 막지 않게 따로 돌린다. 보내지 못해도 답은 같다
+                let sent = tokio::task::spawn_blocking(move || mailer.send(mail))
+                    .await
+                    .unwrap_or(Err(MailFailure::Unreachable));
+                if let Err(failure) = sent {
+                    self.record_mail(failure);
+                }
+            }
             // 초대받지 않았거나, 막혔거나, 1분 안에 다시 왔다. 답은 같다
             Ok(None) | Err(StoreError::Refused(_)) => {}
             Err(StoreError::Unavailable) => {
@@ -953,25 +1014,90 @@ impl State {
             .and_then(Secret::parse);
         let browser =
             cookie(request.headers(), BROWSER_COOKIE).and_then(|text| Secret::parse(&text));
-        let refused = |code: &str| {
-            let mut response = redirect(&format!("{}?error={code}", self.login_path()));
-            // 토큰이 든 주소가 다음 화면의 Referer 로 새지 않게 한다
-            response.headers_mut().insert(
-                header::REFERRER_POLICY,
-                HeaderValue::from_static("no-referrer"),
-            );
-            response
-        };
         let Some(token) = token else {
-            return refused("invalid");
+            return self.refused("invalid");
         };
         let Some(browser) = browser else {
-            return refused("other_browser");
+            return self.refused("other_browser");
         };
-        match pool
+        let entered = pool
             .run(move |store| store.enter(&token, &browser, now()))
-            .await
-        {
+            .await;
+        self.entered(entered)
+    }
+
+    /// 브라우저의 표식. 없으면 새로 짓고 심을 쿠키를 함께 돌려준다.
+    fn browser(headers: &HeaderMap) -> Option<(Secret, Option<String>)> {
+        match cookie(headers, BROWSER_COOKIE).and_then(|text| Secret::parse(&text)) {
+            Some(browser) => Some((browser, None)),
+            None => {
+                let browser = Secret::generate().ok()?;
+                let cookie = browser_cookie(&browser);
+                Some((browser, Some(cookie)))
+            }
+        }
+    }
+
+    /// Google 로 보낸다. 브라우저의 표식을 심고(이메일 링크와 같은 쿠키), 레이어가 서명한 `state` 를 실은 Google 의 주소로 302 한다.
+    /// 팩토리가 Google 의 키를 넣지 않았거나 지웠으면 404 다.
+    fn google_start(&self, headers: &HeaderMap, query: Option<&str>) -> Response<Body> {
+        let Some(door) = &self.config.google else {
+            return error(StatusCode::NOT_FOUND, "not_found");
+        };
+        let next = query
+            .and_then(|query| orbital_core::auth::query_value(query, "next"))
+            .map_or_else(|| "/".to_owned(), |next| safe_next(&next));
+        let Some((browser, planted)) = Self::browser(headers) else {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+        };
+        let Some(location) = door.authorize(&next, &browser) else {
+            return error(StatusCode::NOT_FOUND, "not_found");
+        };
+        let mut response = redirect(&location);
+        if let Some(cookie) = planted {
+            set_cookie(&mut response, &cookie);
+        }
+        response
+    }
+
+    /// 레이어의 콜백이 낸 한 번 쓰는 표로 들어온다. 그 표를 받은 브라우저에서, 60초 안에, 한 번만 된다.
+    async fn google_finish(&self, request: &Request<Incoming>, pool: Arc<Pool>) -> Response<Body> {
+        if self.config.google.is_none() {
+            return error(StatusCode::NOT_FOUND, "not_found");
+        }
+        let ticket = request
+            .uri()
+            .query()
+            .and_then(|query| query_value(query, "ticket"))
+            .and_then(Secret::parse);
+        let browser =
+            cookie(request.headers(), BROWSER_COOKIE).and_then(|text| Secret::parse(&text));
+        let Some(ticket) = ticket else {
+            return self.refused("invalid");
+        };
+        let Some(browser) = browser else {
+            return self.refused("other_browser");
+        };
+        let entered = pool
+            .run(move |store| store.enter_google(&ticket, &browser, now()))
+            .await;
+        self.entered(entered)
+    }
+
+    /// 들어오지 못했다. 로그인 화면에 까닭의 코드를 실어 보낸다.
+    fn refused(&self, code: &str) -> Response<Body> {
+        let mut response = redirect(&format!("{}?error={code}", self.login_path()));
+        // 토큰이 든 주소가 다음 화면의 Referer 로 새지 않게 한다
+        response.headers_mut().insert(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        );
+        response
+    }
+
+    /// 링크나 표로 들어온 결과를 답으로 옮긴다. 들어왔으면 세션 쿠키를 심고 돌아갈 곳으로 보낸다.
+    fn entered(&self, entered: Result<orbital_pg::auth::Entered, StoreError>) -> Response<Body> {
+        match entered {
             Ok(entered) => {
                 let mut response = redirect(&entered.next);
                 response.headers_mut().insert(
@@ -981,7 +1107,7 @@ impl State {
                 set_cookie(&mut response, &session_cookie(&entered.session));
                 response
             }
-            Err(StoreError::Refused(refusal)) => refused(match refusal {
+            Err(StoreError::Refused(refusal)) => self.refused(match refusal {
                 AuthError::Link(LinkRefusal::Expired)
                 | AuthError::Invitation(InvitationRefusal::Expired) => "expired",
                 AuthError::Link(LinkRefusal::Used) => "used",
@@ -1166,14 +1292,18 @@ mod tests {
             std::env::temp_dir().join(format!("orbital-outbox-{}.jsonl", std::process::id()));
         let _ = fs::remove_file(&path);
         let outbox = Outbox::new(&path);
-        outbox.send(Mail {
-            to: "kim@example.com".to_owned(),
-            link: "http://127.0.0.1:1/_orbital/auth/callback?token=ab".to_owned(),
-        });
-        outbox.send(Mail {
-            to: "lee@example.com".to_owned(),
-            link: "x".to_owned(),
-        });
+        outbox
+            .send(Mail {
+                to: "kim@example.com".to_owned(),
+                link: "http://127.0.0.1:1/_orbital/auth/callback?token=ab".to_owned(),
+            })
+            .unwrap();
+        outbox
+            .send(Mail {
+                to: "lee@example.com".to_owned(),
+                link: "x".to_owned(),
+            })
+            .unwrap();
         let mails = Outbox::read(&path);
         assert_eq!(mails.len(), 2);
         assert_eq!(mails[0].to, "kim@example.com");

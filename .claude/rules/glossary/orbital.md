@@ -28,8 +28,12 @@ paths:
 | router | 미리보기 · 운영마다 하나가 포트 하나를 듣고, 요청을 서비스로 가르고, 세션을 확인해 신원을 싣는 것. `/_orbital/` 은 직접 답한다 | `orbital-router`, `auth::route` |
 | 사용자 | 인스턴스의 앱에 로그인하는 사람. 인스턴스의 database 안 `orbital_auth` 에 있다. 씨앗 사용자는 미리보기에만 있다 | `SessionUser`, `User`, `SeedUser` |
 | 초대 | 그 이메일이 들어올 수 있게 하고 처음 가질 업무 역할을 정한 것. 14일 동안 받아들여진다 | `AuthStore::invite`, `judge_invitation` |
-| 로그인 링크 | 메일로 가는 한 번 쓰는 주소. 15분, 요청한 브라우저에서만 열린다. 같은 이메일로는 1분에 하나 | `AuthStore::request_link` · `enter`, `judge_link` |
+| 로그인 링크 | 메일로 가는 한 번 쓰는 주소. 운영에서만 팩토리의 키로 나가고 미리보기에서는 나가지 않는다. 15분, 요청한 브라우저에서만 열린다. 같은 이메일로는 1분에 하나 | `AuthStore::request_link` · `enter`, `judge_link` |
 | 세션 | 로그인한 브라우저의 쿠키(`__Host-orbital-session`)가 가리키는 것. 거두거나 사용자를 빼면 다음 요청부터 없는 것이다 | `AuthStore::session`, `judge_session` |
+| 팩토리의 설정 | 팩토리마다 한 벌인 로그인의 키(Resend 의 키 · 보내는 주소, Google 클라이언트). 비밀은 어떤 답에도 돌아오지 않는다. 없으면 그 로그인 방법은 운영에 오르지 못한다 | `Settings`, `PUT /v1/settings/auth`, `FactoryKey`, `missing_keys` |
+| 봉인 | 팩토리의 비밀을 기록에 두는 모양. 조직과 칸을 함께 묶어 다른 줄에 옮기면 풀리지 않는다. 열쇠는 기록 밖(`ORBITAL_SEAL_KEY`)에 있다 | `seal`, `SealKey` |
+| 개발용 메일함 | 메일을 보내지 않고 `outbox.jsonl` 에 쌓는 것. 명시해 켠 레이어(`ORBITAL_DEV_MAIL=outbox`)에서만 메일 키를 대신한다 | `Outbox`, `Options::dev_mailbox` |
+| Google 로그인의 state · 표 | 레이어가 서명해 Google 에 넘기는 것(인스턴스 · `next` · 브라우저 표식과 `nonce` 의 해시, 10분)과, 콜백이 Google 계정을 확인한 뒤 인스턴스에 적는 한 번 쓰는 표(60초, 요청한 브라우저에서만) | `StateClaims`, `judge_state`, `judge_id_token`, `google_ticket`, `AuthStore::enter_google` |
 | 인가 서버 · 자원 서버 | MCP 의 인가에서 Orbital Auth 가 토큰을 내는 쪽(발급자는 router 의 주소), router 가 MCP 주소에서 토큰을 확인하는 쪽 | `orbital_core::oauth`, `orbital_router::oauth` |
 | 승인(grant) | 사용자가 클라이언트 하나에 준 허락. 코드와 토큰은 승인에 딸리고, 승인을 거두면 함께 끊긴다 | `oauth_grant`, `AuthStore::decide` · `revoke_grant` |
 | 인가 코드 · access 토큰 · refresh 토큰 | 5분 한 번 · 1시간 · 30일(쓸 때마다 간다). 해시로만 둔다 | `oauth_code`, `oauth_token`, `judge_code` · `judge_token` |

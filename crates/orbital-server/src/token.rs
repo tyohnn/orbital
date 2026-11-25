@@ -10,6 +10,8 @@ use orbital_core::scope::Token;
 use sha2::Sha256;
 
 const PREFIX: &str = "orb1";
+/// Google 로그인의 `state`. 같은 열쇠로 서명하되 머리말이 달라 토큰과 서로 바꿔 쓰이지 않는다.
+const STATE_PREFIX: &str = "gs1";
 
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -47,6 +49,27 @@ pub fn verify(key: &[u8], text: &str) -> Option<Token> {
     }
     // 서명을 견주는 데 걸린 시간으로 서명을 맞혀 가지 못하게, 라이브러리의 견주기를 쓴다
     mac(key, &format!("{PREFIX}.{body}"))
+        .verify_slice(&unhex(signature)?)
+        .ok()?;
+    serde_json::from_slice(&unhex(body)?).ok()
+}
+
+/// Google 로그인의 `state` 에 서명한다. 모양은 `gs1.<내용의 hex>.<HMAC-SHA256 의 hex>` 다.
+pub fn sign_state(key: &[u8], state: &orbital_core::google::StateClaims) -> String {
+    let body = serde_json::to_string(state).expect("state 는 JSON 이 된다");
+    let signed = format!("{STATE_PREFIX}.{}", hex(body.as_bytes()));
+    let signature = hex(&mac(key, &signed).finalize().into_bytes());
+    format!("{signed}.{signature}")
+}
+
+/// 서명이 맞으면 `state` 의 내용을 돌려준다. 만료는 보지 않는다. 그것은 core 의 `google::judge_state` 의 일이다.
+pub fn verify_state(key: &[u8], text: &str) -> Option<orbital_core::google::StateClaims> {
+    let mut parts = text.split('.');
+    let (prefix, body, signature) = (parts.next()?, parts.next()?, parts.next()?);
+    if prefix != STATE_PREFIX || parts.next().is_some() {
+        return None;
+    }
+    mac(key, &format!("{STATE_PREFIX}.{body}"))
         .verify_slice(&unhex(signature)?)
         .ok()?;
     serde_json::from_slice(&unhex(body)?).ok()

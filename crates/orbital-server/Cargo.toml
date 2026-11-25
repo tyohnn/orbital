@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 orbital-core = { path = "../orbital-core" }
+base64.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
 orbital-pg = { path = "../orbital-pg" }
 orbital-proxy = { path = "../orbital-proxy" }
 orbital-router = { path = "../orbital-router" }
@@ -25,9 +28,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tiny_http.workspace = true
 tokio.workspace = true
-
-[dev-dependencies]
-ureq.workspace = true
+ureq = { workspace = true, features = ["tls"] }
 
 [lints]
 workspace = true

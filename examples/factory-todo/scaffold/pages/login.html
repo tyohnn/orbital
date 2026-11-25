@@ -3,7 +3,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>로그인</title>
-<!-- 로그인 화면은 이메일 주소만 다뤄요. 링크를 만들고 보내고 받는 일은 레이어(/_orbital/auth/…)가 해요 -->
+<!-- 로그인 화면은 이메일 주소만 다뤄요. 링크를 만들고 보내고 받는 일은 레이어(/_orbital/auth/…)가 해요.
+     Google 단추는 숨겨 두었어요. orbital.toml 의 methods 에 "google" 을 더하고 팩토리가 Google 키를 넣은 뒤에 hidden 을 지워요 -->
 <main>
     <h1>할 일 카드에 들어가기</h1>
     <form id="login">
@@ -11,14 +12,39 @@
         <input id="email" name="email" type="email" autocomplete="email" required>
         <button type="submit">로그인 링크 받기</button>
     </form>
+    <button id="google" type="button" hidden>Google로 계속하기</button>
     <p id="sent" hidden>메일함을 확인해 주세요. 받은 링크를 이 브라우저에서 열면 들어와요.</p>
+    <p id="refused" role="alert" hidden></p>
     <p id="failed" role="alert" hidden>링크를 보내지 못했어요. 잠시 뒤에 다시 해 주세요.</p>
 </main>
 <script type="module">
-    import { sendLoginLink } from "/vendor/orbital-app.js";
+    import { googleSignInUrl, sendLoginLink } from "/vendor/orbital-app.js";
 
     const form = document.getElementById("login");
-    const next = new URLSearchParams(location.search).get("next") ?? "/";
+    const query = new URLSearchParams(location.search);
+    const next = query.get("next") ?? "/";
+
+    // 들어오지 못하면 레이어가 ?error=<코드> 를 실어 이 화면으로 돌려보내요
+    const reasons = {
+        not_invited: "초대받지 않은 이메일이에요. 관리자에게 초대를 요청해 주세요.",
+        unverified: "Google에서 확인되지 않은 이메일이에요. 다른 계정으로 해 주세요.",
+        expired: "시간이 지났어요. 다시 해 주세요.",
+        used: "이미 쓴 링크예요. 다시 해 주세요.",
+        other_browser: "로그인을 시작한 브라우저에서 열어 주세요.",
+        disabled: "쓸 수 없는 계정이에요. 관리자에게 문의해 주세요.",
+    };
+    const error = query.get("error");
+    if (error !== null)
+    {
+        const refused = document.getElementById("refused");
+        refused.textContent = reasons[error] ?? "들어오지 못했어요. 다시 해 주세요.";
+        refused.hidden = false;
+    }
+
+    document.getElementById("google").addEventListener("click", () =>
+    {
+        location.href = googleSignInUrl(next);
+    });
     form.addEventListener("submit", async (event) =>
     {
         event.preventDefault();

@@ -7,6 +7,7 @@ pub mod access;
 pub mod auth;
 pub mod check;
 pub mod describe;
+pub mod google;
 pub mod manifest;
 pub mod name;
 pub mod oauth;

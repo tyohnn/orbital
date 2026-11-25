@@ -76,6 +76,15 @@ pub(crate) fn encode_component(text: &str) -> String {
     encoded
 }
 
+/// 질의(`a=1&b=2`)에서 이름 하나의 값을 풀어 꺼낸다. `+` 는 공백이다. 없거나 모양이 틀렸으면 `None` 이다.
+pub fn query_value(query: &str, name: &str) -> Option<String> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == name)
+        .and_then(|(_, value)| decode_component(&value.replace('+', " ")))
+}
+
 /// `%` 로 감싼 글자를 푼다. 모양이 틀렸거나 UTF-8 이 아니면 `None` 이다.
 fn decode_component(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
@@ -294,7 +303,7 @@ pub fn judge_link(link: &LinkState, browser_hash: &[u8], now: u64) -> Result<(),
 }
 
 /// 두 값을 끝까지 견준다. 앞에서부터 견주다 멈추면 걸린 시간으로 값을 맞혀 갈 수 있다.
-fn same_bytes(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn same_bytes(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }
@@ -407,6 +416,17 @@ mod tests {
     use crate::manifest::Manifest;
 
     const MADE: u64 = 1_800_000_000;
+
+    #[test]
+    fn 질의에서_이름_하나의_값을_풀어_꺼낸다() {
+        assert_eq!(
+            query_value("a=1&next=%2Fcards%3Fx%3D1&b", "next"),
+            Some("/cards?x=1".to_owned())
+        );
+        assert_eq!(query_value("state=a+b", "state"), Some("a b".to_owned()));
+        assert_eq!(query_value("xnext=1", "next"), None);
+        assert_eq!(query_value("next=%zz", "next"), None);
+    }
 
     fn link(used_at: Option<u64>) -> LinkState {
         LinkState {

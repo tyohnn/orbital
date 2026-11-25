@@ -12,15 +12,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orbital_core::access::Access;
+use orbital_core::auth::query_value;
 use orbital_core::check::{judge as judge_access, unguarded};
 use orbital_core::describe::changes;
+use orbital_core::google::{IdTokenRefusal, callback_url, judge_id_token, judge_state};
 use orbital_core::manifest::{ServiceKind, ValidManifest};
 use orbital_core::name::{Ident, InstanceId};
 use orbital_core::oauth::registrable_redirect;
 use orbital_core::plan::Names;
 use orbital_core::release::{
-    Aftermath, Approval, Approver, BuiltBy, Change, Migrations, PromoteDenied, Rehearsed, Release,
-    ReleaseId, after_promotion, blockers, promote as judge_promotion,
+    Aftermath, Approval, Approver, BuiltBy, Change, FactoryKey, Migrations, PromoteDenied,
+    Rehearsed, Release, ReleaseId, after_promotion, blockers, missing_keys,
+    promote as judge_promotion,
 };
 use orbital_core::scope::{
     Action, Capability, DenyReason, OrganizationId, Request, Token, Verdict, judge,
@@ -30,8 +33,8 @@ use orbital_pg::auth::AuthStore;
 use orbital_pg::rehearsal::RestorePoint;
 use orbital_proxy::{Route, serve};
 use orbital_router::{
-    Config as RouterConfig, Connect, DocumentFetcher, HttpsFetcher, Mailer, Outbox, SESSION_COOKIE,
-    Stage as RouterStage, Target as RouterTarget, serve as serve_router,
+    Config as RouterConfig, Connect, DocumentFetcher, GoogleDoor, HttpsFetcher, Outbox, Resend,
+    SESSION_COOKIE, Stage as RouterStage, Target as RouterTarget, serve as serve_router,
 };
 use orbital_run::{Job, Runner, Running, free_port, wait_for_port};
 use orbital_source::assemble::{AssembleError, Assembled, assemble};
@@ -42,7 +45,10 @@ use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
+use crate::login::{Endpoints, FactoryGoogleDoor, FactoryMailer, exchange, sha256_hex};
 use crate::registry::{InstanceRecord, ProductionRecord, Registry, ReleaseRecord};
+use crate::seal::SealKey;
+use crate::settings::{Settings, SettingsError};
 use crate::token;
 
 /// 일이 안 됐을 때 부른 쪽에 돌려주는 것. 에이전트가 읽고 고칠 수 있게 적는다.
@@ -63,6 +69,8 @@ pub enum Failure {
         log: String,
     },
     MigrationFailed(String),
+    /// 요청이 틀렸다(위조했거나 만료된 Google 의 `state` 같은). 아무것도 하지 않았다.
+    Invalid(String),
     /// 승격의 규칙이 막았다.
     Denied(PromoteDenied),
     Conflict(String),
@@ -136,6 +144,8 @@ impl Drop for RouterTask {
 struct Launched {
     services: Vec<LiveService>,
     router: RouterTask,
+    /// router 의 바깥 주소.
+    origin: String,
 }
 
 /// 띄울 자리. 미리보기와 운영이 이름 · 비밀 · 서명의 열쇠를 따로 갖는다.
@@ -144,6 +154,10 @@ struct Stand<'a> {
     generated: &'a BTreeMap<String, String>,
     identity_key: &'a [u8],
     stage: Stage,
+    /// 인스턴스가 속한 팩토리. 운영의 메일과 Google 로그인이 이 팩토리의 키를 쓴다.
+    organization: &'a str,
+    /// 인스턴스가 속한 앱의 이름. 메일의 글에 쓴다.
+    app: &'a str,
 }
 
 impl Drop for LiveService {
@@ -160,6 +174,8 @@ impl Drop for LiveService {
 /// 떠 있는 것 하나(미리보기이거나 운영). 서비스가 먼저 내려가고 router 가 뒤에 내려간다.
 struct Live {
     release: String,
+    /// router 의 바깥 주소. Google 의 콜백이 한 번 쓰는 표를 들고 이리로 보낸다.
+    origin: String,
     names: Names,
     manifest: ValidManifest,
     /// 미리보기의 씨앗 사용자. 운영에는 없다.
@@ -176,6 +192,8 @@ struct Target<'a> {
     names: &'a Names,
     generated: &'a BTreeMap<String, String>,
     identity_key: &'a [u8],
+    organization: &'a str,
+    app: &'a str,
 }
 
 /// 승격이 깨지기 앞의 운영.
@@ -257,14 +275,47 @@ pub struct Options {
     /// (service key, 조직). 팩토리의 서버가 쓴다.
     pub service_keys: Vec<(String, String)>,
     pub runner: Box<dyn Runner>,
+    /// 팩토리의 키를 봉인하는 열쇠. 기록 밖에서 온다(`ORBITAL_SEAL_KEY`). 없으면 팩토리가 설정을 넣지 못한다.
+    pub seal_key: Option<SealKey>,
+    /// 레이어의 바깥 주소(`ORBITAL_PUBLIC_URL`). Google 의 콜백이 이 아래(`/v1/auth/google/callback`)에 선다.
+    pub public_url: String,
+    /// 개발용 메일함(`ORBITAL_DEV_MAIL=outbox`). 명시해 켰을 때만, 팩토리의 메일 키가 없어도 운영에 오르고 메일이 `ORBITAL_HOME/outbox.jsonl` 에 쌓인다.
+    pub dev_mailbox: bool,
+    /// Resend 와 Google 의 주소. 테스트가 가짜 서버로 갈아 끼운다.
+    pub endpoints: Endpoints,
+}
+
+impl Options {
+    /// 기본값의 설정. 봉인의 열쇠와 개발용 메일함은 없고, 바깥 주소는 `http://127.0.0.1:7400` 이며, 실제 Resend 와 Google 을 부른다.
+    pub fn new(
+        home: PathBuf,
+        pg_url: String,
+        service_keys: Vec<(String, String)>,
+        runner: Box<dyn Runner>,
+    ) -> Self {
+        Self {
+            home,
+            pg_url,
+            service_keys,
+            runner,
+            seal_key: None,
+            public_url: "http://127.0.0.1:7400".to_owned(),
+            dev_mailbox: false,
+            endpoints: Endpoints::default(),
+        }
+    }
 }
 
 pub struct Layer {
     home: PathBuf,
     /// DB 의 관리 주소. router 가 인증 역할로 붙을 때 사용자와 database 만 바꿔 쓴다.
     pg_url: String,
-    /// 로그인 링크를 보내는 것. 실제 발송기가 붙기 전까지는 `ORBITAL_HOME/outbox.jsonl` 에 쌓는다.
-    mailer: Arc<dyn Mailer>,
+    /// 팩토리의 설정(메일 · Google 의 키). 봉인한 글로만 파일에 있다.
+    settings: Arc<Settings>,
+    /// 개발용 메일함. 명시해 켰을 때만 있다.
+    outbox: Option<Arc<Outbox>>,
+    public_url: String,
+    endpoints: Endpoints,
     /// Client ID Metadata Documents 를 받아 오는 것. 갈아 끼운다(테스트는 가짜를 쓴다).
     documents: Arc<dyn DocumentFetcher>,
     upstream: String,
@@ -311,6 +362,8 @@ fn auth_failure(error: orbital_pg::auth::AuthError) -> Failure {
 
 /// 개발용 메일함의 파일. `ORBITAL_HOME` 아래에 둔다.
 pub const OUTBOX: &str = "outbox.jsonl";
+/// 팩토리의 설정 파일. `ORBITAL_HOME` 아래에 둔다.
+pub const SETTINGS: &str = "settings.json";
 
 fn digest(text: &str) -> [u8; 32] {
     Sha256::digest(text.as_bytes()).into()
@@ -328,6 +381,15 @@ fn blocker_text(blocker: &orbital_core::release::Blocker) -> String {
                 .to_owned()
         }
         Blocker::RehearsalFailed => "마이그레이션의 예행연습이 실패했습니다".to_owned(),
+        Blocker::KeyMissing { key } => key_text(*key),
+    }
+}
+
+/// 팩토리의 키가 없어 막힌 까닭. 에이전트가 고칠 수 없는 일임을 밝힌다.
+pub fn key_text(key: FactoryKey) -> String {
+    match key {
+        FactoryKey::Mail => "팩토리가 메일 발송 키를 넣지 않았습니다. 에이전트가 고칠 수 없는 일입니다. 팩토리의 관리자가 설정(`PUT /v1/settings/auth`)에 Resend 키와 보내는 주소를 넣어야 이메일 링크 로그인이 운영에 오릅니다".to_owned(),
+        FactoryKey::Google => "팩토리가 Google 로그인 키를 넣지 않았습니다. 에이전트가 고칠 수 없는 일입니다. 팩토리의 관리자가 설정(`PUT /v1/settings/auth`)에 Google 클라이언트의 ID 와 비밀을 넣어야 Google 로그인이 운영에 오릅니다".to_owned(),
     }
 }
 
@@ -369,9 +431,15 @@ impl Layer {
             }
         };
 
+        let settings = Settings::open(options.home.join(SETTINGS), options.seal_key)?;
         Ok(Self {
             sources: SourceStore::new(options.home.join("sources")),
-            mailer: Arc::new(Outbox::new(options.home.join(OUTBOX))),
+            settings: Arc::new(settings),
+            outbox: options
+                .dev_mailbox
+                .then(|| Arc::new(Outbox::new(options.home.join(OUTBOX)))),
+            public_url: options.public_url.trim_end_matches('/').to_owned(),
+            endpoints: options.endpoints,
             documents: Arc::new(HttpsFetcher),
             pg_url: options.pg_url,
             upstream,
@@ -769,14 +837,39 @@ impl Layer {
             );
             Arc::new(move || AuthStore::connect(&url, &names, &manifest)) as Connect
         });
+        // 메일과 Google 은 팩토리의 키로 한다. 미리보기의 router 는 메일을 보내지 않고 Google 의 문이 없다
+        let mailer = Arc::new(FactoryMailer {
+            settings: Arc::clone(&self.settings),
+            organization: stand.organization.to_owned(),
+            app: stand.app.to_owned(),
+            resend: Resend::new(&self.endpoints.resend),
+            outbox: self.outbox.clone(),
+        });
+        let declares_google = assembled
+            .manifest
+            .get()
+            .auth
+            .as_ref()
+            .is_some_and(|auth| auth.uses(orbital_core::manifest::Auth::GOOGLE));
+        let google = (stage == Stage::Production && declares_google).then(|| {
+            Arc::new(FactoryGoogleDoor {
+                settings: Arc::clone(&self.settings),
+                organization: stand.organization.to_owned(),
+                instance: instance.as_str().to_owned(),
+                state_key: self.token_key.clone(),
+                callback: callback_url(&self.public_url),
+                authorize_endpoint: self.endpoints.google_authorize.clone(),
+            }) as Arc<dyn GoogleDoor>
+        });
         let config = RouterConfig {
-            origin,
+            origin: origin.clone(),
             manifest: assembled.manifest.clone(),
             names: names.clone(),
             identity_key: stand.identity_key.to_vec(),
             targets,
             auth,
-            mailer: Arc::clone(&self.mailer),
+            mailer,
+            google,
             stage: match stage {
                 Stage::Preview => RouterStage::Preview,
                 Stage::Production => RouterStage::Production,
@@ -786,7 +879,11 @@ impl Layer {
             documents: Arc::clone(&self.documents),
         };
         let router = RouterTask(self.runtime.spawn(serve_router(listener, config)));
-        Ok(Launched { services, router })
+        Ok(Launched {
+            services,
+            router,
+            origin,
+        })
     }
 
     /// 씨앗 사용자의 식별자. 미리보기에만 있다.
@@ -878,6 +975,8 @@ impl Layer {
             generated: &generated,
             identity_key: &identity_key,
             stage: Stage::Preview,
+            organization: &record.organization,
+            app: &record.app,
         };
         let launched = match self.launch(instance, &assembled, &folder, &stand) {
             Ok(launched) => launched,
@@ -922,6 +1021,7 @@ impl Layer {
                 built_by: BuiltBy::Layer,
                 access_findings: findings.len(),
                 rehearsal,
+                missing_keys: self.missing_keys(&record.organization, &assembled.manifest),
             })
             .iter()
             .map(blocker_text)
@@ -955,6 +1055,7 @@ impl Layer {
             (instance.as_str().to_owned(), Stage::Preview),
             Live {
                 release: assembled.release.0.clone(),
+                origin: launched.origin,
                 names,
                 seed_users: Self::seed_ids(&assembled, Stage::Preview),
                 manifest: assembled.manifest.clone(),
@@ -1161,15 +1262,27 @@ impl Layer {
                     .to_owned(),
             )
         })?;
+        let commit = Commit::parse(&known.commit)
+            .ok_or_else(|| internal("release 의 commit 을 읽지 못했습니다"))?;
+        let (access_findings, rehearsal) = (known.access_findings, known.rehearsal);
+        let organization = record.organization.clone();
+        let manifest = self.assembled(instance, &commit)?.manifest;
         let found = blockers(&Release {
             id: ReleaseId(release.to_owned()),
             built_by: BuiltBy::Layer,
-            access_findings: known.access_findings,
-            rehearsal: known.rehearsal,
+            access_findings,
+            rehearsal,
+            missing_keys: self.missing_keys(&organization, &manifest),
         });
         if !found.is_empty() {
             return Err(Failure::Denied(PromoteDenied::Blocked { blockers: found }));
         }
+        let record = inner
+            .registry
+            .state
+            .instances
+            .get_mut(instance.as_str())
+            .ok_or(Failure::NotFound)?;
         record.promotion_requested = Some(release.to_owned());
         inner.registry.save().map_err(Failure::Internal)
     }
@@ -1190,11 +1303,16 @@ impl Layer {
         let mut inner = self.lock();
         let record = Self::owned(&mut inner, organization, instance)?.clone();
         let known = record.releases.get(release).ok_or(Failure::NotFound)?;
+        let commit = Commit::parse(&known.commit)
+            .ok_or_else(|| internal("release 의 commit 을 읽지 못했습니다"))?;
+        let assembled = self.assembled(instance, &commit)?;
         let facts = Release {
             id: ReleaseId(release.to_owned()),
             built_by: BuiltBy::Layer,
             access_findings: known.access_findings,
             rehearsal: known.rehearsal,
+            // 팩토리의 키는 올리는 때의 것을 본다. 앞에서 넣었다가 지웠으면 막힌다
+            missing_keys: self.missing_keys(organization, &assembled.manifest),
         };
         // 승인은 호출에 적힌 release 하나에 묶인다. 승인한 뒤 commit 이 더해졌으면 식별자가 달라 여기서 찾지 못하거나 예행연습이 다시 필요하다
         let approval = Approval {
@@ -1203,9 +1321,6 @@ impl Layer {
         };
         judge_promotion(&facts, change, Some(&approval)).map_err(Failure::Denied)?;
 
-        let commit = Commit::parse(&known.commit)
-            .ok_or_else(|| internal("release 의 commit 을 읽지 못했습니다"))?;
-        let assembled = self.assembled(instance, &commit)?;
         let folder = self.build(instance, &assembled)?;
         let names = Names::new(instance.clone());
         let key = (instance.as_str().to_owned(), Stage::Production);
@@ -1262,6 +1377,8 @@ impl Layer {
             names: &names,
             generated: &generated,
             identity_key: &identity_key,
+            organization: &record.organization,
+            app: &record.app,
         };
         let outcome = self.promote_onto(&mut inner, &target, &scripts);
         let (launched, ran) = match outcome {
@@ -1317,6 +1434,7 @@ impl Layer {
             key,
             Live {
                 release: release.to_owned(),
+                origin: launched.origin,
                 names,
                 manifest: assembled.manifest.clone(),
                 seed_users: Vec::new(),
@@ -1373,6 +1491,8 @@ impl Layer {
             generated: target.generated,
             identity_key: target.identity_key,
             stage: Stage::Production,
+            organization: target.organization,
+            app: target.app,
         };
         let launched = self
             .launch(target.instance, assembled, target.folder, &stand)
@@ -1446,12 +1566,15 @@ impl Layer {
             generated: &production.generated,
             identity_key: &identity_key,
             stage: Stage::Production,
+            organization: &prior.record.organization,
+            app: &prior.record.app,
         };
         if let Ok(launched) = self.launch(prior.instance, &assembled, &folder, &stand) {
             inner.live.insert(
                 (prior.instance.as_str().to_owned(), Stage::Production),
                 Live {
                     release: production.release.clone(),
+                    origin: launched.origin,
                     names: prior.names.clone(),
                     manifest: assembled.manifest.clone(),
                     seed_users: Vec::new(),
@@ -1660,5 +1783,129 @@ impl Layer {
         self.sources.destroy(instance).map_err(internal)?;
         inner.registry.state.instances.remove(instance.as_str());
         inner.registry.save().map_err(Failure::Internal)
+    }
+}
+
+// ---- 팩토리의 설정과 Google 의 콜백 ----
+
+impl Layer {
+    /// 선언의 로그인 방법이 쓰는데 그 팩토리가 넣지 않은 키. 판정은 core 가 한다.
+    fn missing_keys(&self, organization: &str, manifest: &ValidManifest) -> Vec<FactoryKey> {
+        missing_keys(
+            manifest,
+            &self.settings.keys(organization, self.outbox.is_some()),
+        )
+    }
+
+    /// 팩토리의 로그인 설정. 비밀은 싣지 않는다.
+    pub fn auth_settings(&self, organization: &str) -> serde_json::Value {
+        self.settings
+            .view(organization, &callback_url(&self.public_url))
+    }
+
+    /// 팩토리의 로그인 설정을 바꾼다. 봉인의 열쇠가 없는 레이어에서는 409 로 까닭을 알린다.
+    pub fn put_auth_settings(&self, organization: &str, body: &[u8]) -> Outcome<()> {
+        self.settings
+            .update(organization, body)
+            .map_err(|error| match error {
+                SettingsError::Problems(problems) => Failure::Problems(problems),
+                SettingsError::NoSealKey => Failure::Conflict(
+                    "레이어에 봉인의 열쇠가 없어 키를 넣지 못합니다. 레이어의 운영자가 `ORBITAL_SEAL_KEY` 를 넣고 다시 띄워야 합니다".to_owned(),
+                ),
+                SettingsError::Internal(message) => Failure::Internal(message),
+            })
+    }
+
+    /// Google 이 돌려보낸 콜백. `state` 를 확인하고, 그 인스턴스의 팩토리 키로 `code` 를 바꾸고, `id_token` 을 확인한 뒤
+    /// 그 인스턴스에 한 번 쓰는 표를 적고, 인스턴스의 router 로 보낼 주소를 돌려준다.
+    ///
+    /// 위조했거나 만료된 `state` 는 아무것도 하지 않고 거절한다(Google 을 부르지도, 표를 적지도 않는다).
+    /// `state` 가 맞으면 그 뒤의 실패는 앱의 로그인 화면(`login_path?error=<코드>`)으로 보낸다.
+    pub fn google_callback(&self, query: &str) -> Outcome<String> {
+        let bad_state = || {
+            Failure::Invalid(
+                "state 가 틀렸거나 만료되었습니다. 앱의 로그인 화면에서 Google 로 다시 들어와 주세요"
+                    .to_owned(),
+            )
+        };
+        let state = query_value(query, "state")
+            .and_then(|text| token::verify_state(&self.token_key, &text))
+            .ok_or_else(bad_state)?;
+        judge_state(&state, now()).map_err(|_| bad_state())?;
+        let browser_hash = token::unhex(&state.browser_hash)
+            .filter(|hash| hash.len() == 32)
+            .ok_or_else(bad_state)?;
+        let instance = InstanceId::parse(&state.instance).map_err(|_| bad_state())?;
+        let (organization, origin, names, manifest) = {
+            let inner = self.lock();
+            let record = inner
+                .registry
+                .state
+                .instances
+                .get(instance.as_str())
+                .ok_or(Failure::NotFound)?;
+            let live = inner
+                .live
+                .get(&(instance.as_str().to_owned(), Stage::Production))
+                .ok_or(Failure::NotFound)?;
+            (
+                record.organization.clone(),
+                live.origin.clone(),
+                live.names.clone(),
+                live.manifest.clone(),
+            )
+        };
+        let Some(auth) = manifest
+            .get()
+            .auth
+            .as_ref()
+            .filter(|auth| auth.uses(orbital_core::manifest::Auth::GOOGLE))
+        else {
+            return Err(Failure::NotFound);
+        };
+        let to_login = |code: &str| format!("{origin}{}?error={code}", auth.login_path);
+        if query_value(query, "error").is_some() {
+            return Ok(to_login("denied"));
+        }
+        let Some(code) = query_value(query, "code") else {
+            return Ok(to_login("invalid"));
+        };
+        let Some(client) = self.settings.google(&organization) else {
+            return Ok(to_login("unavailable"));
+        };
+        let Ok(token) = exchange(
+            &self.endpoints.google_token,
+            &client,
+            &code,
+            &callback_url(&self.public_url),
+        ) else {
+            return Ok(to_login("unavailable"));
+        };
+        let computed = token.nonce.as_deref().map(sha256_hex);
+        let account = match judge_id_token(
+            &token,
+            &client.client_id,
+            &state.nonce_hash,
+            computed.as_deref(),
+            now(),
+        ) {
+            Ok(account) => account,
+            Err(IdTokenRefusal::EmailNotVerified) => return Ok(to_login("unverified")),
+            Err(_) => return Ok(to_login("invalid")),
+        };
+        let mut store = AuthStore::connect(&self.pg_url, &names, &manifest).map_err(internal)?;
+        let ticket = store
+            .issue_google_ticket(
+                &account.email,
+                &account.subject,
+                &state.next,
+                &browser_hash,
+                now(),
+            )
+            .map_err(internal)?;
+        Ok(format!(
+            "{origin}/_orbital/auth/google/finish?ticket={}",
+            ticket.to_text()
+        ))
     }
 }

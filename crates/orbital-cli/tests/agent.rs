@@ -124,10 +124,13 @@ fn 에이전트가_코드를_받아_고쳐_올리고_미리보기의_주소를_�
 
     // 관리 서버를 실제 HTTP 로 띄운다
     let layer = Layer::open(Options {
-        home: scratch.join("home"),
-        pg_url,
-        service_keys: vec![(FACTORY.to_owned(), "factory".to_owned())],
-        runner: Box::new(LocalRunner::default()),
+        dev_mailbox: true,
+        ..Options::new(
+            scratch.join("home"),
+            pg_url,
+            vec![(FACTORY.to_owned(), "factory".to_owned())],
+            Box::new(LocalRunner::default()),
+        )
     })
     .unwrap();
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();

@@ -7,7 +7,7 @@
 
 ```toml
 [auth]
-methods = ["email_link"]   # 메일로 가는 로그인 링크
+methods = ["email_link"]   # 메일로 가는 로그인 링크. "google" 을 더하면 Google 로그인(아래)
 login_path = "/login"      # 로그인이 필요할 때 레이어가 사람을 보낼 화면
 directory = ["manager"]    # orbital.users(다른 사용자 목록)를 읽을 업무 역할. 없으면 아무도 읽지 못한다
 
@@ -16,6 +16,12 @@ service = "web"
 path = "/mcp"
 consent_path = "/oauth/consent"
 ```
+
+**로그인 방법은 팩토리의 키가 있어야 운영에 오릅니다.** 레이어는 공용 발송 도메인도 공용 Google 클라이언트도 갖지 않습니다.
+`email_link` 는 팩토리의 Resend 키와 보내는 주소가, `google` 은 팩토리의 Google 클라이언트가 있어야 합니다. 키가 없으면
+`orbital preview` 의 「승격을 막는 것」에 「팩토리가 … 키를 넣지 않았습니다」가 나오고 승격 요청이 거절됩니다. **에이전트가 고칠 수 없는 일입니다.**
+코드를 고치거나 선언에서 방법을 빼서 넘기지 말고, 사람에게 「팩토리의 관리자가 설정에 키를 넣어야 한다」고 알립니다.
+키가 없어도 미리보기는 서고, 미리보기에서는 메일이 나가지 않습니다(씨앗 사용자로 들어갑니다).
 
 `[auth.mcp]` 를 두면 레이어가 인가 서버가 되어 `/.well-known/oauth-*`, `/_orbital/oauth/*` 에 답합니다. 앱은 `/mcp` 에서
 Bearer 토큰을 보지 않습니다. 레이어가 확인하고 신원으로 바꿔 넘깁니다.
@@ -27,6 +33,12 @@ Bearer 토큰을 보지 않습니다. 레이어가 확인하고 신원으로 바
 
 - **로그인 화면은 이메일 주소만 다룹니다.** `sendLoginLink({ email, next })` 를 부르고 「메일함을 확인해 주세요」를 보입니다.
   비밀번호 칸을 만들지 않고, 초대받았는지를 화면에서 가르지 않습니다(레이어는 어느 주소에나 같은 답을 줍니다).
+- **Google 로 들어가기**는 단추 하나입니다. `location.href = googleSignInUrl(next)` 로 보내면 레이어가 Google 에 다녀와
+  `next` 로 돌려보냅니다. 선언의 `methods` 에 `google` 이 있고 운영일 때만 열립니다(미리보기에서는 404).
+  본보기 `pages/login.html` 에 숨긴 단추(`#google`)가 있으니 선언에 `google` 을 켤 때 `hidden` 을 지웁니다.
+  같은 이메일이면 이메일 링크로 들어온 사람과 같은 사용자이고, 처음 오는 이메일은 이메일 링크처럼 초대(또는 `signup = "open"`)가 있어야 합니다.
+- **들어오지 못하면** 레이어가 `login_path?error=<코드>` 로 돌려보냅니다. 코드는 `not_invited` · `unverified`(Google 이 확인하지 않은 이메일) ·
+  `expired` · `used` · `other_browser` · `disabled` · `denied`(Google 에서 거절) · `unavailable` · `invalid` 입니다. 화면은 코드마다 사람이 할 일을 적습니다.
 - **누가 들어왔는지**는 `me()` 로 봅니다. 로그인하지 않았으면 `null` 입니다. 나가기는 `logout()` 입니다.
 - **동의 화면은 레이어가 말한 것을 보입니다.** `consentRequest(id)` 가 준 클라이언트 이름 · 돌아갈 곳 · 범위를 글자 그대로
   (`textContent`) 보이고, 거기에 없는 약속을 덧붙이지 않습니다.

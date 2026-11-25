@@ -87,13 +87,14 @@ CREATE POLICY own ON app.note USING (author = (SELECT orbital.subject()));
 const KEY: &[u8] = b"test-signing-key-not-a-real-secret";
 const FAR_FUTURE: u64 = 4_000_000_000;
 const NOW: u64 = 1_800_000_000;
-const TABLES: [&str; 6] = [
+const TABLES: [&str; 7] = [
     "users",
     "user_role",
     "login",
     "invitation",
     "email_link",
     "session",
+    "google_ticket",
 ];
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -277,10 +278,9 @@ fn 업무_역할과_소유자와_마이그레이션_역할은_orbital_auth_의_�
         ("owner", bench.migrator(true)),
     ];
     for (who, client) in &mut clients {
-        for (table, column) in TABLES
-            .iter()
-            .zip(["name", "role", "subject", "roles", "next", "user_id"])
-        {
+        for (table, column) in TABLES.iter().zip([
+            "name", "role", "subject", "roles", "next", "user_id", "next",
+        ]) {
             for statement in [
                 format!("SELECT * FROM orbital_auth.{table}"),
                 format!("DELETE FROM orbital_auth.{table}"),

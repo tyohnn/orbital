@@ -122,6 +122,8 @@ before(async () =>
             ORBITAL_HOME: join(scratch, "home"),
             ORBITAL_PG: pg,
             ORBITAL_SERVICE_KEYS: `factory=${FACTORY}`,
+            // 팩토리의 메일 키 없이 운영에 올린다. 개발용 메일함을 명시해 켠다
+            ORBITAL_DEV_MAIL: "outbox",
             ORBITAL_LISTEN: listen,
         },
     });
