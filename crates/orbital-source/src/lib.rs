@@ -407,6 +407,50 @@ impl SourceStore {
     }
 }
 
+/// 팩토리가 올린 스캐폴드의 묶음을 받아 둔다. 버전(태그와 브랜치)을 모두 받는다.
+///
+/// 인스턴스는 여기의 한 버전에서 갈라진다([`SourceStore::create`]).
+pub fn receive_scaffold(repository: &Path, bundle: &[u8]) -> Result<(), Error> {
+    if !repository.join("HEAD").is_file() {
+        if let Some(parent) = repository.parent() {
+            fs::create_dir_all(parent).map_err(|_| failed("스캐폴드의 폴더를 만들"))?;
+        }
+        let made = Command::new("git")
+            .args(["init", "--quiet", "--bare", "--initial-branch", "main"])
+            .arg(repository)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|_| failed("스캐폴드의 저장소를 만들"))?;
+        if !made.success() {
+            return Err(failed("스캐폴드의 저장소를 만들"));
+        }
+    }
+    let file = repository.join(format!(
+        "incoming-{}-{}.bundle",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::File::create(&file)
+        .and_then(|mut handle| handle.write_all(bundle))
+        .map_err(|_| failed("묶음을 받"))?;
+    let fetched = SourceStore::output(
+        SourceStore::git(repository)
+            .args([
+                "-c",
+                "transfer.fsckObjects=true",
+                "fetch",
+                "--quiet",
+                "--force",
+            ])
+            .arg(&file)
+            .args(["refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"]),
+        "묶음을 읽",
+    );
+    let _ = fs::remove_file(&file);
+    fetched?.map(|_| ()).ok_or(Error::BadBundle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

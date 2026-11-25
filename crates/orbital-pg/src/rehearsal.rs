@@ -40,6 +40,13 @@ pub struct RestorePoint {
 }
 
 impl RestorePoint {
+    /// 적어 둔 이름에서 되돌릴 지점을 다시 가리킨다. 그 이름의 database 가 없으면 `restore` 가 없다고 답한다.
+    pub fn named(database: impl Into<String>) -> Self {
+        Self {
+            database: database.into(),
+        }
+    }
+
     pub fn database(&self) -> &str {
         &self.database
     }
@@ -119,6 +126,27 @@ impl Admin {
                 quote(database)
             ))
             .map_err(pg("database 를 지우"))
+    }
+
+    /// 운영 DB 의 문을 닫고 붙어 있는 연결을 끊는다. 복제는 원본에 다른 연결이 없어야 한다.
+    ///
+    /// 닫혀 있는 동안 앱의 요청은 DB 에 붙지 못한다. 복제가 끝나면 곧바로 [`Admin::resume`] 으로 연다.
+    /// proxy 가 요청을 붙잡아 주기 전까지의 모양이다.
+    pub fn quiesce(&mut self, names: &Names) -> Result<(), Error> {
+        let database = names.database();
+        self.open(&database, false)?;
+        self.cluster
+            .execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1",
+                &[&database],
+            )
+            .map_err(pg("운영 DB 의 연결을 끊"))?;
+        Ok(())
+    }
+
+    /// 닫았던 운영 DB 의 문을 다시 연다.
+    pub fn resume(&mut self, names: &Names) -> Result<(), Error> {
+        self.open(&names.database(), true)
     }
 
     /// 운영 DB 의 사본에 마이그레이션을 미리 돌려 본다. 운영은 건드리지 않고, 사본은 끝나면 지운다.

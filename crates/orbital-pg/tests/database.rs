@@ -1055,3 +1055,36 @@ fn 되돌릴_지점으로_돌아가면_마이그레이션의_기록도_그때로
         1
     );
 }
+
+#[test]
+fn 운영_db_의_문을_닫고_연결을_끊으면_복제할_수_있고_다시_열면_붙는다() {
+    let mut bench = bench!();
+    let mut held = bench.login("api", "employee");
+    bench.admin.quiesce(&bench.names).unwrap();
+    // 닫혀 있는 동안에는 새로 붙지 못하고, 붙어 있던 연결은 끊겼다
+    let login = bench.names.login(&ident("api"), &ident("employee"));
+    assert!(
+        bench
+            .admin
+            .connect_as(&bench.names.database(), &login)
+            .is_err()
+    );
+    assert!(held.query("SELECT 1", &[]).is_err());
+    let result = bench
+        .admin
+        .rehearse(
+            &bench.names,
+            &["ALTER TABLE payroll.payslip ADD COLUMN note text"],
+        )
+        .unwrap();
+    assert!(result.passed);
+    bench.admin.resume(&bench.names).unwrap();
+    assert_eq!(
+        payslip_owners(
+            &mut bench.login("api", "employee"),
+            Some(&bench.identity("emp_1"))
+        )
+        .len(),
+        2
+    );
+}
