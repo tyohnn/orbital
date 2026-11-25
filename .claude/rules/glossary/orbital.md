@@ -21,7 +21,10 @@ paths:
 | 마이그레이션 역할 | 레이어가 배포하는 동안만 들어가 스키마를 바꾸는 역할 | `Names::migrator` |
 | 계획 | DB 에 세울 것을 적은 단계의 목록 | `Step`, `provision`, `grants` |
 | 권한 검사 | 실제 DB 가 선언과 권한 표에 정확히 맞는지 보는 일. 승격의 관문 | `Snapshot`, `Finding`, `check::judge` |
-| 토큰 | 에이전트의 작업 한 번 동안의 권한. 인스턴스 하나, 프리뷰까지 | `Token`, `Capability`, `scope::judge` |
+| 토큰 | 작업 한 번 동안의 권한. 인스턴스 하나, 프리뷰까지. 팩토리의 서버 안에만 있고 에이전트에게 가지 않는다. `source_read` 는 받기만 한다 | `Token`, `Capability`, `scope::judge` |
+| 작업(work) | 팩토리의 서버가 service key 로 열어 토큰을 감싼 것. 그 함수(프리뷰 · 로그 · 리허설 · 승격 요청)와 git 이어 주기(받은 git 요청을 작업의 토큰으로 넘기고 밖에서 온 `Authorization` 은 버린다)는 토큰으로만 부른다 | SDK `works.open`, `Work`, `Work.git.relay` |
+| git 의 길 | 인스턴스마다 레이어가 받는 git 의 smart HTTP 셋(`info/refs` · `git-upload-pack` · `git-receive-pack`). 토큰으로만 열린다. 받는 ref 는 `main` 하나이고 앞으로만 가며, 묶음과 같은 판정과 같은 받는 자리(격리한 폴더에 받아 검사한 뒤 옮긴다)를 지난다 | `git::route`, `git::judge_push`, `SourceStore::ingest` |
+| git 의 자격 | 팩토리가 에이전트에게 내는, 팩토리의 git 원격(`<팩토리>/git/<작업>`)에만 쓰는 자격. 그 작업 하나에서 두 시간 동안 통한다. 레이어는 모른다 | 본보기의 `Works.forGit` |
 | 리허설 | 운영 DB 의 사본에 마이그레이션을 미리 돌리는 일. 숫자만 돌아온다 | `orbital-pg` |
 | 서명된 신원 | router 가 세션을 확인해 서명한 것(`v2`: 사람 · 세션 · 업무 역할). 요청마다 60초짜리로 앱에 싣는다. 행 단위 규칙은 이것만 읽는다 | `orbital-pg::identity`, `Claims` |
 | 역할 제한 정책 | `[auth]` 를 선언한 인스턴스의 표마다 레이어가 두는 제한하는 정책. 연결의 업무 역할이 신원에 없으면 어떤 행도 내주지 않는다 | `Step::SetRolePolicy`, `orbital.granted()`, `ROLE_POLICY` |
@@ -50,7 +53,7 @@ paths:
 | 인증의 주인 | `orbital_auth` 의 표와 `orbital.me` · `orbital.users` 뷰의 주인. 로그인하지 못하고 아무도 이 역할이 되지 못하며 앱의 표에 닿지 못한다 | `Names::auth_owner` |
 | 동적 등록의 한도 | 인스턴스마다 1분에 열 번, 살아 있는 동적 클라이언트 200개. 한 번도 승인받지 못한 것은 하루 뒤에 지운다 | `registration_wait`, `AuthStore::register_dynamic` |
 | 스캐폴드 | 팩토리가 올린 앱의 원본. 버전(태그)이 있고 인스턴스가 그 하나에서 갈라진다 | `receive_scaffold`, `SourceStore::create` |
-| 묶음 | 코드를 주고받는 git bundle. 에이전트가 받아 가서 고친 뒤 올린다 | `SourceStore::bundle` · `receive` |
+| 묶음 | 코드를 주고받는 git bundle. git 의 길과 같은 판정을 지나는 둘째 길이다. 팩토리의 서버와 테스트가 쓴다 | `SourceStore::bundle` · `receive` |
 | release | commit 하나와 거기서 읽은 선언 · 권한 표 · 마이그레이션. 식별자가 commit 에 묶인다 | `ReleaseId`, `Assembled`, `release_id` |
 | 프리뷰 | release 를 씨앗 데이터의 DB 와 함께 임시로 세운 것. 인스턴스마다 하나 | `Layer::preview` |
 | 승격 | 사람이 승인한 release 를 운영에 올리는 일. 팩토리의 서버만 부른다 | `release::promote`, `Layer::promote` |
