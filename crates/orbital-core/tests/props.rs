@@ -648,3 +648,85 @@ mod release {
         }
     }
 }
+
+// ---- 하위 도메인 ----
+
+mod hosts {
+    use orbital_core::host::{BaseDomain, HostTarget, judge_host};
+    use orbital_core::name::InstanceId;
+    use proptest::prelude::*;
+
+    /// 하위 도메인 자리에 올 조각. 머리말이 겹치는 식별자 둘을 두고, 모양이 틀린 것을 섞는다.
+    const LABELS: [&str; 12] = [
+        "k3f9x2ab",
+        "k3f9x2abc",
+        "k3f9x2ab-preview",
+        "k3f9x2abc-preview",
+        "K3F9X2AB",
+        "",
+        "x.k3f9x2ab",
+        "k3f9x2ab-preview-preview",
+        "short",
+        "-preview",
+        "k3f9x2ab.",
+        "k3f9x2ab-Preview",
+    ];
+    /// 기준 도메인 앞에 붙어 인스턴스로 가는 머리. 이 넷 말고는 어디로도 가지 않는다.
+    const HEADS: [(&str, &str, bool); 4] = [
+        ("k3f9x2ab.", "k3f9x2ab", false),
+        ("k3f9x2abc.", "k3f9x2abc", false),
+        ("k3f9x2ab-preview.", "k3f9x2ab", true),
+        ("k3f9x2abc-preview.", "k3f9x2abc", true),
+    ];
+    const SEPARATORS: [&str; 3] = [".", "", ".."];
+    const BASES: [&str; 2] = ["orbital.test", "orbital.test:7480"];
+    const SUFFIXES: [&str; 8] = [
+        "orbital.test",
+        "orbital.test:7480",
+        "orbital.test:7481",
+        "evilorbital.test",
+        "orbital.test.",
+        "test",
+        "orbital.test.other",
+        "",
+    ];
+
+    proptest! {
+        #[test]
+        fn 어떤_호스트든_기준_도메인_아래의_한_조각이_아니면_어느_인스턴스로도_가지_않는다(
+            label in 0..LABELS.len(),
+            separator in 0..SEPARATORS.len(),
+            suffix in 0..SUFFIXES.len(),
+            base in 0..BASES.len(),
+        ) {
+            let head = format!("{}{}", LABELS[label], SEPARATORS[separator]);
+            let host = format!("{head}{}", SUFFIXES[suffix]);
+            let base_text = BASES[base];
+            // 오라클: 꼬리가 기준 도메인과 한 글자도 다르지 않고, 그 앞이 인스턴스 하나의 머리와 한 글자도 다르지 않을 때만 간다
+            let expected = HEADS
+                .iter()
+                .find(|(known, _, _)| SUFFIXES[suffix] == base_text && head == *known)
+                .map(|(_, id, preview)| {
+                    let instance = InstanceId::parse(id).unwrap();
+                    if *preview { HostTarget::Preview(instance) } else { HostTarget::Production(instance) }
+                });
+            let base = BaseDomain::parse(base_text).unwrap();
+            prop_assert_eq!(judge_host(&host, &base), expected, "{}", host);
+        }
+
+        #[test]
+        fn 어떤_호스트든_인스턴스로_간다면_그_호스트는_그_인스턴스의_하위_도메인_그대로다(
+            host in "[a-zA-Z0-9.:-]{0,32}",
+            base in 0..BASES.len(),
+        ) {
+            let base = BaseDomain::parse(BASES[base]).unwrap();
+            if let Some(target) = judge_host(&host, &base) {
+                let canonical = match &target {
+                    HostTarget::Production(instance) => format!("{}.{base}", instance.as_str()),
+                    HostTarget::Preview(instance) => format!("{}-preview.{base}", instance.as_str()),
+                };
+                prop_assert_eq!(host, canonical);
+            }
+        }
+    }
+}
