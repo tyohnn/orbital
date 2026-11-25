@@ -1159,3 +1159,255 @@ fn 너무_큰_올리기와_깨진_pack_은_받지_않고_저장소는_그대로�
     );
     assert_eq!(bench.head(&instance), new);
 }
+
+// ---- 줄인(gzip) 요청 ----
+
+/// 명령 한 번의 머리말로 토큰을 건네고, git 이 HTTP 로 주고받은 머리를 표준 오류에 찍게 한다(`GIT_TRACE_CURL`).
+fn traced_git(folder: &Path, token: &str, args: &[&str]) -> Output {
+    let header = format!("http.extraHeader=Authorization: Bearer {token}");
+    Command::new("git")
+        .current_dir(folder)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_TRACE_CURL", "1")
+        .env("GIT_TRACE_CURL_NO_DATA", "1")
+        .args(["-c", header.as_str()])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// `gzip` 실행 파일로 줄인다.
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut child = Command::new("gzip")
+        .args(["-c", "-9"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let input = bytes.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input).unwrap());
+    let output = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    output.stdout
+}
+
+#[test]
+fn git_이_줄여_보낸_받기_요청을_풀어_받는다() {
+    let mut bench = bench!();
+    let instance = bench.instance();
+    let token = bench.token(&instance, &WORK);
+    // 받는 쪽에 올리지 않은 commit 이 많으면 have 가 많아져 git 이 요청을 줄여(gzip) 보낸다
+    let work = bench.clone(&instance, &token, "many-haves");
+    for at in 0..200 {
+        edit(
+            &work,
+            "LOCAL.md",
+            &format!("{at}\n"),
+            &format!("올리지 않은 {at}"),
+        );
+    }
+    let other = bench.clone(&instance, &token, "other");
+    let pushed = edit(&other, "NEW.md", "새것\n", "새것");
+    ok(bearer_git(
+        &other,
+        &token,
+        &["push", "--quiet", "origin", "main"],
+    ));
+
+    let fetched = traced_git(&work, &token, &["fetch", "origin"]);
+    let trace = String::from_utf8_lossy(&fetched.stderr);
+    assert!(fetched.status.success(), "{trace}");
+    assert!(
+        trace
+            .to_ascii_lowercase()
+            .contains("content-encoding: gzip"),
+        "git 이 요청을 줄이지 않았습니다. 이 테스트는 줄인 요청을 재야 합니다"
+    );
+    assert_eq!(git(&work, &["rev-parse", "origin/main"]), pushed);
+}
+
+#[test]
+fn 직접_줄인_받기_요청도_받고_풀린_크기가_한도를_넘는_요청은_받지_않는다() {
+    let limit = 256 * 1024;
+    let mut bench = bench!(Some(limit));
+    let instance = bench.instance();
+    let token = bench.token(&instance, &WORK);
+    let head = bench.head(&instance);
+    let url = format!("{}/git-upload-pack", bench.remote(&instance));
+    let post = |body: &[u8]| {
+        let response = ureq::post(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Content-Type", "application/x-git-upload-pack-request")
+            .set("Content-Encoding", "gzip")
+            .send_bytes(body);
+        let response = match response {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(error) => panic!("{error}"),
+        };
+        let status = response.status();
+        let mut body = Vec::new();
+        response.into_reader().read_to_end(&mut body).unwrap();
+        (status, body)
+    };
+
+    // 손으로 짠 받기 요청(want 하나, done)을 줄여 보낸다. pack 이 돌아온다
+    let mut request = pkt(&format!("want {head}\n"));
+    request.extend_from_slice(b"0000");
+    request.extend(pkt("done\n"));
+    let (status, body) = post(&gzip(&request));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(body.windows(4).any(|window| window == b"PACK"));
+
+    // 풀면 한도(256KiB)를 넘는 요청(4MiB 의 0 을 줄인 4KiB 남짓): 끝까지 풀지 않고 거절한다
+    let bomb = gzip(&vec![0u8; 4 * 1024 * 1024]);
+    assert!(bomb.len() < limit / 10);
+    let started = std::time::Instant::now();
+    let (status, body) = post(&bomb);
+    assert_eq!(status, 422, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("줄인(gzip) 요청을 풀지 못했습니다"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // 한도에 꼭 맞게 풀리는 요청은 푼다(받기 요청으로는 틀렸으니 git 의 거절이 돌아온다)
+    let (_, body) = post(&gzip(&vec![b'0'; limit]));
+    assert!(
+        !String::from_utf8_lossy(&body).contains("줄인(gzip) 요청을 풀지 못했습니다"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    // 줄인 것이 아닌데 줄였다고 하면 받지 않는다
+    let (status, _) = post(b"not gzip at all");
+    assert_eq!(status, 422);
+}
+
+#[test]
+fn 요청_본문은_한도까지_받고_한_바이트라도_넘으면_413_이다() {
+    let limit = 256 * 1024;
+    let mut bench = bench!(Some(limit));
+    let instance = bench.instance();
+    let token = bench.token(&instance, &WORK);
+    let url = format!("{}/v1/instances/{instance}/source", bench.url);
+    let bearer = format!("Bearer {token}");
+    let at_limit = raw("POST", &url, Some(&bearer), &vec![b'x'; limit]);
+    assert_ne!(at_limit.status, 413, "{}", at_limit.text());
+    let over = raw("POST", &url, Some(&bearer), &vec![b'x'; limit + 1]);
+    assert_eq!(over.status, 413, "{}", over.text());
+    assert!(over.text().contains("너무 큽니다"), "{}", over.text());
+}
+
+// ---- 큰 저장소(무거운 묶음) ----
+
+/// 이 프로세스가 쓴 메모리의 꼭대기(KiB). 레이어가 같은 프로세스에서 돈다. git 의 하위 프로세스는 들지 않는다.
+fn peak_kib() -> u64 {
+    fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// 줄어들지 않는 바이트.
+fn noise(bytes: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    fs::File::open("/dev/urandom")
+        .unwrap()
+        .take(bytes as u64)
+        .read_to_end(&mut out)
+        .unwrap();
+    out
+}
+
+#[test]
+fn 큰_저장소를_git_으로_올리고_받으며_한도를_넘는_올리기는_까닭과_함께_거절한다() {
+    if std::env::var("ORBITAL_FRAMEWORKS").is_err() {
+        eprintln!(
+            "무거운 묶음입니다. ORBITAL_FRAMEWORKS=1 로 돕니다(npm run test:frameworks). 건너뜁니다"
+        );
+        return;
+    }
+    let limit = 48 * 1024 * 1024;
+    let mut bench = bench!(Some(limit));
+    let instance = bench.instance();
+    let token = bench.token(&instance, &WORK);
+    let work = bench.clone(&instance, &token, "big");
+    // 파일 3000 개(작은 글) + 이진 파일 20 개(1MiB 씩)를 commit 셋에 나눠 쌓는다: 이력 약 20MiB 의 줄어들지 않는 것
+    for round in 0..3 {
+        for at in 0..1000 {
+            let folder = work.join(format!("src/{round}/{}", at % 50));
+            fs::create_dir_all(&folder).unwrap();
+            fs::write(
+                folder.join(format!("file-{at}.txt")),
+                format!("{round}-{at}\n").repeat(40),
+            )
+            .unwrap();
+        }
+        for at in 0..7 {
+            fs::write(
+                work.join(format!("blob-{round}-{at}.bin")),
+                noise(1024 * 1024),
+            )
+            .unwrap();
+        }
+        git(&work, &["add", "-A"]);
+        git(
+            &work,
+            &["commit", "--quiet", "-m", &format!("큰 commit {round}")],
+        );
+    }
+    let size = Command::new("git")
+        .current_dir(&work)
+        .args(["count-objects", "-vH"])
+        .output()
+        .unwrap();
+    eprintln!(
+        "잰 것: 큰 저장소 {}",
+        String::from_utf8_lossy(&size.stdout).replace('\n', " ")
+    );
+    let before = peak_kib();
+    let started = std::time::Instant::now();
+    ok(bearer_git(
+        &work,
+        &token,
+        &["push", "--quiet", "origin", "main"],
+    ));
+    let pushed = started.elapsed();
+    let after_push = peak_kib();
+    let started = std::time::Instant::now();
+    let copy = bench.clone(&instance, &token, "big-copy");
+    let cloned = started.elapsed();
+    let after_clone = peak_kib();
+    assert_eq!(
+        git(&copy, &["rev-parse", "HEAD"]),
+        git(&work, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        git(&copy, &["ls-files"]).lines().count(),
+        git(&work, &["ls-files"]).lines().count()
+    );
+    eprintln!(
+        "잰 것: 큰 저장소 올리기 {:.1}초 · 받기 {:.1}초, 이 프로세스(레이어)의 메모리 꼭대기 {} → {}(올린 뒤) → {}(받은 뒤) MiB",
+        pushed.as_secs_f64(),
+        cloned.as_secs_f64(),
+        before / 1024,
+        after_push / 1024,
+        after_clone / 1024
+    );
+
+    // 한도(48MiB)를 넘는 올리기: 줄어들지 않는 60MiB. git 이 무엇을 보는지 적는다
+    let head = bench.head(&instance);
+    fs::write(work.join("huge.bin"), noise(60 * 1024 * 1024)).unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "--quiet", "-m", "한도를 넘는 것"]);
+    let started = std::time::Instant::now();
+    let refused = refused(bearer_git(&work, &token, &["push", "origin", "main"]));
+    eprintln!(
+        "잰 것: 한도를 넘는 올리기는 {:.1}초 만에 거절, git 이 보인 것: {}",
+        started.elapsed().as_secs_f64(),
+        refused.trim().replace('\n', " / ")
+    );
+    assert!(refused.contains("413"), "{refused}");
+    assert_eq!(bench.head(&instance), head);
+}

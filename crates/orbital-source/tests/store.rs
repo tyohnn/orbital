@@ -511,3 +511,71 @@ fn 선언_파일이_없거나_읽히지_않으면_그렇다고_돌려준다() {
     };
     assert!(problems[0].contains("`orbital.toml` 이 없습니다"));
 }
+
+// ---- 줄인(gzip) 요청 풀기 ----
+
+fn gzipped(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut child = Command::new("gzip")
+        .args(["-c", "-9"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let input = bytes.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input).unwrap());
+    let output = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    output.stdout
+}
+
+#[test]
+fn 줄인_요청은_풀린_크기가_한도와_같으면_풀고_한_바이트라도_넘으면_받지_않는다() {
+    let limit = 64 * 1024;
+    for size in [0, 1, limit - 1, limit] {
+        let plain = vec![b'0'; size];
+        assert_eq!(
+            orbital_source::gunzip(&gzipped(&plain), limit)
+                .map(|out| out.len())
+                .ok(),
+            Some(size),
+            "{size}"
+        );
+    }
+    assert!(matches!(
+        orbital_source::gunzip(&gzipped(&vec![b'0'; limit + 1]), limit),
+        Err(Error::BadBundle)
+    ));
+    assert!(matches!(
+        orbital_source::gunzip(b"not gzip", limit),
+        Err(Error::BadBundle)
+    ));
+}
+
+/// 이 프로세스가 쓴 메모리의 꼭대기(KiB).
+fn peak_kib() -> u64 {
+    fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0)
+}
+
+#[test]
+fn 풀면_커지는_요청은_한도까지만_풀고_멈춰_메모리를_한도만큼만_쓴다() {
+    // gzip 은 이어 붙인 조각을 모두 푼다. 1MiB 의 0 을 줄인 조각(1KiB 남짓) 512 개 = 보내는 것 0.5MiB, 풀면 512MiB
+    let piece = gzipped(&vec![0u8; 1024 * 1024]);
+    let bomb: Vec<u8> = piece.repeat(512);
+    assert!(bomb.len() < 1024 * 1024);
+    let before = peak_kib();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        orbital_source::gunzip(&bomb, 1024 * 1024),
+        Err(Error::BadBundle)
+    ));
+    let grew = peak_kib().saturating_sub(before);
+    assert!(grew < 64 * 1024, "풀면서 {grew} KiB 를 더 썼습니다");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}

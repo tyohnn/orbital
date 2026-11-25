@@ -154,25 +154,28 @@ pub fn gunzip(bytes: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
         .spawn()
         .map_err(|_| failed("줄인 요청을 풀"))?;
     let mut stdin = child.stdin.take().ok_or(failed("줄인 요청을 풀"))?;
-    let mut stdout = child.stdout.take().ok_or(failed("줄인 요청을 풀"))?;
+    let stdout = child.stdout.take().ok_or(failed("줄인 요청을 풀"))?;
     let read = std::thread::scope(|scope| {
         scope.spawn(move || {
             let _ = stdin.write_all(bytes);
         });
         let mut out = Vec::new();
+        let mut stdout = stdout;
         let read = std::io::Read::read_to_end(
             &mut std::io::Read::take(&mut stdout, limit as u64 + 1),
             &mut out,
         );
+        // 한도를 넘었으면 끝까지 풀지 않고 멈춘다. 넣는 쪽이 막혀 서로 기다리지 않게 넣는 쪽을 기다리기 전에 멈춘다.
+        // 한도 안에서 끝났으면(풀린 것을 다 읽었으면) 멈추지 않는다. 막 끝나는 중인 것을 멈추면 온전한 요청을 깨진 것으로 본다
+        if read.is_err() || out.len() > limit {
+            let _ = child.kill();
+        }
+        drop(stdout);
         read.map(|_| out)
     });
-    let _ = child.kill();
     let status = child.wait().map_err(|_| failed("줄인 요청을 풀"))?;
     let out = read.map_err(|_| failed("줄인 요청을 풀"))?;
-    if out.len() > limit {
-        return Err(Error::BadBundle);
-    }
-    if !status.success() {
+    if out.len() > limit || !status.success() {
         return Err(Error::BadBundle);
     }
     Ok(out)
