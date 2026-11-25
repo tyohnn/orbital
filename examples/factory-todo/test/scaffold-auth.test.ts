@@ -30,6 +30,15 @@ test("로그인 화면은 이메일 주소만 받고 링크를 보내는 일은 
     assert.doesNotMatch(page, /fetch\(/);
 });
 
+test("Google 단추는 레이어의 시작 주소로만 보내고 선언이 google 을 켜지 않은 동안 숨어 있다", () =>
+{
+    const page = read("pages/login.html");
+    assert.match(page, /googleSignInUrl\(next\)/);
+    assert.match(page, /<button id="google" type="button" hidden>/);
+    // 본보기의 선언은 google 을 켜지 않는다. 팩토리가 키를 넣지 않으면 운영에 오르지 못하기 때문이다
+    assert.match(read("orbital.toml"), /methods = \["email_link"\]/);
+});
+
 test("동의 화면은 레이어가 말한 것을 보이고 사람이 단추를 눌렀을 때만 승인을 보낸다", () =>
 {
     const page = read("pages/consent.html");
