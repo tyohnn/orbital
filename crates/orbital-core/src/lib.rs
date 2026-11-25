@@ -14,6 +14,7 @@ pub mod name;
 pub mod oauth;
 pub mod plan;
 pub mod release;
+pub mod rollout;
 pub mod scope;
 pub mod secrets;
 pub mod sweep;

@@ -350,6 +350,8 @@ fn action() -> impl Strategy<Value = Action> {
         Just(Action::ProductionDatabase),
         Just(Action::SecretsRead),
         Just(Action::SecretsWrite),
+        Just(Action::RolloutView),
+        Just(Action::RolloutManage),
     ]
 }
 
@@ -397,6 +399,7 @@ fn touches_production(action: Action) -> bool {
             | Action::ProductionDatabase
             | Action::SecretsRead
             | Action::SecretsWrite
+            | Action::RolloutManage
     )
 }
 
@@ -666,6 +669,7 @@ mod release {
                 rehearsal,
                 missing_keys: Vec::new(),
                 missing_secrets: Vec::new(),
+                conformance: orbital_core::release::Conformed::NotDeclared,
             })
     }
 
@@ -769,6 +773,7 @@ mod secrets {
                 rehearsal: Rehearsed::Passed,
                 missing_keys: Vec::new(),
                 missing_secrets: missing_secrets(&manifest, &filled),
+                conformance: orbital_core::release::Conformed::NotDeclared,
             };
             // 구현을 부르지 않고 마스크에서 바로 기대값을 찾는다
             let expected: Vec<Blocker> = NAMES
@@ -864,6 +869,237 @@ mod hosts {
                     HostTarget::Preview(instance) => format!("{}-preview.{base}", instance.as_str()),
                 };
                 prop_assert_eq!(host, canonical);
+            }
+        }
+    }
+}
+
+// ---- rollout ----
+
+mod rollout {
+    use orbital_core::name::InstanceId;
+    use orbital_core::release::Change;
+    use orbital_core::rollout::{Event, Progress, Rollout, Status};
+    use orbital_core::scope::{Action, Capability, OrganizationId, Request, Token, Verdict, judge};
+    use proptest::prelude::*;
+
+    /// 머리말이 겹치는 식별자를 섞는다. 마지막 것은 rollout 에 들지 않는 인스턴스로 쓴다.
+    const POOL: [&str; 5] = ["k3f9x2ab", "k3f9x2abc", "zzzzzzzz", "aaaaaaaa", "outsider"];
+
+    fn id(text: &str) -> InstanceId {
+        InstanceId::parse(text).unwrap()
+    }
+
+    /// 인스턴스 둘에서 넷까지를 물결 셋 가운데 하나에 넣는다. 빈 물결은 걷는다.
+    fn waves() -> impl Strategy<Value = Vec<Vec<InstanceId>>> {
+        proptest::collection::vec(0usize..3, 2..=4).prop_map(|places| {
+            let mut waves: Vec<Vec<InstanceId>> = vec![Vec::new(); 3];
+            for (at, wave) in places.iter().enumerate() {
+                waves[*wave].push(id(POOL[at]));
+            }
+            waves.retain(|wave| !wave.is_empty());
+            waves
+        })
+    }
+
+    /// 사건 하나의 재료: (갈래, 인스턴스의 자리, 권한 검사가 통과했나, 다른 change 인가).
+    type Raw = (u8, usize, bool, bool);
+
+    fn raw() -> impl Strategy<Value = Raw> {
+        // 갈래: 0..=2 적용 · 프리뷰 · 검사, 3..=4 승격, 5 되돌려짐, 6 다시 열기, 7 거두기(드물게)
+        (
+            prop_oneof![
+                6 => 0u8..=2,
+                3 => 3u8..=4,
+                1 => Just(5u8),
+                1 => Just(6u8),
+                1 => Just(7u8),
+            ],
+            0usize..5,
+            any::<bool>(),
+            prop_oneof![4 => Just(false), 1 => Just(true)],
+        )
+    }
+
+    /// 재료를 사건으로 옮긴다. 검사의 적합성 테스트 결과는 인스턴스마다 정한 `conforms` 를 따른다.
+    fn event(raw: Raw, conforms: &[bool; 5], cancel: bool) -> Event {
+        let (kind, at, access, other) = raw;
+        let instance = id(POOL[at]);
+        match kind {
+            0 => Event::Applied { instance },
+            1 => Event::Previewed { instance },
+            2 => Event::Checked {
+                instance,
+                access_passed: access,
+                conformance_passed: conforms[at],
+            },
+            3 | 4 => Event::Promoted {
+                instance,
+                change: if other {
+                    Change::FeatureUpdate
+                } else {
+                    Change::SecurityUpdate
+                },
+            },
+            5 => Event::RolledBack { instance },
+            7 if cancel => Event::Cancel,
+            _ => Event::Resume,
+        }
+    }
+
+    fn start(waves: Vec<Vec<InstanceId>>) -> Rollout {
+        Rollout::new(
+            "todo".to_owned(),
+            "a".repeat(40),
+            Change::SecurityUpdate,
+            waves,
+        )
+        .unwrap()
+    }
+
+    fn promoted_count(rollout: &Rollout) -> usize {
+        rollout
+            .progress
+            .values()
+            .filter(|state| **state == Progress::Promoted)
+            .count()
+    }
+
+    proptest! {
+        #[test]
+        fn 멈춘_rollout_에서는_사건이_어떤_순서로_와도_새_승격이_없다(
+            waves in waves(),
+            raws in proptest::collection::vec(raw(), 0..60),
+            conforms in proptest::array::uniform5(prop_oneof![3 => Just(true), 1 => Just(false)]),
+        ) {
+            let mut rollout = start(waves);
+            for raw in raws {
+                let event = event(raw, &conforms, false);
+                let before = promoted_count(&rollout);
+                let halted = rollout.status == Status::Halted;
+                if let Ok(next) = rollout.step(&event) {
+                    if halted {
+                        prop_assert!(promoted_count(&next) <= before, "{:?}", event);
+                    }
+                    rollout = next;
+                }
+            }
+        }
+
+        #[test]
+        fn 적합성_테스트를_통과하지_않은_인스턴스는_사건이_어떤_순서로_와도_승격에_닿지_못한다(
+            waves in waves(),
+            raws in proptest::collection::vec(raw(), 0..60),
+            conforms in proptest::array::uniform5(any::<bool>()),
+        ) {
+            let mut rollout = start(waves);
+            for raw in raws {
+                if let Ok(next) = rollout.step(&event(raw, &conforms, true)) {
+                    rollout = next;
+                }
+                // 오라클: 적합성 테스트를 한 번도 통과하지 못하는 인스턴스는 `promoted` 가 아니다
+                for (at, name) in POOL.iter().enumerate() {
+                    if !conforms[at] {
+                        prop_assert_ne!(rollout.progress.get(&id(name)), Some(&Progress::Promoted));
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn 뒤_물결은_앞_물결이_모두_오른_뒤에만_오른다(
+            waves in waves(),
+            raws in proptest::collection::vec(raw(), 0..80),
+            conforms in proptest::array::uniform5(prop_oneof![5 => Just(true), 1 => Just(false)]),
+        ) {
+            let mut rollout = start(waves.clone());
+            for raw in raws {
+                let Ok(next) = rollout.step(&event(raw, &conforms, false)) else {
+                    continue;
+                };
+                // 새로 오른 인스턴스가 있으면, 그 앞 물결은 모두 이미 올라 있었다
+                for (wave, members) in waves.iter().enumerate() {
+                    for instance in members {
+                        let newly = next.progress.get(instance) == Some(&Progress::Promoted)
+                            && rollout.progress.get(instance) != Some(&Progress::Promoted);
+                        if newly {
+                            for earlier in waves.iter().take(wave).flatten() {
+                                prop_assert_eq!(rollout.progress.get(earlier), Some(&Progress::Promoted));
+                            }
+                        }
+                    }
+                }
+                rollout = next;
+            }
+        }
+    }
+
+    fn capability() -> impl Strategy<Value = Capability> {
+        prop_oneof![
+            Just(Capability::Source),
+            Just(Capability::Preview),
+            Just(Capability::Rehearse),
+            Just(Capability::SecretsRequest)
+        ]
+    }
+
+    /// 토큰에 적어 보낼 능력의 이름. rollout 을 다루는 능력처럼 보이는 이름을 섞는다.
+    fn word() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just("source"),
+            Just("preview"),
+            Just("rehearse"),
+            Just("secrets_request"),
+            Just("rollout"),
+            Just("rollout_manage"),
+            Just("rollouts"),
+            Just("resume"),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn 어떤_토큰으로도_rollout_을_만들거나_다시_여는_능력을_얻지_못한다(
+            can in proptest::collection::btree_set(capability(), 0..=4),
+            token_instance in 0usize..2,
+            request_instance in 0usize..2,
+            at in 0u64..6,
+            words in proptest::collection::vec(word(), 0..5),
+        ) {
+            let token = Token {
+                organization: OrganizationId("org_a".to_owned()),
+                instance: id(POOL[token_instance]),
+                can,
+                expires_at: 5,
+            };
+            let request = Request {
+                organization: OrganizationId("org_a".to_owned()),
+                instance: id(POOL[request_instance]),
+                action: Action::RolloutManage,
+                at,
+            };
+            prop_assert_ne!(judge(&token, &request), Verdict::Allow);
+            // rollout 을 다루는 능력의 이름을 적어 보낸 토큰은 읽히지 않는다
+            let text = serde_json::json!({
+                "organization": "org_a",
+                "instance": "k3f9x2ab",
+                "can": words,
+                "expires_at": 5,
+            })
+            .to_string();
+            let known = words
+                .iter()
+                .all(|word| matches!(*word, "source" | "preview" | "rehearse" | "secrets_request"));
+            let parsed = serde_json::from_str::<Token>(&text);
+            prop_assert_eq!(parsed.is_ok(), known);
+            if let Ok(parsed) = parsed {
+                let request = Request {
+                    organization: parsed.organization.clone(),
+                    instance: parsed.instance.clone(),
+                    action: Action::RolloutManage,
+                    at: 0,
+                };
+                prop_assert_ne!(judge(&parsed, &request), Verdict::Allow);
             }
         }
     }

@@ -84,6 +84,7 @@ fn denied(denied: &PromoteDenied) -> Reply {
                     Blocker::RehearsalFailed => "마이그레이션의 리허설이 실패했습니다".to_owned(),
                     Blocker::KeyMissing { key } => crate::layer::key_text(*key),
                     Blocker::SecretMissing { secret } => crate::layer::secret_text(secret),
+                    Blocker::ConformanceFailed { outcome } => crate::layer::conformance_text(*outcome),
                 })
                 .collect(),
         ),

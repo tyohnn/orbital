@@ -51,13 +51,18 @@ pub enum Action {
     SecretsRead,
     /// 비밀의 값을 넣거나 지우고, 사람의 입력 표를 받는다.
     SecretsWrite,
+    /// 자기 인스턴스가 든 rollout 의 진행(그 인스턴스의 상태 · 업데이트 commit · 멈췄는지)을 본다.
+    RolloutView,
+    /// rollout 을 만들고, 합치기를 부르고, 다시 열고, 거둔다. service key 로만 한다.
+    RolloutManage,
 }
 
 impl Action {
     /// 이 일에 필요한 능력. `None` 이면 토큰으로는 할 수 없는 일이다.
     pub fn needs(&self) -> Option<Capability> {
         match self {
-            Self::SourceRead | Self::SourceWrite => Some(Capability::Source),
+            // 업데이트를 받아 합치는 것이 코드의 일이다
+            Self::SourceRead | Self::SourceWrite | Self::RolloutView => Some(Capability::Source),
             Self::PreviewDeploy
             | Self::PreviewLogs
             | Self::PreviewDatabase
@@ -68,7 +73,8 @@ impl Action {
             | Self::ProductionLogs
             | Self::ProductionDatabase
             | Self::SecretsRead
-            | Self::SecretsWrite => None,
+            | Self::SecretsWrite
+            | Self::RolloutManage => None,
         }
     }
 }

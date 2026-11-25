@@ -23,8 +23,8 @@ use orbital_core::name::{Ident, InstanceId, SecretName};
 use orbital_core::oauth::registrable_redirect;
 use orbital_core::plan::Names;
 use orbital_core::release::{
-    Aftermath, Approval, Approver, BuiltBy, Change, FactoryKey, Migrations, PromoteDenied,
-    Rehearsed, Release, ReleaseId, after_promotion, blockers, missing_keys,
+    Aftermath, Approval, Approver, BuiltBy, Change, Conformed, FactoryKey, Migrations,
+    PromoteDenied, Rehearsed, Release, ReleaseId, after_promotion, blockers, missing_keys,
     promote as judge_promotion,
 };
 use orbital_core::scope::{
@@ -580,7 +580,23 @@ fn blocker_text(blocker: &orbital_core::release::Blocker) -> String {
         Blocker::RehearsalFailed => "마이그레이션의 리허설이 실패했습니다".to_owned(),
         Blocker::KeyMissing { key } => key_text(*key),
         Blocker::SecretMissing { secret } => secret_text(secret),
+        Blocker::ConformanceFailed { outcome } => conformance_text(*outcome),
     }
+}
+
+/// 적합성 테스트를 통과하지 못해 막힌 까닭. 테스트는 위쪽의 것이라 고쳐도 소용없고, 포크의 코드를 고쳐야 함을 밝힌다.
+pub fn conformance_text(outcome: Conformed) -> String {
+    let how = match outcome {
+        Conformed::Failed => "실패했습니다",
+        Conformed::TimedOut => "제한 시간 안에 끝나지 않았습니다",
+        Conformed::NotRun => {
+            "돌지 못했습니다(위쪽의 테스트 폴더를 꺼내지 못했거나 명령을 시작하지 못했습니다)"
+        }
+        Conformed::NotDeclared | Conformed::Passed => "통과했습니다",
+    };
+    format!(
+        "팩토리가 정한 적합성 테스트가 {how}. 테스트는 위쪽(앱)의 것으로 돌아서 포크에서 테스트를 고치거나 지워도 바뀌지 않습니다. 프리뷰의 `conformance.output` 을 보고 앱의 코드를 고친 뒤 프리뷰를 다시 세워 주세요"
+    )
 }
 
 /// 밖에서 넣는 비밀의 운영 값이 없어 막힌 까닭. 에이전트가 고칠 수 없는 일임을 밝힌다.
@@ -1430,6 +1446,7 @@ impl Layer {
                     instance,
                     &assembled.manifest,
                 ),
+                conformance: Conformed::NotDeclared,
             })
             .iter()
             .map(blocker_text)
@@ -1710,6 +1727,7 @@ impl Layer {
             rehearsal,
             missing_keys: self.missing_keys(&organization, &manifest),
             missing_secrets: self.missing_secrets(&organization, instance, &manifest),
+            conformance: Conformed::NotDeclared,
         });
         if !found.is_empty() {
             return Err(Failure::Denied(PromoteDenied::Blocked { blockers: found }));
@@ -1752,6 +1770,7 @@ impl Layer {
             missing_keys: self.missing_keys(organization, &assembled.manifest),
             // 밖에서 넣는 비밀도 올리는 때의 운영 칸을 본다
             missing_secrets: self.missing_secrets(organization, instance, &assembled.manifest),
+            conformance: Conformed::NotDeclared,
         };
         // 승인은 호출에 적힌 release 하나에 묶인다. 승인한 뒤 commit 이 더해졌으면 식별자가 달라 여기서 찾지 못하거나 리허설이 다시 필요하다
         let approval = Approval {

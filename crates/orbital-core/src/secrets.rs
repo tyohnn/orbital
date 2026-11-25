@@ -233,6 +233,7 @@ external = [{external}]
             rehearsal: crate::release::Rehearsed::Passed,
             missing_keys: Vec::new(),
             missing_secrets: missing_secrets(&manifest, &filled),
+            conformance: crate::release::Conformed::NotDeclared,
         };
         assert_eq!(crate::release::blockers(&release), vec![]);
     }

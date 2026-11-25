@@ -49,6 +49,32 @@ pub struct Release {
     /// 선언이 밖에서 넣는다고 적었는데 운영의 값이 없는 비밀. [`crate::secrets::missing_secrets`] 가 셈한다.
     #[serde(default)]
     pub missing_secrets: Vec<SecretName>,
+    /// 위쪽이 정한 적합성 테스트가 프리뷰에서 어떻게 끝났는가.
+    #[serde(default)]
+    pub conformance: Conformed,
+}
+
+/// 적합성 테스트가 어떻게 끝났는가. 위쪽이 선언하지 않았으면 돌릴 것이 없다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Conformed {
+    /// 위쪽(release 가 담은 가장 새 앱의 commit)이 적합성 테스트를 선언하지 않았다.
+    #[default]
+    NotDeclared,
+    Passed,
+    /// 명령이 실패로 끝났다.
+    Failed,
+    /// 명령을 돌리지 못했다(시작하지 못했거나 테스트의 폴더를 꺼내지 못했다).
+    NotRun,
+    /// 제한 시간 안에 끝나지 않아 멈췄다.
+    TimedOut,
+}
+
+impl Conformed {
+    /// 승격을 막지 않는가.
+    pub fn clears(self) -> bool {
+        matches!(self, Self::NotDeclared | Self::Passed)
+    }
 }
 
 /// 운영의 로그인이 쓰는 팩토리의 키. 레이어는 공용 발송 도메인도 공용 Google 클라이언트도 갖지 않는다.
@@ -103,6 +129,10 @@ pub enum Blocker {
     SecretMissing {
         secret: SecretName,
     },
+    /// 위쪽이 정한 적합성 테스트를 통과하지 못했다(실패 · 돌지 않음 · 제한 시간 초과). 포크의 코드를 고쳐 프리뷰를 다시 세워야 한다.
+    ConformanceFailed {
+        outcome: Conformed,
+    },
 }
 
 /// 이 release 의 승격을 막는 것을 모두 돌려준다. 비어 있어야 승격을 요청할 수 있다.
@@ -135,6 +165,11 @@ pub fn blockers(release: &Release) -> Vec<Blocker> {
                 secret: secret.clone(),
             }),
     );
+    if !release.conformance.clears() {
+        found.push(Blocker::ConformanceFailed {
+            outcome: release.conformance,
+        });
+    }
     found
 }
 
@@ -260,6 +295,7 @@ mod tests {
             rehearsal: Rehearsed::Passed,
             missing_keys: Vec::new(),
             missing_secrets: Vec::new(),
+            conformance: Conformed::NotDeclared,
         }
     }
 
@@ -451,8 +487,44 @@ path = "/"
             rehearsal: Rehearsed::Failed,
             missing_keys: vec![FactoryKey::Mail, FactoryKey::Google],
             missing_secrets: vec![SecretName::parse("BANK_API_KEY").unwrap()],
+            conformance: Conformed::Failed,
         };
-        assert_eq!(blockers(&release).len(), 6);
+        assert_eq!(blockers(&release).len(), 7);
+    }
+
+    #[test]
+    fn 적합성_테스트를_통과하지_못한_release_는_승격하지_못한다() {
+        for outcome in [Conformed::Failed, Conformed::NotRun, Conformed::TimedOut] {
+            let mut release = release("r1");
+            release.conformance = outcome;
+            assert_eq!(
+                blockers(&release),
+                vec![Blocker::ConformanceFailed { outcome }]
+            );
+            assert_eq!(
+                promote(
+                    &release,
+                    Change::SecurityUpdate,
+                    Some(&approval("r1", Approver::Factory))
+                ),
+                Err(PromoteDenied::Blocked {
+                    blockers: vec![Blocker::ConformanceFailed { outcome }]
+                })
+            );
+        }
+        // 통과했거나 위쪽이 선언하지 않았으면 막지 않는다
+        for outcome in [Conformed::Passed, Conformed::NotDeclared] {
+            let mut release = release("r1");
+            release.conformance = outcome;
+            assert_eq!(blockers(&release), vec![]);
+        }
+        assert_eq!(
+            serde_json::to_string(&Blocker::ConformanceFailed {
+                outcome: Conformed::TimedOut
+            })
+            .unwrap(),
+            r#"{"blocker":"conformance_failed","outcome":"timed_out"}"#
+        );
     }
 
     #[test]
