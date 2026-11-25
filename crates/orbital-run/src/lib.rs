@@ -13,6 +13,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -286,13 +287,49 @@ impl Runner for LocalRunner {
     }
 }
 
-/// 이 기계에서 비어 있는 포트 하나. 잡았다 놓은 것이라 곧바로 쓴다.
+/// 방금 내준 포트와 그때. 받은 쪽이 듣기 시작하기 전에 같은 포트를 다른 쪽에 내주지 않으려고 잠깐 기억한다.
+static HANDED: Mutex<Vec<(u16, Instant)>> = Mutex::new(Vec::new());
+/// 내준 포트를 기억하는 시간. 앱이 뜨는 데 걸리는 시간(깨우는 한도)보다 넉넉하다.
+const HANDED_FOR: Duration = Duration::from_secs(60);
+
+/// 방금 다른 쪽에 내준 포트인가. 받은 쪽이 아직 듣지 않아 비어 보여도 쓰지 않는다.
+///
+/// 정한 포트나 운영체제가 준 포트에서 바로 듣는 쪽(router · proxy)이 듣기 전에 묻는다. 잡았다 놓은 포트는 받은 프로세스가
+/// 듣기 전까지 비어 있어, 묻지 않으면 그 사이에 같은 포트를 잡는다.
+pub fn handed(port: u16) -> bool {
+    let mut handed = HANDED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    handed.retain(|(_, at)| now.duration_since(*at) < HANDED_FOR);
+    handed.iter().any(|(taken, _)| *taken == port)
+}
+
+/// 포트를 내준 것으로 적는다. 이미 적힌 포트면 `false` 다.
+fn hand(port: u16) -> bool {
+    if handed(port) {
+        return false;
+    }
+    HANDED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((port, Instant::now()));
+    true
+}
+
+/// 이 기계에서 비어 있는 포트 하나. 잡았다 놓은 것이라 곧바로 쓴다. 방금 내준 포트는 다시 내주지 않는다.
 pub fn free_port() -> Option<u16> {
-    TcpListener::bind("127.0.0.1:0")
-        .ok()?
-        .local_addr()
-        .ok()
-        .map(|address| address.port())
+    for _ in 0..64 {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .ok()?
+            .local_addr()
+            .ok()?
+            .port();
+        if hand(port) {
+            return Some(port);
+        }
+    }
+    None
 }
 
 /// 포트가 연결을 받을 때까지 기다린다. 받으면 `true` 다.
@@ -444,6 +481,20 @@ mod tests {
             .unwrap(),
             ..runner()
         }
+    }
+
+    #[test]
+    fn 방금_내준_포트는_비어_보여도_다시_내주지_않는다() {
+        let port = free_port().unwrap();
+        // 받은 쪽이 아직 듣지 않아 포트는 비어 있다. 그래도 장부가 내준 것으로 안다
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+        assert!(handed(port));
+        let others: Vec<u16> = (0..200).map(|_| free_port().unwrap()).collect();
+        assert!(!others.contains(&port));
+        let mut unique = others.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), others.len(), "같은 포트를 두 번 내줬습니다");
     }
 
     #[test]
