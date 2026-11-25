@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # rustup 은 rust-toolchain.toml 의 버전과 구성 요소를 읽어 설치한다
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      # 실제 DB 에 역할을 세우는 테스트가 가장 높은 버전의 PostgreSQL 을 쓴다
+      - run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -sS -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-19
+      - run: PG_DATA=/tmp/orbital-pg sudo -E scripts/pg-local.sh
+      - run: ORBITAL_PG=postgres://postgres@127.0.0.1:54519/postgres npm run pr:check

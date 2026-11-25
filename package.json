@@ -1,0 +1,14 @@
+{
+    "name": "orbital",
+    "private": true,
+    "type": "module",
+    "engines": {
+        "node": ">=26"
+    },
+    "scripts": {
+        "check:layers": "node scripts/check-layers.mjs",
+        "check:claude-md": "node scripts/check-claude-md.mjs",
+        "check": "npm run check:layers && npm run check:claude-md",
+        "pr:check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && npm run check"
+    }
+}
