@@ -567,10 +567,16 @@ fn 보관_기간이_지난_기반_백업과_거기에만_딸린_wal_을_지운�
     let at = bench.moment();
     bench.store.seal(&bench.url()).unwrap();
 
-    // 옛 백업은 보관 기간이 지났고 새 백업은 아직이다
-    let keep_for = 1_000;
-    let now = new.finished_at + 500;
+    // 옛 백업은 보관 기간이 지났고 새 백업은 아직이다. 두 백업 사이가 얼마나 걸렸든 성립하게 그 사이를 보관 기간으로 잡는다
+    // (고정한 숫자로 잡으면 기계가 빨라 두 백업이 그보다 가까이 끝났을 때 앞의 조건이 깨진다)
+    let keep_for = new.finished_at - old.finished_at;
+    assert!(
+        keep_for >= 2,
+        "두 백업이 같은 때에 끝났습니다: {keep_for}ms"
+    );
+    let now = new.finished_at + 1;
     assert!(old.finished_at + keep_for < now);
+    assert!(new.finished_at + keep_for > now);
     let pruning = prune(&bench.store.backups().unwrap(), now, keep_for);
     assert_eq!(pruning.backups, vec![old.id.clone()]);
     bench.store.prune(&pruning).unwrap();
