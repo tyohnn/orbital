@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr as _;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -403,8 +404,31 @@ impl Drop for Bench {
                 );
             }
         }
-        // 놓인 기계가 내려가 있어 걷지 못한 인스턴스의 database 는 관리 역할로 걷는다
+        // 놓인 기계가 내려가 있어 걷지 못한 인스턴스의 database 는 관리 역할로 걷는다. 기록에 이름으로 남은 프리뷰의 것도 걷는다
+        // (테스트가 도중에 실패해 놓인 기계 없이 끝나면 프리뷰의 database 와 역할이 클러스터에 남는다)
         for (instance, _, _) in &self.instances {
+            let preview: Option<String> = Config::from_str(&self.pg_url)
+                .ok()
+                .and_then(|mut config| {
+                    config.dbname(self.control.as_str());
+                    config.connect(NoTls).ok()
+                })
+                .and_then(|mut client| {
+                    client
+                        .query_opt(
+                            "SELECT body ->> 'preview' FROM orbital.instance WHERE id = $1",
+                            &[instance],
+                        )
+                        .ok()
+                        .flatten()
+                })
+                .and_then(|row| row.get(0));
+            if let (Some(preview), Ok(mut admin)) =
+                (preview, orbital_pg::Admin::connect(&self.pg_url))
+                && let Ok(preview) = orbital_core::name::InstanceId::parse(&preview)
+            {
+                let _ = admin.destroy(&orbital_core::plan::Names::new(preview));
+            }
             if let Ok(mut admin) = orbital_pg::Admin::connect(&self.pg_url) {
                 let names = orbital_core::plan::Names::new(
                     orbital_core::name::InstanceId::parse(instance).unwrap(),
@@ -893,8 +917,17 @@ fn 다시_뜰_때_제_기계에_놓인_운영만_되살린다() {
     let (_, their_url) = bench.ship("b", OTHER_FACTORY, &theirs);
     bench.shut("a");
     bench.shut("b");
-    assert!(get(&format!("{our_url}/")).is_none());
-    assert!(get(&format!("{their_url}/")).is_none());
+    // 레이어를 내려도 뒤의 스레드(알림 듣기 · 웹훅 보내기)가 하던 기록의 조회를 마칠 때까지는 router 가 잠깐 더 산다. 곧 내려간다
+    for url in [&our_url, &their_url] {
+        let started = std::time::Instant::now();
+        while get(&format!("{url}/")).is_some() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "내린 관리 서버의 운영이 아직 답합니다"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 
     // a 의 폴더에 b 의 인스턴스의 코드 저장소가 있어도(나눠 쓰는 디스크처럼) a 는 b 에 놓인 운영을 되살리지 않는다
     copy_tree(
