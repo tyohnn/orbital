@@ -316,7 +316,7 @@ impl Layer {
 
     /// 사건을 차례로 넘긴다. 받지 않은 사건은 버린다(그 까닭은 승격할 때 다시 판정한다). rollout 의 줄을 잠그고 고친다.
     pub(super) fn record(&self, id: &str, events: &[Event]) -> Outcome<()> {
-        self.records.update_rollout(id, |record| {
+        self.records.update_rollout(id, (self.clock)(), |record| {
             for event in events {
                 if let Ok(next) = record.rollout.step(event) {
                     record.rollout = next;
@@ -543,7 +543,7 @@ impl Layer {
     fn decide(&self, organization: &str, id: &str, event: &Event) -> Outcome<RolloutReport> {
         self.owned_rollout(organization, id)?;
         self.records
-            .update_rollout(id, |record| -> Outcome<RolloutReport> {
+            .update_rollout(id, (self.clock)(), |record| -> Outcome<RolloutReport> {
                 let next = record
                     .rollout
                     .step(event)

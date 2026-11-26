@@ -13,3 +13,4 @@ pub mod seal;
 pub mod settings;
 pub mod token;
 pub mod vault;
+pub mod webhook;

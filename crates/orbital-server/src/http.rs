@@ -9,6 +9,7 @@
 //! 조직은 자기 열쇠를 더 내고(`POST /v1/keys`, 값은 그 답에만) 보고(`GET /v1/keys`, 값 없이) 거둔다(`DELETE /v1/keys/{id}`).
 //! 운영자의 길(`/v1/operator/…`)은 운영자의 열쇠로만 열리고 조직을 만들고 보고 닫고 열쇠를 낸다. 운영자의 열쇠로는 조직의 일을 하지 못한다.
 //! 팩토리의 로그인 설정(`/v1/settings/auth`)은 service key 에만 있고, 넣은 비밀은 어떤 답에도 싣지 않는다.
+//! 이벤트(`GET /v1/events?after=&limit=`)와 웹훅(`/v1/settings/webhook`)도 service key 에만 있다. 웹훅의 서명 비밀은 걸 때의 답에만 실린다.
 //! 밖에서 넣는 비밀(`/v1/instances/{id}/secrets`)의 값은 service key 와 입력 표(`POST /v1/secret-entries`, 표는 `Authorization: Bearer`)로만 들어오고 어떤 열쇠로도 나가지 않는다.
 //! 입력 표의 길은 쿠키도 키도 보지 않고 표만 보며, 사람의 브라우저(팩토리의 카드)가 다른 출처에서 부르므로 CORS 를 연다.
 //! 무엇이 허락되는지는 여기서 정하지 않는다. 토큰은 core 의 `scope::judge` 가, 승격은 core 의 `release::promote` 가 판정한다.
@@ -589,6 +590,18 @@ fn with_service_key(
             layer.put_auth_settings(&organization, body)?;
             Ok(ok(layer.auth_settings(&organization)))
         }
+        // 이 조직의 이벤트(차례대로)와 웹훅. 서명의 비밀은 걸 때의 답에만 실린다
+        ("GET", ["events"]) => Ok(ok(layer.list_events(&organization, query)?)),
+        ("GET", ["settings", "webhook"]) => {
+            Ok(ok(json!({ "webhook": layer.webhook(&organization)? })))
+        }
+        ("PUT", ["settings", "webhook"]) => {
+            let (webhook, secret) = layer.set_webhook(&organization, body)?;
+            Ok(ok(json!({ "webhook": webhook, "secret": secret })))
+        }
+        ("DELETE", ["settings", "webhook"]) => Ok(ok(
+            json!({ "removed": layer.remove_webhook(&organization)? }),
+        )),
         // 복구 훈련이 통과했는지와 숫자만
         ("GET", ["backup"]) => Ok(ok(json!(layer.backup_status(&organization)?))),
         ("PUT", ["apps", app]) => {
@@ -1007,6 +1020,10 @@ pub fn handle_request(layer: &Layer, call: &Call<'_>) -> Reply {
             // rollout 을 만들고 · 합치고 · 다시 열고 · 거두는 길을 토큰으로 두드리면 core 가 「service key 로만」이라고 답한다
             ["apps", _, "rollouts"] | ["rollouts", ..] => layer
                 .authorize_own(bearer, Action::RolloutManage)
+                .map(|()| ok(json!({}))),
+            // 조직의 이벤트와 웹훅도 토큰으로 두드리면 core 가 「service key 로만」이라고 답한다
+            ["events"] | ["settings", "webhook"] => layer
+                .authorize_own(bearer, Action::Events)
                 .map(|()| ok(json!({}))),
             _ => Err(Failure::NotFound),
         }

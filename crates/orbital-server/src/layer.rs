@@ -75,9 +75,12 @@ use crate::settings::{Settings, SettingsError};
 use crate::token;
 use crate::vault::{RedeemError, SecretValue, Vault, VaultError};
 
+mod events;
 mod organizations;
 mod rollout;
 
+pub use events::DeliveryReport;
+use orbital_core::event::{Body as EventBody, Note};
 use orbital_core::rollout::Event as RolloutEvent;
 pub use organizations::{IssuedKey, OrganizationReport, key_refusal_text};
 use rollout::refusal_text;
@@ -627,6 +630,16 @@ pub struct Options {
     /// 다른 관리 서버에서 닿는 이 기계의 공용 listener(`ORBITAL_MACHINE_ROUTER_URL`, `http://` 만). 하위 도메인을 쓰는 레이어에서
     /// 다른 기계가 받은 이 기계에 놓인 인스턴스의 고객 요청을 이리로 넘긴다. 없으면 다른 기계는 그 요청에 404 로 답한다.
     pub machine_router_url: Option<String>,
+    /// 개발용 웹훅(`ORBITAL_DEV_WEBHOOK=private`). 명시해 켰을 때만 웹훅의 주소로 `http://` 와 loopback · 사설 주소를 받는다.
+    /// 로컬의 받는 서버로 재는 테스트와 개발에만 쓴다. 꺼져 있으면 `https://` 와 바깥(공인)의 주소만 받는다.
+    pub dev_webhooks: bool,
+    /// 웹훅의 호스트를 푸는 것. 테스트가 갈아 끼워 「사설 주소로 풀리는 이름」을 만든다.
+    pub webhook_resolver: Arc<dyn crate::webhook::Resolve>,
+    /// 웹훅 하나를 보내고 답을 기다리는 시간의 상한(기본 10초). 연결을 맺는 데는 이것과 5초 가운데 짧은 것을 쓴다.
+    pub webhook_timeout: Duration,
+    /// 웹훅을 보내는 뒤의 스레드가 보는 간격(기본 1초). `None` 이면 스레드를 띄우지 않는다(테스트가 `deliver_due` 를 바로 부른다).
+    /// 봉인의 열쇠가 없는 레이어는 웹훅을 걸 수 없어 띄우지 않는다.
+    pub webhook_every: Option<Duration>,
 }
 
 /// 하위 도메인으로 인스턴스를 가르는 레이어의 설정.
@@ -674,6 +687,10 @@ impl Options {
             token_key: None,
             machine_url: None,
             machine_router_url: None,
+            dev_webhooks: false,
+            webhook_resolver: Arc::new(crate::webhook::SystemResolver),
+            webhook_timeout: Duration::from_secs(10),
+            webhook_every: Some(Duration::from_secs(1)),
         }
     }
 }
@@ -763,6 +780,8 @@ pub struct LayerCore {
     sealed_plaintext: usize,
     /// 인스턴스마다의 빌드 자물쇠. 빌드는 레이어의 자물쇠(`inner`) 밖에서 돌고, 같은 인스턴스의 빌드와 빌드 폴더 걷기만 한 줄로 세운다.
     building: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    /// 웹훅을 보내는 설정.
+    webhooks: events::Webhooks,
     inner: Mutex<Inner>,
 }
 
@@ -1012,10 +1031,14 @@ impl Layer {
                 let (vault_changed, more) = vault.reseal(previous)?;
                 unopened.extend(more);
                 unopened.extend(production.unopened.iter().cloned());
+                let (webhook_changed, more) =
+                    records.reseal_webhooks(previous).map_err(|error| error.0)?;
+                unopened.extend(more);
                 Some(crate::seal::Resealed {
                     settings: settings_changed,
                     vault: vault_changed,
                     production: production.resealed,
+                    webhook: webhook_changed,
                     unopened,
                 })
             }
@@ -1106,6 +1129,16 @@ impl Layer {
             operator_key: options.operator_key.as_deref().map(digest),
             test_instance_limit: options.test_instance_limit,
             building: Mutex::new(BTreeMap::new()),
+            webhooks: events::Webhooks {
+                allow: if options.dev_webhooks {
+                    orbital_core::webhook::Allow::Development
+                } else {
+                    orbital_core::webhook::Allow::Public
+                },
+                resolver: options.webhook_resolver,
+                timeout: options.webhook_timeout,
+                swept_at: Mutex::new(None),
+            },
             resealed,
             restoring: Mutex::new(BTreeSet::new()),
             inner: Mutex::new(Inner {
@@ -1116,6 +1149,9 @@ impl Layer {
         }));
         layer.restore();
         layer.listen_for_refresh();
+        if let (Some(every), true) = (options.webhook_every, layer.records.sealing()) {
+            layer.deliver_in_background(every);
+        }
         Ok(layer)
     }
 
@@ -1697,6 +1733,16 @@ impl Layer {
                 machine: self.machine().to_owned(),
                 ..InstanceRecord::default()
             },
+            (
+                (self.clock)(),
+                &[Note {
+                    instance: Some(instance.clone()),
+                    body: EventBody::InstanceCreated {
+                        app: app.to_string(),
+                        version: version.to_owned(),
+                    },
+                }],
+            ),
             |state, existing| self.judge_new_instance(state, existing),
         );
         if let Err(error) = written {
@@ -2810,10 +2856,19 @@ impl Layer {
         if !found.is_empty() {
             return Err(Failure::Denied(PromoteDenied::Blocked { blockers: found }));
         }
-        self.update(instance, |record| {
-            record.promotion_requested = Some(release.to_owned());
-            Ok(())
-        })
+        self.records
+            .update_instance_noting(instance.as_str(), (self.clock)(), |record, notes| {
+                record.promotion_requested = Some(release.to_owned());
+                notes.push(Note {
+                    instance: Some(instance.clone()),
+                    body: EventBody::PromotionRequested {
+                        release: release.to_owned(),
+                        commit: commit.to_string(),
+                    },
+                });
+                Ok::<(), Failure>(())
+            })?
+            .ok_or(Failure::NotFound)
     }
 }
 
@@ -2972,6 +3027,23 @@ impl Layer {
                     names: &names,
                 };
                 let failure = self.back_out(&mut inner, &prior, point.as_ref(), kind, failure);
+                // 운영은 바꾸지 않았으므로(되돌렸다) 인스턴스의 줄을 고치는 트랜잭션이 없다. 되돌린 바로 뒤에 따로 쌓는다
+                self.note_after(
+                    organization,
+                    &[Note {
+                        instance: Some(instance.clone()),
+                        body: EventBody::PromotionFailed {
+                            release: release.to_owned(),
+                            commit: commit.to_string(),
+                            previous_release: record
+                                .production
+                                .as_ref()
+                                .map(|production| production.release.clone()),
+                            migrated,
+                            rollout: governing.clone(),
+                        },
+                    }],
+                );
                 // 업데이트를 담은 release 가 서지 못하고 되돌려졌다. 그 인스턴스는 실패로 적히고 rollout 이 멈춘다
                 if let Some(id) = &governing {
                     let _ = self.record(
@@ -3017,11 +3089,26 @@ impl Layer {
             origin: Some(launched.origin.clone()),
             manifest: Some(assembled.manifest.get().clone()),
         };
-        self.update(instance, |stored| {
-            stored.production = Some(production);
-            stored.promotion_requested = None;
-            Ok(())
-        })?;
+        let succeeded = EventBody::PromotionSucceeded {
+            release: release.to_owned(),
+            commit: commit.to_string(),
+            previous_release: production.previous.clone(),
+            change,
+            approved_by,
+            migrations: u32::try_from(report.migrations.len()).unwrap_or(u32::MAX),
+            rollout: governing.clone(),
+        };
+        self.records
+            .update_instance_noting(instance.as_str(), (self.clock)(), |stored, notes| {
+                stored.production = Some(production);
+                stored.promotion_requested = None;
+                notes.push(Note {
+                    instance: Some(instance.clone()),
+                    body: succeeded,
+                });
+                Ok::<(), Failure>(())
+            })?
+            .ok_or(Failure::NotFound)?;
         if let Some(id) = &governing {
             self.record(
                 id,
@@ -3528,10 +3615,21 @@ impl Layer {
                     .map_err(|_| internal("인스턴스의 빌드 폴더를 걷지 못했습니다"))?;
             }
         }
-        // 기록의 줄을 지운다. 그 인스턴스의 일정 · 금고의 값 · 요청 · 입력 표 · 닫은 작업도 함께 지워진다
+        // 기록의 줄을 지운다. 그 인스턴스의 일정 · 금고의 값 · 요청 · 입력 표 · 닫은 작업도 함께 지워진다.
+        // `instance.deleted` 는 같은 트랜잭션에 쌓는다
         drop(inner);
         self.records
-            .remove_instance(instance.as_str())
+            .remove_instance(
+                instance.as_str(),
+                &record.organization,
+                (self.clock)(),
+                &[Note {
+                    instance: Some(instance.clone()),
+                    body: EventBody::InstanceDeleted {
+                        app: record.app.clone(),
+                    },
+                }],
+            )
             .map_err(Failure::from)
     }
 }
@@ -3817,7 +3915,7 @@ impl Layer {
             ));
         }
         self.vault
-            .request(instance, &name, reason.trim(), (self.clock)())
+            .request(organization, instance, &name, reason.trim(), (self.clock)())
             .map_err(vault_failure)
     }
 

@@ -60,6 +60,11 @@ pub fn production_binding(organization: &str, instance: &str, field: &str) -> St
     format!("orbital/production/v1\n{organization}\n{instance}\n{field}")
 }
 
+/// 웹훅의 서명 비밀의 봉인이 무엇의 것인지. 조직이 다르면 같은 열쇠로도 풀리지 않는다. 머리말이 달라 다른 봉인과 섞이지 않는다.
+pub fn webhook_binding(organization: &str) -> String {
+    format!("orbital/webhook/v1\n{organization}\nsecret")
+}
+
 /// 봉인한다. 운영체제의 무작위 값을 얻지 못하면 `None` 이다.
 pub fn seal(key: &SealKey, bound_to: &str, plain: &str) -> Option<String> {
     let mut nonce = [0u8; NONCE];
@@ -110,7 +115,9 @@ pub struct Resealed {
     pub vault: usize,
     /// 운영의 신원 열쇠와 레이어가 만든 비밀에서 바꾼 칸.
     pub production: usize,
-    /// 어느 열쇠로도 풀리지 않아 그대로 둔 줄의 이름(`settings <조직> <칸>`, `vault <인스턴스> <단계> <이름>`, `production <인스턴스> <칸>`).
+    /// 웹훅의 서명 비밀에서 바꾼 줄.
+    pub webhook: usize,
+    /// 어느 열쇠로도 풀리지 않아 그대로 둔 줄의 이름(`settings <조직> <칸>`, `vault <인스턴스> <단계> <이름>`, `production <인스턴스> <칸>`, `webhook <조직>`).
     pub unopened: Vec<String>,
 }
 

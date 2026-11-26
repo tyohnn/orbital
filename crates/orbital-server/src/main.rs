@@ -36,6 +36,11 @@
 //!   평문이던 줄을 봉인으로 바꾼다. 기록(control database)과 다른 자리에 둔다. 바꾸면 앞에서 넣은 키와 값이 풀리지 않아 다시 넣어야 한다
 //! - `ORBITAL_DEV_MAIL`: `outbox` 일 때만 개발용 메일함을 켠다. 팩토리의 메일 키가 없어도 운영에 오르고, 로그인 링크를 보내지 않고
 //!   `ORBITAL_HOME/outbox.jsonl`(주인만 읽는 파일)에 한 줄씩 쌓는다. 테스트가 이 파일에서 링크를 꺼낸다. 운영의 레이어에서는 켜지 않는다
+//! - `ORBITAL_DEV_WEBHOOK`: `private` 일 때만 개발용 웹훅을 켠다. 웹훅의 주소로 `http://` 와 loopback · 사설 · CGNAT · ULA 주소를 받는다
+//!   (link-local 과 메타데이터 주소는 그래도 받지 않는다). 로컬의 받는 서버로 재는 테스트와 개발에만 쓰고, 운영의 레이어에서는 켜지 않는다.
+//!   켜지 않으면 웹훅은 `https://` 이고 호스트가 바깥(공인)의 주소로만 풀려야 하며, 보낼 때마다 풀어 판정한 그 주소에 붙는다.
+//!   웹훅(`PUT /v1/settings/webhook`)은 봉인의 열쇠(`ORBITAL_SEAL_KEY`)가 있는 레이어에서만 건다. 서명의 비밀을 봉인해 기록에 두기 때문이다.
+//!   보내는 일은 관리 서버마다 1초마다 보고, 여러 관리 서버 가운데 하나만 같은 이벤트를 보낸다
 //! - `ORBITAL_SLEEP_AFTER`: 마지막 요청이 끝난 뒤 이 초만큼 요청이 없으면 서버 서비스의 프로세스를 내린다(기본 300). 다음 요청에 깬다
 //! - `ORBITAL_BASE_DOMAIN`: 기준 도메인(`apps.factory.example`, 로컬이면 `orbital.localhost:7480` 처럼 바깥 포트까지). 주면
 //!   `<인스턴스>.<기준 도메인>` 이 운영, `<인스턴스>-preview.<기준 도메인>` 이 프리뷰의 주소가 되고, 모든 인스턴스의 요청을
@@ -254,6 +259,15 @@ fn start() -> Result<(), String> {
         }
         Err(_) => false,
     };
+    let dev_webhooks = match std::env::var("ORBITAL_DEV_WEBHOOK") {
+        Ok(mode) if mode == "private" => true,
+        Ok(_) => {
+            return Err(
+                "`ORBITAL_DEV_WEBHOOK` 은 `private` 만 받습니다. 개발용 웹훅을 쓰지 않으려면 지워 주세요".to_owned(),
+            );
+        }
+        Err(_) => false,
+    };
     let public_url =
         std::env::var("ORBITAL_PUBLIC_URL").unwrap_or_else(|_| format!("http://{listen}"));
     let sleep_after = match std::env::var("ORBITAL_SLEEP_AFTER") {
@@ -341,6 +355,7 @@ fn start() -> Result<(), String> {
             .filter(|url| !url.trim().is_empty()),
         operator_key,
         test_instance_limit,
+        dev_webhooks,
         ..Options::new(
             setting("ORBITAL_HOME")?.into(),
             setting("ORBITAL_PG")?,
@@ -356,8 +371,8 @@ fn start() -> Result<(), String> {
     if let Some(resealed) = layer.resealed() {
         // 줄의 수와 이름만 찍는다. 값은 없다
         eprintln!(
-            "orbitald: 봉인을 새 열쇠로 다시 했습니다(설정 {}줄 · 금고 {}줄 · 운영 {}칸). 확인했으면 `ORBITAL_SEAL_KEY_PREVIOUS` 를 빼고 다시 띄워 주세요",
-            resealed.settings, resealed.vault, resealed.production
+            "orbitald: 봉인을 새 열쇠로 다시 했습니다(설정 {}줄 · 금고 {}줄 · 운영 {}칸 · 웹훅 {}줄). 확인했으면 `ORBITAL_SEAL_KEY_PREVIOUS` 를 빼고 다시 띄워 주세요",
+            resealed.settings, resealed.vault, resealed.production, resealed.webhook
         );
         for name in &resealed.unopened {
             eprintln!("orbitald: 어느 열쇠로도 풀리지 않아 그대로 둔 줄: {name}");
@@ -381,6 +396,11 @@ fn start() -> Result<(), String> {
     eprintln!("orbitald: http://{listen} 에서 듣습니다");
     if let Some(address) = layer.router_address() {
         eprintln!("orbitald: 인스턴스의 하위 도메인은 {address} 에서 받습니다");
+    }
+    if dev_webhooks {
+        eprintln!(
+            "orbitald: 개발용 웹훅을 켰습니다. 웹훅의 주소로 `http://` 와 loopback · 사설 주소를 받습니다. 운영의 레이어에서는 끄세요"
+        );
     }
     if dev_mailbox {
         eprintln!(

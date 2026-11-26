@@ -2149,7 +2149,7 @@ fn 인스턴스의_어떤_역할도_control_database_에_접속하지_못한다(
 }
 
 #[test]
-fn 인스턴스를_지우면_control_database_의_그_줄들도_모두_지워진다() {
+fn 인스턴스를_지우면_control_database_의_그_줄들도_이벤트의_기록_밖에서는_모두_지워진다() {
     let mut bench = bench!();
     let instance = one_on_a(&mut bench);
     bench.ship("a", FACTORY, &instance);
@@ -2226,5 +2226,22 @@ fn 인스턴스를_지우면_control_database_의_그_줄들도_모두_지워진
     for table in tables {
         assert_eq!(count(&bench, table), 0, "{table}");
     }
+    // 이벤트의 기록(`event`)만 보관 기간 동안 그 인스턴스의 이름을 남긴다. 몸에는 이름과 숫자만 있다
+    let events: Vec<String> = bench
+        .control()
+        .query(
+            "SELECT type FROM orbital.event WHERE instance = $1 ORDER BY id",
+            &[&instance],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(events.first().map(String::as_str), Some("instance.created"));
+    assert_eq!(events.last().map(String::as_str), Some("instance.deleted"));
+    bench
+        .control()
+        .execute("DELETE FROM orbital.event", &[])
+        .unwrap();
     assert!(!bench.everything().contains(&instance));
 }

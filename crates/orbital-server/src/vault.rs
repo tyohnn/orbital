@@ -446,21 +446,36 @@ impl Vault {
     }
 
     /// 에이전트의 요청을 적는다. 같은 이름의 앞 요청은 새 것으로 바뀐다.
+    /// 요청을 적고, 같은 트랜잭션에 `secret.requested` 이벤트(이름만)를 쌓는다.
     pub fn request(
         &self,
+        organization: &str,
         instance: &InstanceId,
         name: &SecretName,
         reason: &str,
         at: u64,
     ) -> Result<(), VaultError> {
-        self.records
-            .client()?
+        let mut client = self.records.client()?;
+        let mut transaction = client.transaction().map_err(db("적"))?;
+        transaction
             .execute(
                 "INSERT INTO orbital.secret_request (instance, name, reason, at) VALUES ($1, $2, $3, $4)
                  ON CONFLICT (instance, name) DO UPDATE SET reason = excluded.reason, at = excluded.at",
                 &[&instance.as_str(), &name.as_str(), &reason, &signed(at)],
             )
             .map_err(db("적"))?;
+        crate::records::append_in(
+            &mut transaction,
+            organization,
+            at,
+            &[orbital_core::event::Note {
+                instance: Some(instance.clone()),
+                body: orbital_core::event::Body::SecretRequested {
+                    name: name.as_str().to_owned(),
+                },
+            }],
+        )?;
+        transaction.commit().map_err(db("적"))?;
         Ok(())
     }
 

@@ -430,6 +430,7 @@ impl Records {
         &self,
         id: &str,
         record: &InstanceRecord,
+        (now, notes): (u64, &[orbital_core::event::Note]),
         judge: impl FnOnce(Option<&OrganizationState>, u32) -> Result<(), E>,
     ) -> Result<(), E> {
         let body = self.encode(id, record)?;
@@ -451,6 +452,7 @@ impl Records {
                 &[&id, &record.organization, &record.app, &record.machine, &body],
             )
             .map_err(pg("적"))?;
+        super::append_in(&mut transaction, &record.organization, now, notes)?;
         transaction.commit().map_err(pg("적"))?;
         Ok(())
     }

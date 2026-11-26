@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use orbital_core::backup::DrillRecord;
 use orbital_core::control::{Known, MigrationRefusal, pending};
+use orbital_core::event::{Note, rollout_notes};
 use orbital_core::name::Ident;
 use postgres::{Client, Config, NoTls, Transaction};
 use sha2::{Digest, Sha256};
@@ -28,8 +29,11 @@ use crate::registry::{InstanceRecord, RolloutRecord, ScheduleRecord, ScheduleRun
 use crate::seal::{Rekeyed, SealKey, open, production_binding, reseal, seal};
 use crate::token::hex;
 
+mod events;
 mod organizations;
 
+pub(crate) use events::append_in;
+pub use events::{Attempt, Delivered, DeliveryRow, EventRow, Head, Miss, WebhookRow};
 pub use organizations::{FoundKey, KeyRow, NewKey, OrganizationRow};
 
 /// control database 의 기본 이름(`ORBITAL_CONTROL_DB`).
@@ -40,7 +44,7 @@ pub const DEFAULT_MACHINE: &str = "local";
 pub const REFRESH_CHANNEL: &str = "orbital_refresh";
 
 /// 저장소에 둔 control database 의 마이그레이션(파일 이름, 내용). 번호는 이름의 앞 네 자리다.
-pub const MIGRATIONS: [(&str, &str); 3] = [
+pub const MIGRATIONS: [(&str, &str); 4] = [
     (
         "0001_records.sql",
         include_str!("../migrations/0001_records.sql"),
@@ -52,6 +56,10 @@ pub const MIGRATIONS: [(&str, &str); 3] = [
     (
         "0003_organizations.sql",
         include_str!("../migrations/0003_organizations.sql"),
+    ),
+    (
+        "0004_events.sql",
+        include_str!("../migrations/0004_events.sql"),
     ),
 ];
 
@@ -494,6 +502,11 @@ impl Records {
         })
     }
 
+    /// 봉인의 열쇠가 있는가.
+    pub fn sealing(&self) -> bool {
+        self.seal.is_some()
+    }
+
     /// 이 관리 서버의 기계.
     pub fn machine(&self) -> &str {
         self.machine.as_str()
@@ -764,6 +777,17 @@ impl Records {
         id: &str,
         change: impl FnOnce(&mut InstanceRecord) -> Result<T, E>,
     ) -> Result<Option<T>, E> {
+        self.update_instance_noting(id, 0, |record, _| change(record))
+    }
+
+    /// [`Records::update_instance`] 와 같고, `change` 가 적은 이벤트를 같은 트랜잭션에 쌓는다(`now` 의 때로).
+    /// 고친 것이 commit 될 때만 이벤트가 남고, 이벤트를 쌓지 못하면 고친 것도 적지 않는다.
+    pub fn update_instance_noting<T, E: From<RecordError>>(
+        &self,
+        id: &str,
+        now: u64,
+        change: impl FnOnce(&mut InstanceRecord, &mut Vec<Note>) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
         let mut client = self.client()?;
         let mut transaction = client.transaction().map_err(pg("고치"))?;
         let Some(row) = transaction
@@ -780,7 +804,8 @@ impl Records {
             (row.get(0), row.get(1), row.get(2)),
             &row.get::<_, String>(3),
         )?;
-        let made = change(&mut record)?;
+        let mut notes = Vec::new();
+        let made = change(&mut record, &mut notes)?;
         let body = self.encode(id, &record)?;
         transaction
             .execute(
@@ -788,16 +813,27 @@ impl Records {
                 &[&id, &body],
             )
             .map_err(pg("고쳐 적"))?;
+        append_in(&mut transaction, &record.organization, now, &notes)?;
         transaction.commit().map_err(pg("고쳐 적"))?;
         Ok(Some(made))
     }
 
     /// 인스턴스를 지운다. 그 인스턴스의 일정 · 금고의 값 · 요청 · 입력 표 · 닫은 작업도 함께 지워진다(외래 키의 `CASCADE`).
-    pub fn remove_instance(&self, id: &str) -> Result<(), RecordError> {
-        self.client()?
+    /// 이벤트(`notes`)는 같은 트랜잭션에 쌓는다. 이벤트의 줄은 지우지 않는다(보관 기간 동안 남는다).
+    pub fn remove_instance(
+        &self,
+        id: &str,
+        organization: &str,
+        now: u64,
+        notes: &[Note],
+    ) -> Result<(), RecordError> {
+        let mut client = self.client()?;
+        let mut transaction = client.transaction().map_err(pg("지우"))?;
+        transaction
             .execute("DELETE FROM orbital.instance WHERE id = $1", &[&id])
             .map_err(pg("지우"))?;
-        Ok(())
+        append_in(&mut transaction, organization, now, notes)?;
+        transaction.commit().map_err(pg("지우"))
     }
 
     // ---- 앱 ----
@@ -981,10 +1017,12 @@ impl Records {
         Ok(())
     }
 
-    /// rollout 의 줄을 잠그고 읽어 고친 뒤 적는다. 없으면 `None` 이다.
+    /// rollout 의 줄을 잠그고 읽어 고친 뒤 적는다. 없으면 `None` 이다. 진행이나 상태가 바뀌었으면 그 이벤트
+    /// (core 의 `event::rollout_notes`)를 같은 트랜잭션에 `now` 의 때로 쌓는다.
     pub fn update_rollout<T, E: From<RecordError>>(
         &self,
         id: &str,
+        now: u64,
         change: impl FnOnce(&mut RolloutRecord) -> Result<T, E>,
     ) -> Result<Option<T>, E> {
         let mut client = self.client()?;
@@ -1000,6 +1038,7 @@ impl Records {
         };
         let mut record: RolloutRecord =
             serde_json::from_str(&row.get::<_, String>(0)).map_err(json("읽"))?;
+        let before = record.rollout.clone();
         let made = change(&mut record)?;
         let body = serde_json::to_string(&record).map_err(json("적"))?;
         transaction
@@ -1008,6 +1047,8 @@ impl Records {
                 &[&id, &body],
             )
             .map_err(pg("고쳐 적"))?;
+        let notes = rollout_notes(id, &before, &record.rollout);
+        append_in(&mut transaction, &record.organization, now, &notes)?;
         transaction.commit().map_err(pg("고쳐 적"))?;
         Ok(Some(made))
     }
