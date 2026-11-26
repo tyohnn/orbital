@@ -59,6 +59,8 @@ pub enum Action {
     RolloutManage,
     /// 운영 DB 를 지난 시점으로 되살린다. service key 로만 한다.
     RestoreInstance,
+    /// 조직의 이벤트를 보고 웹훅을 걸고 뗀다. service key 로만 한다(작업의 토큰은 인스턴스 하나의 일만 한다).
+    Events,
 }
 
 impl Action {
@@ -80,7 +82,8 @@ impl Action {
             | Self::SecretsRead
             | Self::SecretsWrite
             | Self::RolloutManage
-            | Self::RestoreInstance => None,
+            | Self::RestoreInstance
+            | Self::Events => None,
         }
     }
 }

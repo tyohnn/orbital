@@ -48,10 +48,12 @@ pub enum Errand {
     Traffic,
     /// 조직과 그 service key 를 보기 · 내기 · 거두기와, 운영자가 조직을 만들고 닫기. 기록에만 닿는다.
     Organization,
+    /// 조직의 이벤트를 보기와 웹훅을 걸고 떼기. 기록에만 닿는다.
+    Events,
 }
 
 impl Errand {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::SourceBundle,
         Self::Push,
         Self::Git,
@@ -71,6 +73,7 @@ impl Errand {
         Self::App,
         Self::Traffic,
         Self::Organization,
+        Self::Events,
     ];
 }
 
@@ -105,7 +108,8 @@ pub fn reach(errand: Errand) -> Reach {
         | Errand::Users
         | Errand::Secrets
         | Errand::Rollout
-        | Errand::Organization => Reach::Anywhere,
+        | Errand::Organization
+        | Errand::Events => Reach::Anywhere,
     }
 }
 
@@ -201,6 +205,7 @@ mod tests {
             Errand::Secrets,
             Errand::Rollout,
             Errand::Organization,
+            Errand::Events,
         ];
         // 모든 일이 두 갈래 가운데 하나에 든다
         assert_eq!(placed.len() + anywhere.len(), Errand::ALL.len());

@@ -356,6 +356,7 @@ fn action() -> impl Strategy<Value = Action> {
         Just(Action::RolloutView),
         Just(Action::RolloutManage),
         Just(Action::RestoreInstance),
+        Just(Action::Events),
     ]
 }
 
@@ -394,7 +395,7 @@ fn request() -> impl Strategy<Value = Request> {
     )
 }
 
-/// 운영을 바꾸는 일. 구현의 `Action::needs` 와 따로 적는다.
+/// 토큰으로 하지 못하는 일: 운영을 바꾸는 일과 조직 전체의 일(이벤트 · 웹훅). 구현의 `Action::needs` 와 따로 적는다.
 fn touches_production(action: Action) -> bool {
     matches!(
         action,
@@ -405,6 +406,7 @@ fn touches_production(action: Action) -> bool {
             | Action::SecretsWrite
             | Action::RolloutManage
             | Action::RestoreInstance
+            | Action::Events
     )
 }
 
@@ -1494,13 +1496,14 @@ mod placement {
     use proptest::prelude::*;
 
     /// 어느 기계나 하는 일. 구현의 `reach` 를 부르지 않고 따로 적는다(기록과 인스턴스의 DB 에만 닿는 일).
-    const ANYWHERE: [Errand; 6] = [
+    const ANYWHERE: [Errand; 7] = [
         Errand::Work,
         Errand::ProductionView,
         Errand::Users,
         Errand::Secrets,
         Errand::Rollout,
         Errand::Organization,
+        Errand::Events,
     ];
 
     fn errand() -> impl Strategy<Value = Errand> {
@@ -1677,6 +1680,196 @@ mod organization {
                 judge_key(&key(Kind::Test)).map(|caller| caller.organization),
                 judge_key(&key(Kind::Live)).map(|caller| caller.organization)
             );
+        }
+    }
+}
+
+mod webhook {
+    use orbital_core::webhook::{
+        Address, Allow, ResolveRefusal, UrlProblem, judge_address, judge_resolved, judge_url,
+    };
+    use proptest::prelude::*;
+
+    /// 안쪽의 IPv4 대역(앞 바이트, 고정된 비트 수). 구현을 부르지 않고 따로 적는다.
+    const INSIDE_V4: [([u8; 2], u32); 7] = [
+        ([10, 0], 8),
+        ([172, 16], 12),
+        ([192, 168], 16),
+        ([127, 0], 8),
+        ([169, 254], 16),
+        ([100, 64], 10),
+        ([0, 0], 8),
+    ];
+
+    /// 대역 안의 아무 주소. 고정된 비트는 대역의 것을, 나머지는 무작위를 쓴다.
+    fn inside_v4() -> impl Strategy<Value = [u8; 4]> {
+        (0usize..INSIDE_V4.len(), any::<u32>()).prop_map(|(at, noise)| {
+            let ([a, b], bits) = INSIDE_V4[at];
+            let base = u32::from_be_bytes([a, b, 0, 0]);
+            let mask = u32::MAX << (32 - bits);
+            ((base & mask) | (noise & !mask)).to_be_bytes()
+        })
+    }
+
+    /// 안쪽의 IPv6: loopback · link-local(fe80::/10) · ULA(fc00::/7).
+    fn inside_v6() -> impl Strategy<Value = [u16; 8]> {
+        (0u8..3, any::<[u16; 8]>()).prop_map(|(kind, mut segments)| {
+            match kind {
+                0 => segments = [0, 0, 0, 0, 0, 0, 0, 1],
+                1 => segments[0] = 0xfe80 | (segments[0] & 0x003f),
+                _ => segments[0] = 0xfc00 | (segments[0] & 0x01ff),
+            }
+            segments
+        })
+    }
+
+    /// 공인 대역의 앞 바이트. 이 /8 안에는 남겨 둔 대역이 없다.
+    fn public_v4() -> impl Strategy<Value = [u8; 4]> {
+        let firsts: Vec<u8> = (1u8..=223)
+            .filter(|first| !matches!(first, 10 | 100 | 127 | 169 | 172 | 192 | 198 | 203))
+            .collect();
+        (proptest::sample::select(firsts), any::<[u8; 3]>())
+            .prop_map(|(first, [b, c, d])| [first, b, c, d])
+    }
+
+    fn allow() -> impl Strategy<Value = Allow> {
+        prop_oneof![Just(Allow::Public), Just(Allow::Development)]
+    }
+
+    proptest! {
+        #[test]
+        fn 어떤_사설_loopback_link_local_주소도_받지_않는다(v4 in inside_v4(), v6 in inside_v6()) {
+            prop_assert!(judge_address(Address::V4(v4), Allow::Public).is_err(), "{:?}", v4);
+            prop_assert!(judge_address(Address::V6(v6), Allow::Public).is_err(), "{:?}", v6);
+        }
+
+        #[test]
+        fn link_local_은_메타데이터_주소를_품어_개발용_레이어에서도_받지_않는다(
+            noise in any::<u16>(), segments in any::<[u16; 7]>()
+        ) {
+            let [c, d] = noise.to_be_bytes();
+            prop_assert!(judge_address(Address::V4([169, 254, c, d]), Allow::Development).is_err());
+            let mut v6 = [0xfe80 | (noise & 0x003f), 0, 0, 0, 0, 0, 0, 0];
+            v6[1..].copy_from_slice(&segments);
+            prop_assert!(judge_address(Address::V6(v6), Allow::Development).is_err());
+        }
+
+        #[test]
+        fn ipv4_로_사상된_ipv6_는_안의_주소가_무엇이든_받지_않는다(v4 in any::<[u8; 4]>(), allow in allow()) {
+            let [a, b, c, d] = v4;
+            let mapped = [0, 0, 0, 0, 0, 0xffff, u16::from_be_bytes([a, b]), u16::from_be_bytes([c, d])];
+            prop_assert!(judge_address(Address::V6(mapped), allow).is_err());
+        }
+
+        #[test]
+        fn 공인_대역의_주소는_받는다(v4 in public_v4()) {
+            prop_assert_eq!(judge_address(Address::V4(v4), Allow::Public), Ok(()));
+        }
+
+        #[test]
+        fn 풀어_나온_주소_가운데_하나라도_안쪽이면_받지_않는다(
+            outside in proptest::collection::vec(public_v4(), 0..5), inside in inside_v4(), at in 0usize..6
+        ) {
+            let mut addresses: Vec<Address> = outside.iter().copied().map(Address::V4).collect();
+            let at = at.min(addresses.len());
+            addresses.insert(at, Address::V4(inside));
+            let judged = judge_resolved(&addresses, Allow::Public);
+            prop_assert!(matches!(judged, Err(ResolveRefusal::Inside { .. })), "{:?}", judged);
+            addresses.remove(at);
+            let expected = if addresses.is_empty() { Err(ResolveRefusal::Empty) } else { Ok(()) };
+            prop_assert_eq!(judge_resolved(&addresses, Allow::Public), expected);
+        }
+
+        #[test]
+        fn 사용자_이름을_적은_주소는_어떤_호스트든_받지_않는다(
+            user in "[a-z0-9:]{0,12}", host in "[a-z0-9.]{1,20}", allow in allow()
+        ) {
+            let problems = judge_url(&format!("https://{user}@{host}/hook"), allow).unwrap_err();
+            prop_assert!(problems.contains(&UrlProblem::Credentials));
+        }
+    }
+}
+
+mod event {
+    use orbital_core::event::{GIVE_UP_AFTER, Retry, after_failure, rollout_notes};
+    use orbital_core::name::InstanceId;
+    use orbital_core::release::Change;
+    use orbital_core::rollout::{Event, Rollout};
+    use proptest::prelude::*;
+
+    const POOL: [&str; 3] = ["k3f9x2ab", "k3f9x2abc", "zzzzzzzz"];
+
+    fn id(text: &str) -> InstanceId {
+        InstanceId::parse(text).unwrap()
+    }
+
+    fn event(kind: u8, at: usize, pass: bool) -> Event {
+        let instance = id(POOL[at]);
+        match kind {
+            0 => Event::Applied { instance },
+            1 => Event::Previewed { instance },
+            2 => Event::Checked {
+                instance,
+                access_passed: pass,
+                conformance_passed: true,
+            },
+            3 => Event::Promoted {
+                instance,
+                change: Change::SecurityUpdate,
+            },
+            4 => Event::RolledBack { instance },
+            5 => Event::Resume,
+            _ => Event::Cancel,
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn 다시_보내는_때는_언제나_지금보다_뒤이고_처음_실패에서_하루를_넘지_않는다(
+            failures in 1u32..64, since in 0u64..1_000_000_000, elapsed in 0u64..GIVE_UP_AFTER
+        ) {
+            let now = since + elapsed;
+            match after_failure(failures, since, now) {
+                Retry::At(next) => {
+                    prop_assert!(next > now);
+                    prop_assert!(next <= since + GIVE_UP_AFTER);
+                }
+                Retry::GiveUp => prop_assert!(false, "하루 안에서 그만뒀습니다"),
+            }
+        }
+
+        #[test]
+        fn 처음_실패에서_하루가_지난_뒤의_실패는_언제나_그만둔다(
+            failures in 1u32..64, since in 0u64..1_000_000_000, late in 0u64..10_000_000
+        ) {
+            prop_assert_eq!(after_failure(failures, since, since + GIVE_UP_AFTER + late), Retry::GiveUp);
+        }
+
+        #[test]
+        fn rollout_의_사건이_어떤_순서로_와도_바뀐_인스턴스마다_하나_상태가_바뀌면_하나가_나온다(
+            raws in proptest::collection::vec((0u8..7, 0usize..3, any::<bool>()), 0..40)
+        ) {
+            let mut rollout = Rollout::new(
+                "todo".to_owned(),
+                "a".repeat(40),
+                Change::SecurityUpdate,
+                vec![vec![id(POOL[0]), id(POOL[1])], vec![id(POOL[2])]],
+            ).unwrap();
+            for (kind, at, pass) in raws {
+                let before = rollout.clone();
+                let after = before.step(&event(kind, at, pass)).unwrap_or_else(|_| before.clone());
+                let notes = rollout_notes("r1", &before, &after);
+                let moved = after.progress.iter().filter(|(instance, state)| before.progress.get(*instance) != Some(*state)).count();
+                let advanced = notes.iter().filter(|note| note.body.kind() == "rollout.advanced").count();
+                prop_assert_eq!(advanced, moved);
+                let status = notes.len() - advanced;
+                prop_assert_eq!(status, usize::from(before.status != after.status));
+                // 진행이 먼저이고 상태가 뒤다
+                if status == 1 {
+                    prop_assert_ne!(notes.last().map(|note| note.body.kind()), Some("rollout.advanced"));
+                }
+                rollout = after;
+            }
         }
     }
 }
