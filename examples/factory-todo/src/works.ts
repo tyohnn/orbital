@@ -26,7 +26,7 @@ export interface Opened
 
 export interface Works
 {
-    /** 고객의 인스턴스에 작업을 새로 연다. 작업과 그 git 의 자격(한 번만 돌려준다)을 돌려준다 */
+    /** 고객의 인스턴스에 작업을 새로 연다. 그 고객의 앞 작업은 닫는다(레이어에서 거두고 git 의 자격도 끊는다). 작업과 그 git 의 자격(한 번만 돌려준다)을 돌려준다 */
     open(customer: string, instance: string): Promise<{ opened: Opened; credential: string }>;
     /** 고객의 살아 있는 가장 새 작업. 없으면 `undefined` 다 */
     current(customer: string): Opened | undefined;
@@ -55,6 +55,16 @@ export function createWorks(orbital: Orbital, now: () => number = () => Math.flo
         async open(customer, instance)
         {
             sweep();
+            // 앞 작업을 닫는다. 그 토큰과 git 의 자격은 다음 요청부터 통하지 않는다
+            for (const [id, entry] of works)
+            {
+                if (entry.customer === customer)
+                {
+                    works.delete(id);
+                    // 레이어가 닫지 못해도(잠깐 닿지 않아도) 이 프로세스의 자격은 이미 끊었다. 레이어의 토큰은 길어야 두 시간 뒤 만료된다
+                    await entry.work.close().catch(() => undefined);
+                }
+            }
             const work = await orbital.works.open({ instance, can: AGENT_CAN, ttlSeconds: AGENT_TTL_SECONDS });
             const id = randomBytes(12).toString("hex");
             const credential = `fgit_${randomBytes(24).toString("base64url")}`;

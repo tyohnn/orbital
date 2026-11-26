@@ -885,7 +885,7 @@ fn nestjs_와_vite_앱이_한_저장소에서_빌드되어_api_는_api_에서_�
 }
 
 #[test]
-fn nestjs_의_급여_일정은_운영에서_그_시각에_레이어가_부르고_앱은_그_머리말로_레이어가_부른_것을_안다()
+fn nestjs_의_급여_일정은_운영에서_그_시각에_레이어가_부르고_급여_관리자의_역할로_급여_표를_읽고_쓴다()
  {
     let mut bench = bench!("hr", example("hr-nest-vite"));
     let instance = bench.instance();
@@ -901,8 +901,29 @@ fn nestjs_의_급여_일정은_운영에서_그_시각에_레이어가_부르고
             .as_bytes(),
     );
     assert_eq!(status, 200, "{body}");
+    // 승인 카드에 일정이 도는 역할이 선다
+    assert!(
+        preview["changes"].to_string().contains(
+            "일정 `/api/jobs/payroll`(`0 9 25 * *`, UTC)이 `payroll_admin` 역할로 돕니다"
+        ),
+        "{preview}"
+    );
     let (production, _) = bench.promote(&instance, &token, &release);
     let origin = service_url(&production, "web");
+    // 운영에 사람 둘과 앞달의 명세 하나(씨앗 데이터는 운영에 들지 않는다)
+    let mut config: postgres::Config = bench.pg_url.parse().unwrap();
+    config.dbname(&format!("i_{instance}"));
+    let mut admin = config.connect(postgres::NoTls).unwrap();
+    admin
+        .batch_execute(
+            "INSERT INTO orbital_auth.users (id, email, created_at) VALUES
+                ('u_aaaaaaaaaaaaaaaaaaaa', 'kim@example.com', now()), ('u_bbbbbbbbbbbbbbbbbbbb', 'lee@example.com', now());
+             INSERT INTO hr.department (id, name) VALUES ('dev', '개발팀');
+             INSERT INTO hr.person (id, name, department) VALUES
+                ('u_aaaaaaaaaaaaaaaaaaaa', '김개발', 'dev'), ('u_bbbbbbbbbbbbbbbbbbbb', '이개발', 'dev');
+             INSERT INTO payroll.payslip (employee, month, amount) VALUES ('u_aaaaaaaaaaaaaaaaaaaa', '2000-01', 3100000);",
+        )
+        .unwrap();
     // 2026-11-25 08:59:30 UTC: 다음 때는 09:00 이다
     let before = 1_795_597_170;
     let tick = |bench: &Bench, at: u64| {
@@ -933,6 +954,23 @@ fn nestjs_의_급여_일정은_운영에서_그_시각에_레이어가_부르고
     assert_eq!(payroll["last_run"]["due_at"], json!(1_795_597_200u64));
     // 다음은 12월 25일 09:00 이다
     assert_eq!(payroll["next_at"], json!(1_798_189_200u64));
+    // 급여 관리자의 역할만 실린 신원으로 역할 제한 정책을 지나 사람마다 이달의 명세를 만들었다
+    let made: Vec<(String, i32)> = admin
+        .query(
+            "SELECT employee, amount FROM payroll.payslip WHERE month <> '2000-01' ORDER BY employee",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        made,
+        vec![
+            ("u_aaaaaaaaaaaaaaaaaaaa".to_owned(), 3_100_000),
+            ("u_bbbbbbbbbbbbbbbbbbbb".to_owned(), 0)
+        ]
+    );
     // 밖에서는 그 머리말을 실어도 닿지 못한다
     let agent = ureq::AgentBuilder::new().redirects(0).build();
     let outside = agent

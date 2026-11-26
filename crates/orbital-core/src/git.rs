@@ -79,6 +79,28 @@ impl Route {
     }
 }
 
+impl Route {
+    /// 이 길이 받는 요청의 `Content-Type`. 객체를 주고받는 `POST` 에만 있고 광고(`GET`)에는 없다.
+    pub fn request_type(self) -> Option<&'static str> {
+        match self {
+            Self::Advertise(_) => None,
+            Self::Exchange(Service::UploadPack) => Some("application/x-git-upload-pack-request"),
+            Self::Exchange(Service::ReceivePack) => Some("application/x-git-receive-pack-request"),
+        }
+    }
+
+    /// 요청의 `Content-Type` 을 받는가. 객체를 주고받는 길은 그 길의 git 의 것만 받는다(대소문자와 `;` 뒤의 매개변수는 보지 않는다).
+    /// 브라우저의 폼이 보낼 수 있는 모양(`text/plain` · `application/x-www-form-urlencoded` · `multipart/form-data`)으로는 닿지 못한다.
+    pub fn accepts(self, content_type: Option<&str>) -> bool {
+        let Some(expected) = self.request_type() else {
+            return true;
+        };
+        content_type
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
+    }
+}
+
 /// `…/git/` 뒤의 경로와 질의에서 길을 고른다. 정해진 셋이 아니면 `None` 이다.
 pub fn route(method: &str, tail: &[&str], query: &str) -> Option<Route> {
     match (method, tail) {
@@ -380,6 +402,32 @@ mod tests {
             old: old.to_owned(),
             new: new.to_owned(),
         }
+    }
+
+    #[test]
+    fn 객체를_주고받는_요청은_그_길의_git_의_content_type_만_받는다() {
+        let upload = Route::Exchange(Service::UploadPack);
+        let receive = Route::Exchange(Service::ReceivePack);
+        assert!(upload.accepts(Some("application/x-git-upload-pack-request")));
+        assert!(upload.accepts(Some(
+            "Application/X-Git-Upload-Pack-Request; charset=binary"
+        )));
+        assert!(receive.accepts(Some("application/x-git-receive-pack-request")));
+        for wrong in [
+            None,
+            Some(""),
+            Some("application/x-git-receive-pack-request"),
+            Some("application/x-git-upload-pack-requestx"),
+            Some("application/json"),
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+            Some("multipart/form-data; boundary=x"),
+        ] {
+            assert!(!upload.accepts(wrong), "{wrong:?}");
+        }
+        assert!(!receive.accepts(Some("application/x-git-upload-pack-request")));
+        // 광고(`GET`)는 본문이 없어 무엇이든 받는다
+        assert!(Route::Advertise(Service::UploadPack).accepts(None));
     }
 
     #[test]

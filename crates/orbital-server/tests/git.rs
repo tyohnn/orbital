@@ -129,6 +129,12 @@ fn raw(method: &str, url: &str, authorization: Option<&str>, body: &[u8]) -> Ans
     if let Some(value) = authorization {
         request = request.set("Authorization", value);
     }
+    // git 이 싣는 것처럼 객체를 주고받는 요청에는 그 길의 `Content-Type` 을 싣는다
+    for service in ["git-upload-pack", "git-receive-pack"] {
+        if method == "POST" && url.ends_with(service) {
+            request = request.set("Content-Type", &format!("application/x-{service}-request"));
+        }
+    }
     let response = if method == "GET" {
         request.call()
     } else {
@@ -896,6 +902,164 @@ fn 만료된_토큰은_진행_중인_git_요청도_거절한다() {
             &format!("{remote}/git-upload-pack"),
             Some(&bearer),
             &want
+        )
+        .status,
+        200
+    );
+}
+
+#[test]
+fn 받기의_답은_다_만들기_전에_흘려_보내고_git_의_것이_아닌_content_type_의_요청은_받지_않는다() {
+    let mut bench = bench!();
+    let instance = bench.instance();
+    let token = bench.token(&instance, &WORK);
+    let remote = bench.remote(&instance);
+    let head = bench.head(&instance);
+    let mut want = pkt(&format!("want {head}\n"));
+    want.extend_from_slice(b"0000");
+    want.extend(pkt("done\n"));
+    let post = |service: &str, content_type: Option<&str>, body: &[u8]| {
+        let mut request = ureq::post(&format!("{remote}/{service}"))
+            .set("Authorization", &format!("Bearer {token}"));
+        if let Some(content_type) = content_type {
+            request = request.set("Content-Type", content_type);
+        }
+        match request.send_bytes(body) {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(error) => panic!("{error}"),
+        }
+    };
+
+    // pack 은 길이를 미리 적지 않고 조각으로 흘려 보낸다
+    let streamed = post(
+        "git-upload-pack",
+        Some("application/x-git-upload-pack-request"),
+        &want,
+    );
+    assert_eq!(streamed.status(), 200);
+    assert_eq!(streamed.header("transfer-encoding"), Some("chunked"));
+    assert_eq!(streamed.header("content-length"), None);
+    let mut body = Vec::new();
+    streamed.into_reader().read_to_end(&mut body).unwrap();
+    assert!(body.windows(4).any(|window| window == b"PACK"));
+
+    // 틀린 받기 요청은 흘려 보내기 전에 거절한다
+    let broken = post(
+        "git-upload-pack",
+        Some("application/x-git-upload-pack-request"),
+        b"0032want 0000000000000000000000000000000000000000\n0000",
+    );
+    assert_eq!(broken.status(), 422);
+
+    // 브라우저의 폼이 보낼 수 있는 것을 포함해 git 의 것이 아닌 `Content-Type` 은 받지 않는다
+    for (service, content_type) in [
+        ("git-upload-pack", None),
+        ("git-upload-pack", Some("text/plain")),
+        ("git-upload-pack", Some("application/x-www-form-urlencoded")),
+        (
+            "git-upload-pack",
+            Some("application/x-git-receive-pack-request"),
+        ),
+        ("git-receive-pack", Some("multipart/form-data; boundary=x")),
+        (
+            "git-receive-pack",
+            Some("application/x-git-upload-pack-request"),
+        ),
+    ] {
+        let refused = post(service, content_type, &want);
+        assert_eq!(refused.status(), 415, "{service} {content_type:?}");
+    }
+    assert_eq!(bench.head(&instance), head);
+}
+
+#[test]
+fn 작업을_닫으면_그_토큰으로_도는_다음_요청부터_진행_중인_git_의_다음_왕복까지_받지_않는다() {
+    let mut bench = bench!();
+    let instance = bench.instance();
+    let opened = bench.factory(
+        "POST",
+        &format!("/v1/instances/{instance}/sessions"),
+        json!({ "can": WORK }),
+    );
+    let token = opened["token"].as_str().unwrap().to_owned();
+    let session = opened["session"].as_str().unwrap().to_owned();
+    assert_eq!(session.len(), 32, "{opened}");
+    assert!(!token.contains(&session));
+    let other = bench.token(&instance, &WORK);
+    let remote = bench.remote(&instance);
+    let bearer = format!("Bearer {token}");
+
+    // 받기를 시작한다: 광고를 받는다
+    let advertised = raw(
+        "GET",
+        &format!("{remote}/info/refs?service=git-upload-pack"),
+        Some(&bearer),
+        &[],
+    );
+    assert_eq!(advertised.status, 200);
+    let head = bench.head(&instance);
+    let mut want = pkt(&format!("want {head}\n"));
+    want.extend_from_slice(b"0000");
+    want.extend(pkt("done\n"));
+
+    // 그사이 팩토리가 작업을 닫는다. 이어지는 왕복과 다른 길이 모두 거절된다
+    let closed = bench.factory(
+        "DELETE",
+        &format!("/v1/instances/{instance}/sessions/{session}"),
+        Value::Null,
+    );
+    assert_eq!(closed, json!({ "closed": true }));
+    let fetched = raw(
+        "POST",
+        &format!("{remote}/git-upload-pack"),
+        Some(&bearer),
+        &want,
+    );
+    assert_eq!(fetched.status, 401, "{}", fetched.text());
+    let rollout = bench.agent(
+        "GET",
+        &format!("/v1/instances/{instance}/rollout"),
+        &token,
+        Value::Null,
+    );
+    assert_eq!(rollout.status, 401, "{}", rollout.text());
+    refused(bearer_git(
+        &bench.scratch,
+        &token,
+        &["clone", "--quiet", &remote, "closed"],
+    ));
+    // 같은 인스턴스의 다른 작업은 그대로 돈다
+    assert_eq!(
+        raw(
+            "POST",
+            &format!("{remote}/git-upload-pack"),
+            Some(&format!("Bearer {other}")),
+            &want,
+        )
+        .status,
+        200
+    );
+    // 작업의 식별자 모양이 아니면 없는 것이다. 작업의 토큰으로는 닫지 못한다
+    let not_found = raw(
+        "DELETE",
+        &format!("{}/v1/instances/{instance}/sessions/zz", bench.url),
+        Some(&format!("Bearer {FACTORY}")),
+        &[],
+    );
+    assert_eq!(not_found.status, 404);
+    let by_token = bench.agent(
+        "DELETE",
+        &format!("/v1/instances/{instance}/sessions/{}", "ab".repeat(16)),
+        &other,
+        Value::Null,
+    );
+    assert_ne!(by_token.status, 200);
+    assert_eq!(
+        raw(
+            "POST",
+            &format!("{remote}/git-upload-pack"),
+            Some(&format!("Bearer {other}")),
+            &want,
         )
         .status,
         200

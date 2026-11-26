@@ -92,4 +92,11 @@ test("훈련이 돈 적 없는 레이어는 낡았다고 답한다", { skip }, a
     );
     assert.ok(refused instanceof OrbitalError);
     assert.equal(refused.status, 404);
+    // 무르는 길도 같다
+    const undone: unknown = await orbital.instances.undoRestore("i0000000000").then(
+        () => undefined,
+        (error: unknown) => error,
+    );
+    assert.ok(undone instanceof OrbitalError);
+    assert.equal(undone.status, 404);
 });

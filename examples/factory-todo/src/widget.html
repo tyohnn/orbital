@@ -110,12 +110,17 @@
         {
             var entry = result && result._meta && result._meta[ENTRY];
 
-            if (!entry || typeof entry.url !== "string")
+            if (!entry || typeof entry.url !== "string" || typeof entry.ticket !== "string")
             {
                 throw new Error("입력 표를 받지 못했어요.");
             }
 
-            return fetch(entry.url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ value: value }) });
+            // 표는 주소가 아니라 머리말에 싣는다. 주소에 실으면 레이어 앞의 프록시가 남기는 접근 기록에 남는다
+            return fetch(entry.url, {
+                method: "POST",
+                headers: { "content-type": "application/json", authorization: "Bearer " + entry.ticket },
+                body: JSON.stringify({ value: value }),
+            });
         }).then(function (response)
         {
             return response.json().catch(function () { return {}; }).then(function (body)

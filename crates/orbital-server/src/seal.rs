@@ -5,8 +5,13 @@
 //! 열쇠는 기록 밖에서 온다(`ORBITAL_SEAL_KEY`). 기록을 통째로 가져가도 열쇠가 없으면 풀리지 않는다.
 //!
 //! 모양은 `seal1.<일회값과 봉인한 글의 hex>` 다.
+//!
+//! 열쇠를 돌려 바꿀 때는 새 열쇠(`ORBITAL_SEAL_KEY`)와 옛 열쇠(`ORBITAL_SEAL_KEY_PREVIOUS`)를 함께 주고 띄운다. 레이어가 뜰 때
+//! 옛 열쇠로만 풀리는 줄을 새 열쇠로 다시 봉인해 적는다([`reseal`]). 어느 열쇠로도 풀리지 않는 줄은 건드리지 않고 이름만 알린다.
 
 use std::fmt;
+
+use serde::Serialize;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
@@ -67,6 +72,39 @@ pub fn seal(key: &SealKey, bound_to: &str, plain: &str) -> Option<String> {
     Some(format!("{PREFIX}{}", hex(&whole)))
 }
 
+/// 봉인 하나를 새 열쇠로 다시 봉인한 결과.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rekeyed {
+    /// 이미 새 열쇠로 풀린다. 그대로 둔다.
+    Current,
+    /// 옛 열쇠로만 풀려 새 열쇠로 다시 봉인했다. 새 봉인이다.
+    Changed(String),
+    /// 어느 열쇠로도 풀리지 않는다. 건드리지 않는다.
+    Unopened,
+}
+
+/// 봉인 하나를 새 열쇠로 옮긴다. 같은 자리(`bound_to`)에 묶은 채로 다시 봉인한다. 무작위 값을 얻지 못하면 `None` 이다.
+pub fn reseal(new: &SealKey, previous: &SealKey, bound_to: &str, sealed: &str) -> Option<Rekeyed> {
+    if open(new, bound_to, sealed).is_some() {
+        return Some(Rekeyed::Current);
+    }
+    match open(previous, bound_to, sealed) {
+        Some(plain) => seal(new, bound_to, &plain).map(Rekeyed::Changed),
+        None => Some(Rekeyed::Unopened),
+    }
+}
+
+/// 레이어가 뜰 때 다시 봉인한 결과. 바꾼 줄의 수와 풀리지 않는 줄의 이름만 있고 값은 없다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Resealed {
+    /// 팩토리의 설정에서 바꾼 줄.
+    pub settings: usize,
+    /// 금고에서 바꾼 줄.
+    pub vault: usize,
+    /// 어느 열쇠로도 풀리지 않아 그대로 둔 줄의 이름(`settings <조직> <칸>`, `vault <인스턴스> <단계> <이름>`).
+    pub unopened: Vec<String>,
+}
+
 /// 푼다. 열쇠가 다르거나, 다른 조직 · 다른 칸의 봉인이거나, 한 글자라도 바뀌었으면 `None` 이다.
 pub fn open(key: &SealKey, bound_to: &str, sealed: &str) -> Option<String> {
     let whole = unhex(sealed.strip_prefix(PREFIX)?)?;
@@ -93,6 +131,36 @@ mod tests {
 
     fn key(byte: u8) -> SealKey {
         SealKey::from_bytes([byte; 32])
+    }
+
+    #[test]
+    fn 다시_봉인은_옛_열쇠로만_풀리는_것을_새_열쇠로_옮기고_새_열쇠로_풀리는_것과_풀리지_않는_것은_그대로_둔다()
+     {
+        let bound = binding("factory", "mail.api_key");
+        let old = seal(&key(1), &bound, "re_live").unwrap();
+        let Some(Rekeyed::Changed(moved)) = reseal(&key(2), &key(1), &bound, &old) else {
+            panic!("옛 열쇠로만 풀리는 것을 옮기지 않았습니다");
+        };
+        assert_eq!(open(&key(2), &bound, &moved).as_deref(), Some("re_live"));
+        assert_eq!(open(&key(1), &bound, &moved), None);
+        // 다른 자리의 것으로는 옮겨도 풀리지 않는다(같은 자리에 묶은 채로 옮긴다)
+        assert_eq!(
+            open(&key(2), &binding("other", "mail.api_key"), &moved),
+            None
+        );
+        assert_eq!(
+            reseal(&key(2), &key(1), &bound, &moved),
+            Some(Rekeyed::Current)
+        );
+        let stranger = seal(&key(3), &bound, "re_live").unwrap();
+        assert_eq!(
+            reseal(&key(2), &key(1), &bound, &stranger),
+            Some(Rekeyed::Unopened)
+        );
+        assert_eq!(
+            reseal(&key(2), &key(1), &bound, "seal1.zz"),
+            Some(Rekeyed::Unopened)
+        );
     }
 
     #[test]

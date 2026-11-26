@@ -7,7 +7,7 @@
 //! - `ORBITAL_LISTEN`: 듣는 주소(기본 `127.0.0.1:7400`)
 //! - `ORBITAL_PUBLIC_URL`: 레이어의 바깥 주소(기본 `http://<ORBITAL_LISTEN>`). Google 의 콜백이 `<바깥 주소>/v1/auth/google/callback` 에 서고,
 //!   팩토리는 이 주소 하나를 Google 콘솔에 등록한다
-//!   비밀의 입력 표(`<바깥 주소>/v1/secret-entries/<표>`)도 이 아래에 선다. 사람의 브라우저가 바로 닿는 주소여야 한다
+//!   비밀의 입력 표(`<바깥 주소>/v1/secret-entries`, 표는 `Authorization: Bearer`)도 이 아래에 선다. 사람의 브라우저가 바로 닿는 주소여야 한다
 //! - `ORBITAL_SEAL_KEY`: 팩토리가 넣은 키(Resend · Google)와 밖에서 넣는 비밀(금고, `ORBITAL_HOME/vault.json`)을 봉인하는 열쇠.
 //!   32바이트를 hex 64자로. 없으면 팩토리가 설정과 비밀의 값을 넣지 못하고(409), 밖에서 넣는 비밀을 선언한 release 는 운영에 오르지 못한다.
 //!   기록(`ORBITAL_HOME`)과 다른 자리에 둔다. 바꾸면 앞에서 넣은 키와 값이 풀리지 않아 다시 넣어야 한다
@@ -139,6 +139,12 @@ fn start() -> Result<(), String> {
         })?),
         Err(_) => None,
     };
+    let previous_seal_key = match std::env::var("ORBITAL_SEAL_KEY_PREVIOUS") {
+        Ok(text) => Some(SealKey::from_hex(&text).ok_or_else(|| {
+            "`ORBITAL_SEAL_KEY_PREVIOUS` 는 앞에 쓰던 `ORBITAL_SEAL_KEY` 를 그대로(hex 64자) 적어야 합니다".to_owned()
+        })?),
+        Err(_) => None,
+    };
     let dev_mailbox = match std::env::var("ORBITAL_DEV_MAIL") {
         Ok(mode) if mode == "outbox" => true,
         Ok(_) => {
@@ -160,6 +166,16 @@ fn start() -> Result<(), String> {
                 })?,
         ),
         Err(_) => Duration::from_secs(5 * 60),
+    };
+    let wake_queue = match std::env::var("ORBITAL_WAKE_QUEUE") {
+        Ok(text) => text
+            .parse::<usize>()
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| {
+                "`ORBITAL_WAKE_QUEUE` 는 1 이상의 수로 적어 주세요(기본 128)".to_owned()
+            })?,
+        Err(_) => 128,
     };
     let hosting = match std::env::var("ORBITAL_BASE_DOMAIN") {
         Err(_) => None,
@@ -193,9 +209,11 @@ fn start() -> Result<(), String> {
     let layer = Layer::open(Options {
         backup,
         seal_key,
+        previous_seal_key,
         public_url,
         dev_mailbox,
         sleep_after,
+        wake_queue,
         hosting,
         schedule_timeout,
         ..Options::new(
@@ -210,6 +228,16 @@ fn start() -> Result<(), String> {
     })?;
     let server =
         tiny_http::Server::http(&listen).map_err(|_| format!("`{listen}` 에서 듣지 못했습니다"))?;
+    if let Some(resealed) = layer.resealed() {
+        // 줄의 수와 이름만 찍는다. 값은 없다
+        eprintln!(
+            "orbitald: 봉인을 새 열쇠로 다시 했습니다(설정 {}줄 · 금고 {}줄). 확인했으면 `ORBITAL_SEAL_KEY_PREVIOUS` 를 빼고 다시 띄워 주세요",
+            resealed.settings, resealed.vault
+        );
+        for name in &resealed.unopened {
+            eprintln!("orbitald: 어느 열쇠로도 풀리지 않아 그대로 둔 줄: {name}");
+        }
+    }
     eprintln!("orbitald: http://{listen} 에서 듣습니다");
     if let Some(address) = layer.router_address() {
         eprintln!("orbitald: 인스턴스의 하위 도메인은 {address} 에서 받습니다");

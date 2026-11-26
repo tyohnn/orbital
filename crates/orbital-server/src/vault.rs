@@ -23,7 +23,7 @@ use orbital_core::secrets::{
 use orbital_core::sweep::LEFTOVER_RETENTION;
 use serde::{Deserialize, Serialize};
 
-use crate::seal::{SealKey, open, seal, secret_binding};
+use crate::seal::{Rekeyed, SealKey, open, reseal, seal, secret_binding};
 
 /// 비밀의 값. 찍어도(`Debug`) 값이 보이지 않고, 글(`Display`)이나 JSON 으로 내보내는 길이 없다.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -181,6 +181,57 @@ impl Vault {
             .map_err(|_| failed())?;
         drop(file);
         fs::rename(&beside, &self.path).map_err(|_| failed())
+    }
+
+    /// 옛 열쇠로만 풀리는 값을 이 금고의 열쇠(새 열쇠)로 다시 봉인해 적는다. 봉인은 조직에 묶여 있어 인스턴스의 조직을
+    /// `organization_of` 로 찾는다(기록에 없는 인스턴스의 줄은 풀리지 않는 것으로 본다). (바꾼 줄의 수, 풀리지 않는 줄의 이름).
+    /// 바꾼 것이 있으면 임시 파일에 쓰고 옮겨 한 번에 바꾼다. 중간에 죽으면 앞의 파일이 그대로 남는다.
+    pub fn reseal(
+        &self,
+        previous: &SealKey,
+        organization_of: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(usize, Vec<String>), String> {
+        let Some(new) = self.seal.as_ref() else {
+            return Ok((0, Vec::new()));
+        };
+        let failed = || "비밀의 금고를 다시 봉인하지 못했습니다".to_owned();
+        let mut stored = self.lock();
+        let mut changed = 0;
+        let mut unopened = Vec::new();
+        for (instance, names) in &mut stored.values {
+            let organization = organization_of(instance);
+            for (name, slots) in names {
+                for stage in Stage::ALL {
+                    let Some(sealed) = slots.slot(stage).as_mut() else {
+                        continue;
+                    };
+                    let outcome = match &organization {
+                        Some(organization) => reseal(
+                            new,
+                            previous,
+                            &secret_binding(organization, instance, stage.as_str(), name),
+                            &sealed.sealed,
+                        )
+                        .ok_or_else(failed)?,
+                        None => Rekeyed::Unopened,
+                    };
+                    match outcome {
+                        Rekeyed::Current => {}
+                        Rekeyed::Changed(again) => {
+                            sealed.sealed = again;
+                            changed += 1;
+                        }
+                        Rekeyed::Unopened => {
+                            unopened.push(format!("vault {instance} {} {name}", stage.as_str()));
+                        }
+                    }
+                }
+            }
+        }
+        if changed > 0 {
+            self.save(&stored).map_err(|_| failed())?;
+        }
+        Ok((changed, unopened))
     }
 
     fn binding(organization: &str, place: &Place) -> String {

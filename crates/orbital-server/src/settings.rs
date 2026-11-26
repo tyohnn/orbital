@@ -18,7 +18,7 @@ use orbital_router::ResendKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::seal::{SealKey, binding, open, seal};
+use crate::seal::{Rekeyed, SealKey, binding, open, reseal, seal};
 
 /// 레이어가 아는 메일 발송기.
 pub const RESEND: &str = "resend";
@@ -147,6 +147,43 @@ impl Settings {
         fs::write(&beside, bytes).map_err(|_| failed())?;
         fs::set_permissions(&beside, fs::Permissions::from_mode(0o600)).map_err(|_| failed())?;
         fs::rename(&beside, &self.path).map_err(|_| failed())
+    }
+
+    /// 옛 열쇠로만 풀리는 봉인을 이 설정의 열쇠(새 열쇠)로 다시 봉인해 적는다. (바꾼 줄의 수, 풀리지 않는 줄의 이름).
+    /// 바꾼 것이 있으면 임시 파일에 쓰고 옮겨 한 번에 바꾼다. 중간에 죽으면 앞의 파일이 그대로 남는다.
+    pub fn reseal(&self, previous: &SealKey) -> Result<(usize, Vec<String>), String> {
+        let Some(new) = self.seal.as_ref() else {
+            return Ok((0, Vec::new()));
+        };
+        let failed = || "팩토리의 설정을 다시 봉인하지 못했습니다".to_owned();
+        let mut stored = self.lock();
+        let mut changed = 0;
+        let mut unopened = Vec::new();
+        for (organization, settings) in &mut stored.organizations {
+            let mut fields: Vec<(&str, &mut String)> = Vec::new();
+            if let Some(mail) = &mut settings.mail {
+                fields.push((MAIL_KEY, &mut mail.api_key));
+            }
+            if let Some(google) = &mut settings.google {
+                fields.push((GOOGLE_SECRET, &mut google.client_secret));
+            }
+            for (field, sealed) in fields {
+                match reseal(new, previous, &binding(organization, field), sealed)
+                    .ok_or_else(failed)?
+                {
+                    Rekeyed::Current => {}
+                    Rekeyed::Changed(again) => {
+                        *sealed = again;
+                        changed += 1;
+                    }
+                    Rekeyed::Unopened => unopened.push(format!("settings {organization} {field}")),
+                }
+            }
+        }
+        if changed > 0 {
+            self.save(&stored).map_err(|_| failed())?;
+        }
+        Ok((changed, unopened))
     }
 
     fn unseal(&self, organization: &str, field: &str, sealed: &str) -> Option<String> {

@@ -18,6 +18,7 @@ use orbital_router::{Mail, Outbox};
 use orbital_run::{Job, LocalRunner, RunError, Runner, Running};
 use orbital_server::http::handle;
 use orbital_server::layer::{Hosting, Layer, OUTBOX, Options};
+use orbital_server::seal::SealKey;
 use serde_json::{Value, json};
 
 const FACTORY: &str = "sk_test_factory";
@@ -219,6 +220,8 @@ struct Probe {
     live: Arc<AtomicUsize>,
     /// 띄울 때 건넨 포트. 마지막 것이 지금(또는 마지막으로) 떠 있던 서버의 포트다.
     ports: Mutex<Vec<u16>>,
+    /// 띄울 때마다 (로그의 이름, 포트, 받은 `PARTNER_KEY`). 로그의 이름에 서비스의 이름이 든다.
+    started: Mutex<Vec<(String, u16, Option<String>)>>,
     sabotage: Mutex<Vec<Sabotage>>,
 }
 
@@ -228,6 +231,8 @@ enum Sabotage {
     Refuse,
     /// 프로세스는 뜨지만 포트를 열지 않는다.
     NeverListen,
+    /// 띄우기 전에 이만큼 머문다. 깨우는 동안 기다리는 요청을 쌓는다.
+    Delay(Duration),
 }
 
 impl Probe {
@@ -241,6 +246,18 @@ impl Probe {
 
     fn last_port(&self) -> u16 {
         *self.ports.lock().unwrap().last().unwrap()
+    }
+
+    /// 그 서비스를 띄운 것들(포트, 받은 `PARTNER_KEY`)을 띄운 차례대로.
+    fn starts_of(&self, service: &str) -> Vec<(u16, Option<String>)> {
+        let suffix = format!("-{service}");
+        self.started
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(log, _, _)| log.ends_with(&suffix))
+            .map(|(_, port, partner)| (*port, partner.clone()))
+            .collect()
     }
 }
 
@@ -293,13 +310,24 @@ impl Runner for CountingRunner {
 
     fn start(&self, job: &Job<'_>) -> Result<Box<dyn Running>, RunError> {
         self.probe.starts.fetch_add(1, Ordering::SeqCst);
-        if let Some(port) = job
-            .env
-            .iter()
-            .find(|(key, _)| key == "PORT")
-            .and_then(|(_, value)| value.parse().ok())
-        {
+        let value = |name: &str| {
+            job.env
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        if let Some(port) = value("PORT").and_then(|port| port.parse().ok()) {
             self.probe.ports.lock().unwrap().push(port);
+            let log = job
+                .log
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.probe
+                .started
+                .lock()
+                .unwrap()
+                .push((log, port, value("PARTNER_KEY")));
         }
         let sabotage = {
             let mut queued = self.probe.sabotage.lock().unwrap();
@@ -307,6 +335,10 @@ impl Runner for CountingRunner {
         };
         let inner = match sabotage {
             Some(Sabotage::Refuse) => return Err(RunError::Spawn),
+            Some(Sabotage::Delay(pause)) => {
+                std::thread::sleep(pause);
+                self.inner.start(job)?
+            }
             Some(Sabotage::NeverListen) => self.inner.start(&Job {
                 command: "sleep 30",
                 ..*job
@@ -332,6 +364,8 @@ struct Bench {
     probe: Arc<Probe>,
     /// 레이어가 읽는 시각(유닉스 초). 0 이면 실제 시각이다. 일정의 때를 테스트가 만든다.
     clock: Arc<AtomicU64>,
+    /// 서비스마다 깨우기를 기다리는 요청의 상한. `None` 이면 레이어의 기본값이다.
+    wake_queue: Option<usize>,
     layer: Option<Layer>,
     instances: Vec<String>,
 }
@@ -353,6 +387,7 @@ impl Bench {
             hosts,
             probe: Arc::new(Probe::default()),
             clock: Arc::new(AtomicU64::new(0)),
+            wake_queue: None,
             layer: None,
             instances: Vec::new(),
         };
@@ -381,7 +416,14 @@ impl Bench {
             scheme: Scheme::Http,
         });
         let clock = Arc::clone(&self.clock);
+        let defaults = Options::new(
+            self.home.clone(),
+            self.pg_url.clone(),
+            vec![(FACTORY.to_owned(), ORGANIZATION.to_owned())],
+            Box::new(runner),
+        );
         let layer = Layer::open(Options {
+            wake_queue: self.wake_queue.unwrap_or(defaults.wake_queue),
             dev_mailbox: true,
             clock: Arc::new(move || match clock.load(Ordering::SeqCst) {
                 0 => std::time::SystemTime::now()
@@ -389,16 +431,12 @@ impl Bench {
                     .map_or(0, |elapsed| elapsed.as_secs()),
                 at => at,
             }),
+            seal_key: Some(SealKey::from_bytes([7; 32])),
             sleep_after: SLEEP_AFTER,
             wake_timeout: Duration::from_secs(5),
             schedule_timeout: Duration::from_secs(1),
             hosting,
-            ..Options::new(
-                self.home.clone(),
-                self.pg_url.clone(),
-                vec![(FACTORY.to_owned(), ORGANIZATION.to_owned())],
-                Box::new(runner),
-            )
+            ..defaults
         })
         .expect("레이어를 열지 못했습니다");
         self.layer = Some(layer);
@@ -493,8 +531,17 @@ impl Bench {
     /// 프리뷰 → 승격 요청 → 고객의 승인 → 운영. (인스턴스, 프리뷰의 주소, 운영의 주소).
     fn ship_with_preview(&mut self, app: &str) -> (String, String, String) {
         let instance = self.instance(app);
+        let (preview, live) = self.ship_instance(&instance, &|_| {});
+        (instance, preview, live)
+    }
+
+    /// 이미 선 인스턴스를 프리뷰 → 승격 요청 → 고객의 승인 → 운영으로 올린다. 프리뷰가 선 뒤 승격 전에 `before` 를 부른다.
+    /// (프리뷰의 주소, 운영의 주소).
+    fn ship_instance(&mut self, instance: &str, before: &dyn Fn(&Self)) -> (String, String) {
+        let instance = instance.to_owned();
         let token = self.token(&instance);
         let (preview, release) = self.preview(&instance, &token);
+        before(self);
         let (status, body) = self.post(
             &format!("/v1/instances/{instance}/promotion-requests"),
             &token,
@@ -511,7 +558,31 @@ impl Bench {
             .as_str()
             .unwrap()
             .to_owned();
-        (instance, preview, live)
+        (preview, live)
+    }
+
+    /// 밖에서 넣는 비밀 `PARTNER_KEY` 의 운영 값을 넣는다.
+    fn set_partner(&self, instance: &str, value: &str) {
+        let (status, body) = self.call(
+            "PUT",
+            &format!("/v1/instances/{instance}/secrets/PARTNER_KEY"),
+            FACTORY,
+            json!({ "stage": "production", "value": value })
+                .to_string()
+                .as_bytes(),
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+
+    /// 서버 서비스가 둘(`web` 은 `/`, `api` 는 `/assets`)이고 밖에서 넣는 비밀이 하나인 인스턴스를 운영에 올린다.
+    fn ship_pair(&mut self) -> (String, String) {
+        self.upload("pair", &|folder: &Path| {
+            copy_tree(&fixture("todo"), folder);
+            copy_tree(&fixture("pair"), folder);
+        });
+        let instance = self.instance("pair");
+        let (_, live) = self.ship_instance(&instance, &|bench| bench.set_partner(&instance, "v1"));
+        (instance, live)
     }
 
     fn ship(&mut self, app: &str) -> (String, String) {
@@ -811,6 +882,70 @@ fn 깨우지_못하면_503_으로_답하고_다음_요청에_다시_깨운다() 
 }
 
 #[test]
+fn 깨우기를_기다리는_요청이_상한을_넘으면_기다리지_않고_503_으로_답한다() {
+    let mut bench = bench!(false);
+    bench.ship("cards");
+    bench.wake_queue = Some(3);
+    bench.restart();
+    let live = {
+        let instance = bench.instances[0].clone();
+        bench.production_url(&instance)
+    };
+    let pause = Duration::from_secs(3);
+    bench
+        .probe
+        .sabotage
+        .lock()
+        .unwrap()
+        .push(Sabotage::Delay(pause));
+    let barrier = Barrier::new(10);
+    let answers: Vec<(u16, Option<String>, Duration)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let started = Instant::now();
+                    let reply = bench.http("GET", &live, "/login", &[], "");
+                    (
+                        reply.status,
+                        reply.header("retry-after").map(str::to_owned),
+                        started.elapsed(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    let woke: Vec<_> = answers
+        .iter()
+        .filter(|(status, _, _)| *status == 200)
+        .collect();
+    let refused: Vec<_> = answers
+        .iter()
+        .filter(|(status, _, _)| *status == 503)
+        .collect();
+    assert_eq!(woke.len(), 3, "{answers:?}");
+    assert_eq!(refused.len(), 7, "{answers:?}");
+    for (_, retry_after, waited) in &refused {
+        assert!(
+            retry_after
+                .as_deref()
+                .is_some_and(|seconds| seconds.parse::<u64>().is_ok()),
+            "{answers:?}"
+        );
+        // 넘친 요청은 깨우기를 기다리지 않는다
+        assert!(*waited < pause, "{answers:?}");
+    }
+    assert_eq!(bench.probe.starts(), 1);
+    // 깨운 뒤에는 상한과 상관없이 받는다
+    let after = bench.http("GET", &live, "/login", &[], "");
+    assert_eq!(after.status, 200, "{}", after.everything());
+}
+
+#[test]
 fn 재운_뒤에도_세션과_데이터는_그대로다() {
     let mut bench = bench!(false);
     let (instance, live) = bench.ship("cards");
@@ -947,8 +1082,7 @@ fn 모르는_호스트는_404_다() {
         BASE.to_owned(),
         format!("zz{instance}.{BASE}"),
         format!("x.{instance}.{BASE}"),
-        format!("{instance}.{BASE}."),
-        format!("{}.{BASE}", instance.to_uppercase()),
+        format!("{instance}.{BASE}.."),
         format!("{instance}.other.test"),
         format!("{instance}.{BASE}:80"),
         router.clone(),
@@ -987,6 +1121,32 @@ fn 모르는_호스트는_404_다() {
     assert_eq!(mismatched.status, 404);
     // 운영의 주소는 그대로 답한다
     assert_eq!(bench.http("GET", &live, "/login", &[], "").status, 200);
+}
+
+#[test]
+fn 대문자나_이름_끝의_점으로_적은_호스트도_그_인스턴스로_간다() {
+    let mut bench = bench!(true);
+    let (instance, _, _) = bench.ship_with_preview("cards");
+    let router = bench.router();
+    for host in [
+        format!("{}.{}", instance.to_uppercase(), BASE.to_uppercase()),
+        format!("{instance}.{BASE}."),
+        format!("{}-PREVIEW.{BASE}", instance.to_uppercase()),
+    ] {
+        let reply = send(&router, Some(&host), "GET", "/login", &[], "");
+        assert_eq!(reply.status, 200, "{host}: {}", reply.everything());
+    }
+    // 요청 줄의 주소와 `Host` 가 대소문자만 다르면 같은 곳이다
+    let known = format!("{instance}.{BASE}");
+    let mixed = send(
+        &router,
+        Some(&known.to_uppercase()),
+        "GET",
+        &format!("http://{known}/login"),
+        &[],
+        "",
+    );
+    assert_eq!(mixed.status, 200, "{}", mixed.everything());
 }
 
 #[test]
@@ -1336,6 +1496,7 @@ fn 일정의_실패는_기록에_남고_팩토리는_마지막_실행의_때와_
     let tick_schedule = of("/jobs/tick");
     assert_eq!(tick_schedule["service"], json!("web"));
     assert_eq!(tick_schedule["cron"], json!("* * * * *"));
+    assert_eq!(tick_schedule["role"], Value::Null);
     assert_eq!(tick_schedule["next_at"], json!(1_795_565_160u64));
     assert_eq!(tick_schedule["last_run"]["due_at"], json!(1_795_565_100u64));
     assert_eq!(tick_schedule["last_run"]["outcome"], json!("ok"));
@@ -1475,4 +1636,300 @@ fn 빌드_폴더가_없는_운영은_레이어를_막지_않고_빌드하는_동
         "빌드가 끝났는데 서지 않았습니다"
     );
     assert_eq!(bench.production_url(&instance), live);
+}
+
+#[test]
+fn 하위_도메인을_쓰는_레이어가_다시_떠도_운영은_같은_주소에서_첫_요청에_깬다() {
+    let mut bench = bench!(true);
+    let (instance, live) = bench.ship("cards");
+    bench.invite(&instance, "kim@example.com");
+    let (kim, _) = bench.sign_in(&live, "kim@example.com");
+    let made = bench.http(
+        "POST",
+        &live,
+        "/cards",
+        &[("Cookie", &kim), JSON],
+        "다시 뜨기 전의 일",
+    );
+    assert_eq!(made.status, 201, "{}", made.everything());
+
+    bench.restart();
+    // 다시 뜬 레이어는 운영을 자는 채로 같은 하위 도메인에 세운다
+    assert_eq!(bench.probe.starts(), 0);
+    assert_eq!(bench.production_url(&instance), live);
+    let cards = bench.cards(&live, &kim);
+    assert_eq!(cards.status, 200, "{}", cards.everything());
+    assert_eq!(titles(&cards), vec!["다시 뜨기 전의 일"]);
+    assert_eq!(bench.probe.starts(), 1);
+}
+
+#[test]
+fn 하위_도메인을_쓰는_레이어에서_빌드_폴더가_없는_운영은_503_으로_답하다가_빌드_뒤_같은_주소에서_선다()
+ {
+    let mut bench = bench!(true);
+    bench.upload("slow", &|folder: &Path| {
+        copy_tree(&fixture("todo"), folder);
+        copy_tree(&fixture("slow"), folder);
+    });
+    let (instance, live) = bench.ship("slow");
+    let (other, other_live) = bench.ship("cards");
+    fs::remove_dir_all(bench.home.join("builds").join(&instance)).unwrap();
+
+    let started = Instant::now();
+    bench.restart();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    let waiting = bench.http("GET", &live, "/health", &[JSON], "");
+    assert_eq!(waiting.status, 503, "{}", waiting.everything());
+    assert!(waiting.header("retry-after").is_some());
+    // 다른 인스턴스의 하위 도메인은 기다리지 않는다
+    assert_eq!(bench.production_url(&other), other_live);
+    assert_eq!(
+        bench.http("GET", &other_live, "/login", &[], "").status,
+        200
+    );
+    assert!(
+        eventually(Duration::from_secs(30), || bench
+            .http("GET", &live, "/health", &[JSON], "")
+            .status
+            == 200),
+        "빌드가 끝났는데 서지 않았습니다"
+    );
+    assert_eq!(bench.production_url(&instance), live);
+}
+
+#[test]
+fn 서버_서비스가_둘인_인스턴스에서_하나만_쉬면_그것만_자고_값이_바뀌면_둘_다_새로_깬다() {
+    let mut bench = bench!(false);
+    let (instance, live) = bench.ship_pair();
+    let api = || bench.http("GET", &live, "/assets/x", &[], "");
+    let web = || bench.http("GET", &live, "/login", &[], "");
+    bench.wait_asleep();
+
+    // api 를 한 번 깨우고 web 만 계속 부른다. api 만 잔다
+    assert_eq!(api().status, 200);
+    let until = Instant::now() + SLEEP_AFTER * 4;
+    while Instant::now() < until {
+        assert_eq!(web().status, 200);
+        std::thread::sleep(SLEEP_AFTER / 4);
+    }
+    let (api_port, _) = *bench.probe.starts_of("api").last().unwrap();
+    let (web_port, _) = *bench.probe.starts_of("web").last().unwrap();
+    assert!(
+        eventually(Duration::from_secs(5), || !listening(api_port)),
+        "쉰 api 가 자지 않았습니다"
+    );
+    assert!(listening(web_port), "불린 web 이 잤습니다");
+    assert_eq!(bench.probe.live(), 1);
+
+    // 둘 다 깨운 뒤 값을 바꾸면 둘 다 내려가고, 다음 요청에 새 값으로 깬다
+    assert_eq!(api().status, 200);
+    assert_eq!(bench.probe.live(), 2);
+    let (web_before, api_before) = (
+        bench.probe.starts_of("web").len(),
+        bench.probe.starts_of("api").len(),
+    );
+    bench.set_partner(&instance, "v2");
+    // 재우는 시간을 기다리지 않고 곧바로 둘 다 내려간다
+    assert_eq!(bench.probe.live(), 0);
+    assert_eq!(web().status, 200);
+    assert_eq!(api().status, 200);
+    let webs = bench.probe.starts_of("web");
+    let apis = bench.probe.starts_of("api");
+    assert_eq!(webs.len(), web_before + 1);
+    assert_eq!(apis.len(), api_before + 1);
+    assert_eq!(webs.last().unwrap().1.as_deref(), Some("v2"));
+    assert_eq!(apis.last().unwrap().1.as_deref(), Some("v2"));
+}
+
+#[test]
+fn 깨우는_중에_값이_바뀌면_그_첫_요청이_끝난_뒤_다시_재우고_다음_요청은_새_값으로_깬다() {
+    let mut bench = bench!(false);
+    let (instance, live) = bench.ship_pair();
+    bench.wait_asleep();
+    let pause = Duration::from_millis(1500);
+    bench
+        .probe
+        .sabotage
+        .lock()
+        .unwrap()
+        .push(Sabotage::Delay(pause));
+    let before = bench.probe.starts_of("web").len();
+    let first = std::thread::scope(|scope| {
+        let waking = scope.spawn(|| bench.http("GET", &live, "/login", &[], ""));
+        // 깨우는 문이 잠긴 동안(실행기가 머무는 동안) 값을 바꾼다
+        std::thread::sleep(pause / 3);
+        bench.set_partner(&instance, "v2");
+        waking.join().unwrap()
+    });
+    assert_eq!(first.status, 200, "{}", first.everything());
+    let webs = bench.probe.starts_of("web");
+    assert_eq!(webs.len(), before + 1);
+    // 깨우던 프로세스는 바뀌기 전의 값을 읽었다. 그래서 첫 요청이 끝나면 재우는 시간을 기다리지 않고 곧바로 재운다
+    assert_eq!(webs.last().unwrap().1.as_deref(), Some("v1"));
+    assert_eq!(bench.http("GET", &live, "/login", &[], "").status, 200);
+    let webs = bench.probe.starts_of("web");
+    assert_eq!(webs.len(), before + 2);
+    assert_eq!(webs.last().unwrap().1.as_deref(), Some("v2"));
+}
+
+#[test]
+fn 역할을_적은_일정은_그_역할만_실린_신원으로_불려_행을_읽고_쓰고_역할이_없는_일정은_막힌다() {
+    let mut bench = bench!(false);
+    bench.upload("payday", &|folder: &Path| {
+        copy_tree(&fixture("payroll"), folder);
+        copy_tree(&fixture("payday"), folder);
+    });
+    bench.clock.store(NOON, Ordering::SeqCst);
+    let instance = bench.instance("payday");
+    let token = bench.token(&instance);
+    let (status, preview) = bench.call(
+        "POST",
+        &format!("/v1/instances/{instance}/previews"),
+        &token,
+        &[],
+    );
+    assert_eq!(status, 200, "{preview}");
+    // 사람이 승인할 때 알게 한다: 권한 변화의 문장에 일정이 도는 역할이 선다
+    let sentence = "이번 변경으로 일정 `/jobs/payroll`(`* * * * *`, UTC)이 `payroll_admin` 역할로 돕니다. 그 역할의 모든 행 권한으로 읽고 씁니다";
+    let release = preview["release"].as_str().unwrap().to_owned();
+    assert_eq!(preview["changes"][0], json!(sentence), "{preview}");
+    assert!(!preview["changes"].to_string().contains("/jobs/blind"));
+    let (status, body) = bench.post(
+        &format!("/v1/instances/{instance}/promotion-requests"),
+        &token,
+        &json!({ "release": release }),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, pending) = bench.call(
+        "GET",
+        &format!("/v1/instances/{instance}/promotion-request"),
+        FACTORY,
+        &[],
+    );
+    assert_eq!(status, 200, "{pending}");
+    assert!(pending.to_string().contains(sentence), "{pending}");
+    let (status, production) = bench.post(
+        &format!("/v1/instances/{instance}/promotions"),
+        FACTORY,
+        &json!({ "release": release, "change": "customer_request", "approved_by": "customer" }),
+    );
+    assert_eq!(status, 200, "{production}");
+    let live = production["services"][0]["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 운영에 직원 한 명과 그의 명세 둘
+    let (status, body) = bench.post(
+        &format!("/v1/instances/{instance}/users"),
+        FACTORY,
+        &json!({ "email": "kim@example.com", "roles": ["employee"] }),
+    );
+    assert_eq!(status, 200, "{body}");
+    // 초대받은 사람은 처음 들어올 때 사용자가 된다
+    let (kim_cookie, _) = bench.sign_in(&live, "kim@example.com");
+    let (_, users) = bench.call(
+        "GET",
+        &format!("/v1/instances/{instance}/users"),
+        FACTORY,
+        &[],
+    );
+    let kim = users["users"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{users}"))
+        .to_owned();
+    let mut config: postgres::Config = bench.pg_url.parse().unwrap();
+    config.dbname(&format!("i_{instance}"));
+    let mut admin = config.connect(postgres::NoTls).unwrap();
+    admin
+        .execute(
+            "INSERT INTO payroll.payslip (employee, amount) VALUES ($1, 100), ($1, 200)",
+            &[&kim],
+        )
+        .unwrap();
+
+    tick(&bench, NOON);
+    tick(&bench, NOON + 60);
+    let ran = jobs(&bench, &instance);
+    let of = |path: &str| {
+        ran.iter()
+            .find(|job| job["path"] == path)
+            .unwrap_or_else(|| panic!("{path}: {ran:?}"))
+            .clone()
+    };
+    // 역할을 적은 일정: 그 역할만의 신원이 실려 모든 행을 읽고 고친다
+    assert_eq!(
+        of("/jobs/payroll"),
+        json!({ "path": "/jobs/payroll", "identity": true, "seen": 2, "updated": 2 })
+    );
+    // 역할을 적지 않은 일정: 같은 연결이어도 신원이 없어 역할 제한 정책이 한 행도 내주지 않는다
+    assert_eq!(
+        of("/jobs/blind"),
+        json!({ "path": "/jobs/blind", "identity": false, "seen": 0, "updated": 0 })
+    );
+    let amounts: Vec<i32> = admin
+        .query("SELECT amount FROM payroll.payslip ORDER BY amount", &[])
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(amounts, vec![101, 201]);
+    // 팩토리는 운영의 일정마다 도는 역할을 본다
+    let report = bench
+        .call(
+            "GET",
+            &format!("/v1/instances/{instance}/production"),
+            FACTORY,
+            &[],
+        )
+        .1;
+    let roles: Vec<&Value> = report["schedules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|schedule| &schedule["role"])
+        .collect();
+    assert_eq!(roles, vec![&json!("payroll_admin"), &Value::Null]);
+
+    // 밖에서는 그 신원을 흉내 내지 못한다. 일정의 경로는 닫혀 있고, 다른 경로에 실어 보낸 `x-orbital-` 는 지워진다
+    let forged = "v2.forged.identity";
+    let closed = bench.http(
+        "POST",
+        &live,
+        "/jobs/payroll",
+        &[
+            ("Cookie", &kim_cookie),
+            ("x-orbital-identity", forged),
+            ("x-orbital-schedule", "web * * * * * /jobs/payroll"),
+            JSON,
+        ],
+        "",
+    );
+    assert_eq!(closed.status, 404, "{}", closed.everything());
+    let echoed = bench.http(
+        "GET",
+        &live,
+        "/echo",
+        &[
+            ("Cookie", &kim_cookie),
+            ("x-orbital-identity", forged),
+            JSON,
+        ],
+        "",
+    );
+    assert_eq!(echoed.status, 200, "{}", echoed.everything());
+    let carried = echoed.json()["headers"]["x-orbital-identity"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_ne!(carried, forged);
+    assert!(
+        !carried.is_empty(),
+        "로그인한 사람의 신원은 router 가 싣습니다"
+    );
+    assert_eq!(jobs(&bench, &instance).len(), ran.len());
 }

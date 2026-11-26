@@ -1,0 +1,32 @@
+# 서버 서비스가 둘인 스캐폴드. 앱(server.js · db/)은 `fixtures/todo` 의 것을 그대로 쓰고 이 파일만 덮는다.
+# 둘은 같은 앱을 따로 띄운 것이고, 서비스마다 따로 자고 깨는지와 값(밖에서 넣는 비밀)이 바뀌면 둘 다 새로 깨는지를 잰다
+
+[[service]]
+name = "web"
+kind = "server"
+build = "node --check server.js"
+start = "node server.js"
+path = "/"
+roles = ["member"]
+
+[[service]]
+name = "api"
+kind = "server"
+build = "node --check server.js"
+start = "node server.js"
+path = "/assets"
+roles = ["member"]
+
+[database]
+schemas = ["todo"]
+migrations = "db/migrations"
+roles = ["member"]
+seed = "db/seed"
+
+[secrets]
+generated = ["SESSION_KEY"]
+external = ["PARTNER_KEY"]
+
+[auth]
+methods = ["email_link"]
+login_path = "/login"

@@ -37,6 +37,10 @@ pub struct ProductionRecord {
     /// 레이어가 만든 비밀. 승격해도 바뀌지 않아야 로그인이 풀리지 않는다.
     #[serde(default)]
     pub generated: BTreeMap<String, String>,
+    /// 마지막으로 되살리기가 남긴 되돌릴 지점(database 의 이름). 이것이 `restore_point` 와 같을 때만 되살리기를 무른다.
+    /// 승격하면 `restore_point` 가 그 승격의 것으로 바뀌어 무르지 못한다(이 칸은 까닭을 알리려고 남긴다).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored: Option<String>,
     /// 하위 도메인을 쓰지 않는 레이어에서 운영의 router 가 듣던 포트. 다시 뜰 때 먼저 잡아 주소가 바뀌지 않게 한다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,

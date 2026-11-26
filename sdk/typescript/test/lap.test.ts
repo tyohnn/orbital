@@ -350,6 +350,24 @@ test("git 을 이어 주면 clone 과 push 가 팩토리의 주소로 된다", {
     }
 });
 
+test("작업을 닫으면 그 작업의 부름은 다음 것부터 거절되고 다른 작업은 그대로다", { skip }, async () =>
+{
+    const instance = (await orbital.instances.create({ app: "todo", from: "v1" })).id;
+    instances.push(instance);
+    const work = await orbital.works.open({ instance, can: ["source", "preview"] });
+    const other = await orbital.works.open({ instance, can: ["source", "preview"] });
+    assert.equal(await work.rollout(), null);
+    await work.close();
+    const refused = await rejection(work.rollout());
+    assert.equal(refused.status, 401);
+    // 진행 중이던 git 도 다음 왕복부터 거절된다
+    const advertised = await work.git.relay(new Request("https://factory.example/git/w/info/refs?service=git-upload-pack"));
+    assert.equal(advertised.status, 401);
+    // 같은 인스턴스의 다른 작업은 그대로 돈다. 다시 닫아도 된다
+    assert.equal(await other.rollout(), null);
+    await work.close();
+});
+
 test("작업의 토큰으로는 승격하지 못한다", { skip }, async () =>
 {
     const instance = (await orbital.instances.create({ app: "todo", from: "v1" })).id;

@@ -36,6 +36,7 @@ use orbital_core::auth::{
 };
 use orbital_core::host::{BaseDomain, HostTarget, judge_host};
 use orbital_core::manifest::{Auth, ValidManifest};
+use orbital_core::name::Ident;
 use orbital_core::oauth::is_mcp_path;
 use orbital_core::plan::Names;
 use orbital_pg::auth::{AuthError, AuthStore, Secret, SessionUser};
@@ -77,7 +78,7 @@ const HOP_BY_HOP: [&str; 9] = [
 
 mod oauth;
 mod wake;
-pub use wake::{AppServer, Starter, WakeFailure};
+pub use wake::{AppServer, Starter, WakeFailure, start_on_free_port};
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
@@ -706,16 +707,21 @@ impl Router {
     }
 
     /// 선언의 일정 하나를 부른다. 그 서비스가 자고 있으면 깨워 `POST` 로 보내고, [`SCHEDULE_HEADER`] 에 `key` 를 싣는다.
-    /// 사람의 신원과 쿠키는 싣지 않는다. 밖에서 온 요청이 아니라 레이어가 부른 것이라 일정의 경로를 막지 않는다.
+    /// 사람의 신원과 쿠키는 싣지 않는다. `role` 이 있으면 사람 없이 그 업무 역할만 실린 서명된 신원을 싣고, 그 수명은 `limit` 이다.
+    /// 밖에서 온 요청이 아니라 레이어가 부른 것이라 일정의 경로를 막지 않는다(밖에서는 그 경로도, 이 신원도 닿지 못한다).
     /// 다시 부르지 않는다. 결과는 router 의 기록에 `SCHEDULE <서비스> <경로> <갈래> <상태>` 로만 남긴다.
     pub async fn call_schedule(
         &self,
         service: &str,
         path: &str,
         key: &str,
+        role: Option<&Ident>,
         limit: Duration,
     ) -> Called {
-        let called = self.state.call_schedule(service, path, key, limit).await;
+        let called = self
+            .state
+            .call_schedule(service, path, key, role, limit)
+            .await;
         let (outcome, status) = match called {
             Called::Answered(status) if (200..300).contains(&status) => ("ok", status.to_string()),
             Called::Answered(status) => ("failed", status.to_string()),
@@ -801,12 +807,12 @@ impl Hosts {
         }
     }
 
-    /// 요청이 가는 router. `Host` 머리말만 글자 그대로 보고(`X-Forwarded-Host` 같은 것은 믿지 않는다), 판정은 core 가 한다.
-    /// 요청 줄에 주소를 적었으면(absolute-form) 그 주소가 `Host` 와 같아야 한다.
+    /// 요청이 가는 router. `Host` 머리말만 보고(`X-Forwarded-Host` 같은 것은 믿지 않는다), 판정(대소문자와 끝의 점을 접는 것까지)은 core 가 한다.
+    /// 요청 줄에 주소를 적었으면(absolute-form) 그 주소가 `Host` 와 대소문자만 빼고 같아야 한다.
     fn pick(&self, request: &Request<Incoming>) -> Option<Router> {
         let host = request.headers().get(header::HOST)?.to_str().ok()?;
         if let Some(authority) = request.uri().authority()
-            && authority.as_str() != host
+            && !authority.as_str().eq_ignore_ascii_case(host)
         {
             return None;
         }
@@ -1077,11 +1083,14 @@ impl State {
     ) -> Response<Body> {
         let visit = match server.enter().await {
             Ok(visit) => visit,
-            Err(_) => {
+            Err(failure) => {
                 let mut response = error(StatusCode::SERVICE_UNAVAILABLE, "waking");
-                response
-                    .headers_mut()
-                    .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+                let headers = response.headers_mut();
+                headers.insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+                if failure == WakeFailure::Overloaded {
+                    // 넘친 요청의 연결은 붙잡지 않는다
+                    headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
+                }
                 return response;
             }
         };
@@ -1134,7 +1143,14 @@ impl State {
     }
 
     /// [`Router::call_schedule`] 의 몸. 기록은 부른 쪽이 남긴다.
-    async fn call_schedule(&self, service: &str, path: &str, key: &str, limit: Duration) -> Called {
+    async fn call_schedule(
+        &self,
+        service: &str,
+        path: &str,
+        key: &str,
+        role: Option<&Ident>,
+        limit: Duration,
+    ) -> Called {
         let Some(Target::Server(server)) = self.config.targets.get(service) else {
             return Called::Unreachable;
         };
@@ -1154,6 +1170,17 @@ impl State {
             let headers = request.headers_mut();
             headers.insert(SCHEDULE_HEADER, value);
             headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+            if let Some(role) = role {
+                // 사람 없이 그 역할만 실린 신원. 일정이 답하기를 기다리는 만큼만 통한다
+                let identity = sign(
+                    &self.config.identity_key,
+                    &self.config.names,
+                    &Claims::for_role(role, now() + limit.as_secs().max(1)),
+                );
+                if let Ok(value) = HeaderValue::from_str(&identity) {
+                    headers.insert(IDENTITY_HEADER, value);
+                }
+            }
             match visit.client.clone().request(request).await {
                 Ok(answer) => {
                     let status = answer.status().as_u16();

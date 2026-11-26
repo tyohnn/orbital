@@ -76,6 +76,8 @@ export interface Schedule
     path: string;
     /** 다섯 칸의 cron 식(UTC). */
     cron: string;
+    /** 일정이 도는 업무 역할(선언의 `role`). 레이어가 사람 없이 이 역할만 실린 신원을 싣는다. 없으면 `null`(신원 없이 부른다). */
+    role: string | null;
     /** 다음에 부를 때(Unix 초). */
     nextAt: number | null;
     /** 마지막으로 부른 것. 한 번도 부르지 않았으면 `null` 이다. */
@@ -88,6 +90,8 @@ export interface Session
     token: string;
     /** 만료되는 때(Unix 초). */
     expiresAt: number;
+    /** 작업의 식별자. 토큰을 모르면 지을 수 없고, 이것으로 토큰을 되살리지 못한다. 만료 전에 거둘 때(`Work.close`) 쓴다. */
+    id: string;
 }
 
 /** 사람의 승인을 기다리는 승격 요청. 승인 화면에 세운다. */
@@ -175,10 +179,15 @@ export interface Secret
     production: SecretSlot;
 }
 
-/** 사람이 값을 넣을 입력 표. `url` 에 표가 실려 있고, 사람의 브라우저가 이 주소로 `{ value }` 를 바로 `POST` 한다. 10분 안에 한 번 쓴다. */
+/**
+ * 사람이 값을 넣을 입력 표. 10분 안에 한 번 쓴다. 사람의 브라우저가 `url`(고정된 주소)로 `Authorization: Bearer <ticket>` 을 실어
+ * `{ value }` 를 바로 `POST` 한다. 표는 주소에 싣지 않는다(레이어 앞의 프록시가 남기는 접근 기록에 남지 않게).
+ */
 export interface SecretEntry
 {
     url: string;
+    /** 한 번 쓰는 표. 화면에만 건네고 모델이 읽는 자리에 싣지 않는다. */
+    ticket: string;
     /** 만료되는 때(Unix 초). */
     expiresAt: number;
 }
@@ -226,6 +235,16 @@ export interface Restored
     tables: number;
     /** 되살리기 직전의 운영 DB 를 떠 둔 되돌릴 지점(database 의 이름). */
     restorePoint: string;
+}
+
+/** 되살리기를 무른 결과. 이름과 숫자만 있다. */
+export interface RestoreUndone
+{
+    instance: string;
+    /** 걸린 시간(밀리초). */
+    millis: number;
+    /** 돌아간 DB 의 표의 수. */
+    tables: number;
 }
 
 /** 위쪽(앱)이 정한 적합성 테스트의 결과. */
@@ -301,6 +320,11 @@ export interface Work
     readonly instance: string;
     /** 만료되는 때(Unix 초). 그 뒤의 부름은 401 로 거절된다. */
     readonly expiresAt: number;
+    /**
+     * 작업을 만료 전에 닫는다(service key 로). 그 뒤로 이 작업의 토큰으로 도는 부름은 진행 중인 git 의 다음 왕복까지 401 이다.
+     * 관리 서버가 다시 떠도 닫은 채다. 여러 번 불러도 된다.
+     */
+    close(): Promise<void>;
     /** 레이어의 `main` 의 끝(또는 `commit`)을 빌드해 프리뷰를 세운다. */
     preview(input?: { commit?: string }): Promise<PreviewReport>;
     previewLogs(): Promise<PreviewLogs>;
@@ -393,6 +417,11 @@ export interface Orbital
          * 되살리기 직전의 DB 는 되돌릴 지점으로 남는다. 그 시점을 덮는 기반 백업이 없거나 보관한 WAL 이 닿지 않으면 409 다.
          */
         restore(instance: string, input: { at: number }): Promise<Restored>;
+        /**
+         * 마지막 되살리기를 무른다: 그때 남긴 되돌릴 지점(되살리기 직전의 운영 DB)으로 돌아간다. 되돌릴 지점은 하나라 한 번만 무른다.
+         * 되살린 뒤 승격이 있었거나 이미 물렀으면 409 와 까닭이다.
+         */
+        undoRestore(instance: string): Promise<RestoreUndone>;
     };
     backup: {
         /** 레이어의 복구 훈련이 통과했는지와 숫자. */
@@ -525,6 +554,7 @@ function toSchedule(value: Record<string, unknown>): Schedule
         service: text(value.service),
         path: text(value.path),
         cron: text(value.cron),
+        role: typeof value.role === "string" ? value.role : null,
         nextAt: typeof value.next_at === "number" ? value.next_at : null,
         lastRun: run === null
             ? null
@@ -743,6 +773,7 @@ export function createOrbital(options: OrbitalOptions): Orbital
         return {
             token: text(record.token),
             expiresAt: typeof record.expires_at === "number" ? record.expires_at : 0,
+            id: text(record.session),
         };
     }
 
@@ -758,6 +789,11 @@ export function createOrbital(options: OrbitalOptions): Orbital
         return {
             instance,
             expiresAt: session.expiresAt,
+            async close()
+            {
+                // 닫는 일은 팩토리의 것이다. 작업의 토큰이 아니라 service key 로 부른다
+                await call("DELETE", at(instance, `/sessions/${encodeURIComponent(session.id)}`));
+            },
             async preview(input = {})
             {
                 return toPreview(await as("POST", "/previews", input.commit === undefined ? undefined : { commit: input.commit }));
@@ -878,6 +914,12 @@ export function createOrbital(options: OrbitalOptions): Orbital
                     tables: number(record.tables),
                     restorePoint: text(record.restore_point),
                 };
+            },
+            async undoRestore(instance)
+            {
+                const reply = await call("POST", at(instance, "/restore/undo"), {});
+                const record = isRecord(reply) ? reply : {};
+                return { instance: text(record.instance), millis: number(record.millis), tables: number(record.tables) };
             },
         },
         backup: {
@@ -1046,7 +1088,7 @@ export function createOrbital(options: OrbitalOptions): Orbital
             {
                 const reply = await call("POST", at(instance, `/secrets/${encodeURIComponent(name)}/entries`), { stage });
                 const record = isRecord(reply) ? reply : {};
-                return { url: text(record.url), expiresAt: typeof record.expires_at === "number" ? record.expires_at : 0 };
+                return { url: text(record.url), ticket: text(record.ticket), expiresAt: typeof record.expires_at === "number" ? record.expires_at : 0 };
             },
         },
         oauthClients: {

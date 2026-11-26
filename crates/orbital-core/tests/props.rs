@@ -839,8 +839,8 @@ mod hosts {
     use orbital_core::name::InstanceId;
     use proptest::prelude::*;
 
-    /// 하위 도메인 자리에 올 조각. 머리말이 겹치는 식별자 둘을 두고, 모양이 틀린 것을 섞는다.
-    const LABELS: [&str; 12] = [
+    /// 하위 도메인 자리에 올 조각. 머리말이 겹치는 식별자 둘을 두고, 모양이 틀린 것과 대문자를 섞는다.
+    const LABELS: [&str; 13] = [
         "k3f9x2ab",
         "k3f9x2abc",
         "k3f9x2ab-preview",
@@ -853,8 +853,9 @@ mod hosts {
         "-preview",
         "k3f9x2ab.",
         "k3f9x2ab-Preview",
+        "K3f9X2aBc-PREVIEW",
     ];
-    /// 기준 도메인 앞에 붙어 인스턴스로 가는 머리. 이 넷 말고는 어디로도 가지 않는다.
+    /// 대소문자를 접은 머리 가운데 인스턴스로 가는 것. 이 넷 말고는 어디로도 가지 않는다.
     const HEADS: [(&str, &str, bool); 4] = [
         ("k3f9x2ab.", "k3f9x2ab", false),
         ("k3f9x2abc.", "k3f9x2abc", false),
@@ -863,20 +864,41 @@ mod hosts {
     ];
     const SEPARATORS: [&str; 3] = [".", "", ".."];
     const BASES: [&str; 2] = ["orbital.test", "orbital.test:7480"];
-    const SUFFIXES: [&str; 8] = [
+    /// 꼬리. 대소문자만 다른 것, 끝에 점이 하나 · 둘 붙은 것(포트 앞의 점 포함)을 섞는다.
+    const SUFFIXES: [&str; 14] = [
         "orbital.test",
         "orbital.test:7480",
         "orbital.test:7481",
         "evilorbital.test",
         "orbital.test.",
+        "orbital.test..",
+        "orbital.test.:7480",
+        "ORBITAL.Test",
+        "Orbital.TEST.:7480",
         "test",
         "orbital.test.other",
+        "orbital.test:07480",
+        "orbital.test:",
         "",
     ];
 
+    /// 오라클이 아는, 기준 도메인과 같은 곳을 가리키는 꼬리. 대소문자를 접고 이름 끝의 점 하나를 떼면 기준 도메인과 글자까지 같은 것만 적었다.
+    fn same_base(suffix: &str, base: &str) -> bool {
+        match base {
+            "orbital.test" => matches!(suffix, "orbital.test" | "orbital.test." | "ORBITAL.Test"),
+            "orbital.test:7480" => {
+                matches!(
+                    suffix,
+                    "orbital.test:7480" | "orbital.test.:7480" | "Orbital.TEST.:7480"
+                )
+            }
+            _ => false,
+        }
+    }
+
     proptest! {
         #[test]
-        fn 어떤_호스트든_기준_도메인_아래의_한_조각이_아니면_어느_인스턴스로도_가지_않는다(
+        fn 어떤_호스트든_대소문자와_끝의_점을_접어_기준_도메인_아래의_한_조각이_아니면_어느_인스턴스로도_가지_않는다(
             label in 0..LABELS.len(),
             separator in 0..SEPARATORS.len(),
             suffix in 0..SUFFIXES.len(),
@@ -885,10 +907,11 @@ mod hosts {
             let head = format!("{}{}", LABELS[label], SEPARATORS[separator]);
             let host = format!("{head}{}", SUFFIXES[suffix]);
             let base_text = BASES[base];
-            // 오라클: 꼬리가 기준 도메인과 한 글자도 다르지 않고, 그 앞이 인스턴스 하나의 머리와 한 글자도 다르지 않을 때만 간다
+            // 오라클: 꼬리가 기준 도메인과 같은 곳(위의 목록)이고, 소문자로 접은 머리가 인스턴스 하나의 머리와 한 글자도 다르지 않을 때만 간다
+            let folded = head.to_ascii_lowercase();
             let expected = HEADS
                 .iter()
-                .find(|(known, _, _)| SUFFIXES[suffix] == base_text && head == *known)
+                .find(|(known, _, _)| same_base(SUFFIXES[suffix], base_text) && folded == *known)
                 .map(|(_, id, preview)| {
                     let instance = InstanceId::parse(id).unwrap();
                     if *preview { HostTarget::Preview(instance) } else { HostTarget::Production(instance) }
@@ -898,7 +921,7 @@ mod hosts {
         }
 
         #[test]
-        fn 어떤_호스트든_인스턴스로_간다면_그_호스트는_그_인스턴스의_하위_도메인_그대로다(
+        fn 어떤_호스트든_인스턴스로_간다면_대소문자와_이름_끝의_점_하나를_접은_호스트는_그_인스턴스의_하위_도메인_그대로다(
             host in "[a-zA-Z0-9.:-]{0,32}",
             base in 0..BASES.len(),
         ) {
@@ -908,7 +931,13 @@ mod hosts {
                     HostTarget::Production(instance) => format!("{}.{base}", instance.as_str()),
                     HostTarget::Preview(instance) => format!("{}-preview.{base}", instance.as_str()),
                 };
-                prop_assert_eq!(host, canonical);
+                let lower = host.to_ascii_lowercase();
+                let (name, port) = match lower.split_once(':') {
+                    Some((name, port)) => (name.to_owned(), format!(":{port}")),
+                    None => (lower.clone(), String::new()),
+                };
+                let name = name.strip_suffix('.').unwrap_or(&name);
+                prop_assert_eq!(format!("{name}{port}"), canonical);
             }
         }
     }

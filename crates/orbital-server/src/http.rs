@@ -6,12 +6,12 @@
 //! `Basic` 의 비밀번호 자리에 든 토큰도 받고, 사용자 이름은 보지 않는다. 자격이 없으면 401 과 `WWW-Authenticate: Basic` 으로 답한다.
 //! 열쇠 없이 오는 길은 Google 의 콜백(`GET /v1/auth/google/callback`) 하나다. 무엇을 할지는 레이어가 서명한 `state` 가 정한다.
 //! 팩토리의 로그인 설정(`/v1/settings/auth`)은 service key 에만 있고, 넣은 비밀은 어떤 답에도 싣지 않는다.
-//! 밖에서 넣는 비밀(`/v1/instances/{id}/secrets`)의 값은 service key 와 입력 표(`/v1/secret-entries/{표}`)로만 들어오고 어떤 열쇠로도 나가지 않는다.
+//! 밖에서 넣는 비밀(`/v1/instances/{id}/secrets`)의 값은 service key 와 입력 표(`POST /v1/secret-entries`, 표는 `Authorization: Bearer`)로만 들어오고 어떤 열쇠로도 나가지 않는다.
 //! 입력 표의 길은 쿠키도 키도 보지 않고 표만 보며, 사람의 브라우저(팩토리의 카드)가 다른 출처에서 부르므로 CORS 를 연다.
 //! 무엇이 허락되는지는 여기서 정하지 않는다. 토큰은 core 의 `scope::judge` 가, 승격은 core 의 `release::promote` 가 판정한다.
 
 use std::collections::BTreeSet;
-use std::io::Read as _;
+use std::io::Read;
 use std::sync::Arc;
 
 use orbital_core::auth::query_value;
@@ -24,7 +24,7 @@ use orbital_source::Commit;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::layer::{Failure, Layer, NewRollout};
+use crate::layer::{Exchanged, Failure, Layer, NewRollout};
 use crate::vault::SecretValue;
 
 pub struct Reply {
@@ -37,6 +37,23 @@ pub struct Reply {
     pub cors: bool,
     /// `WWW-Authenticate: Basic` 을 싣는다. git 의 길에서 자격이 없거나 맞지 않을 때만 쓴다. git 은 이것을 보고 자격 도우미를 부른다.
     pub challenge: bool,
+    /// 흘려 보낼 본문. 있으면 `body` 대신 이것을 조각(chunked)으로 보낸다. git 의 받기(pack)만 쓴다.
+    pub stream: Option<Box<dyn std::io::Read + Send>>,
+}
+
+impl Reply {
+    /// 흘려 보낼 본문을 모두 읽어 `body` 에 담는다. 테스트가 부르는 [`handle`] 이 쓴다.
+    fn drained(mut self) -> Self {
+        if let Some(mut stream) = self.stream.take() {
+            let mut body = Vec::new();
+            if stream.read_to_end(&mut body).is_ok() {
+                self.body = body;
+            } else {
+                self.status = 500;
+            }
+        }
+        self
+    }
 }
 
 fn ok(value: Value) -> Reply {
@@ -47,6 +64,7 @@ fn ok(value: Value) -> Reply {
         location: None,
         cors: false,
         challenge: false,
+        stream: None,
     }
 }
 
@@ -58,6 +76,7 @@ fn found(location: String) -> Reply {
         location: Some(location),
         cors: false,
         challenge: false,
+        stream: None,
     }
 }
 
@@ -70,6 +89,7 @@ fn problem(status: u16, code: &str, message: &str, details: Vec<String>) -> Repl
         location: None,
         cors: false,
         challenge: false,
+        stream: None,
     }
 }
 
@@ -136,6 +156,9 @@ fn failure(failure: Failure) -> Reply {
         Failure::Denied(why) => denied(&why),
         Failure::Conflict(message) => problem(409, "conflict", &message, Vec::new()),
         Failure::Gone(message) => problem(410, "gone", &message, Vec::new()),
+        Failure::UnsupportedMediaType(message) => {
+            problem(415, "unsupported_media_type", &message, Vec::new())
+        }
         Failure::Internal(message) => problem(500, "internal", &message, Vec::new()),
     }
 }
@@ -196,7 +219,7 @@ fn secrets_reply(
 }
 
 /// 사람의 브라우저가 입력 표로 값을 보내는 길. 쿠키도 키도 보지 않고, 다른 출처에서 부르므로 CORS 를 연다.
-fn entry(layer: &Layer, method: &str, ticket: &str, body: &[u8]) -> Reply {
+fn entry(layer: &Layer, method: &str, ticket: Option<&str>, body: &[u8]) -> Reply {
     let mut reply = match method {
         // 브라우저의 사전 요청. 무엇이든 표가 맞는지는 본 요청에서 본다
         "OPTIONS" => Reply {
@@ -206,9 +229,15 @@ fn entry(layer: &Layer, method: &str, ticket: &str, body: &[u8]) -> Reply {
             location: None,
             cors: true,
             challenge: false,
+            stream: None,
         },
-        "POST" => parse_quietly::<EnteredValue>(body, "{ \"value\": \"…\" }")
-            .and_then(|entered| {
+        "POST" => ticket
+            .ok_or(Failure::NotFound)
+            .and_then(|ticket| {
+                parse_quietly::<EnteredValue>(body, "{ \"value\": \"…\" }")
+                    .map(|entered| (ticket, entered))
+            })
+            .and_then(|(ticket, entered)| {
                 layer.redeem_entry(
                     ticket,
                     entered.name.as_deref(),
@@ -309,6 +338,7 @@ fn with_token(
                 location: None,
                 cors: false,
                 challenge: false,
+                stream: None,
             })
         }
         ("POST", ["source"]) => {
@@ -379,7 +409,9 @@ fn with_token(
             allow(Action::SecretsWrite).map(|()| ok(json!({})))
         }
         // 되살리는 길을 토큰으로 두드리면 core 가 「service key 로만」이라고 답한다. 본문은 읽지 않는다
-        ("POST", ["restore"]) => allow(Action::RestoreInstance).map(|()| ok(json!({}))),
+        ("POST", ["restore"] | ["restore", "undo"]) => {
+            allow(Action::RestoreInstance).map(|()| ok(json!({})))
+        }
         // 자기 인스턴스가 든 열린 rollout 의 진행. 다른 인스턴스는 싣지 않는다
         ("GET", ["rollout"]) => {
             allow(Action::RolloutView)?;
@@ -446,13 +478,19 @@ fn with_service_key(
             match (method, tail) {
                 ("POST", ["sessions"]) => {
                     let request: NewSession = parse(body)?;
-                    let (token, expires_at) = layer.open_session(
+                    let (token, expires_at, session) = layer.open_session(
                         &organization,
                         &instance,
                         request.can,
                         request.ttl_seconds.unwrap_or(7200),
                     )?;
-                    Ok(ok(json!({ "token": token, "expires_at": expires_at })))
+                    Ok(ok(
+                        json!({ "token": token, "expires_at": expires_at, "session": session }),
+                    ))
+                }
+                ("DELETE", ["sessions", session]) => {
+                    layer.close_session(&organization, &instance, session)?;
+                    Ok(ok(json!({ "closed": true })))
                 }
                 ("POST", ["promotions"]) => {
                     let request: NewPromotion = parse(body)?;
@@ -548,6 +586,9 @@ fn with_service_key(
                         request.at
                     )?)))
                 }
+                ("POST", ["restore", "undo"]) => {
+                    Ok(ok(json!(layer.undo_restore(&organization, &instance)?)))
+                }
                 ("DELETE", []) => {
                     layer.destroy_instance(&organization, &instance)?;
                     Ok(ok(json!({ "destroyed": true })))
@@ -565,6 +606,7 @@ struct Incoming<'a> {
     method: &'a str,
     query: &'a str,
     credential: Option<&'a str>,
+    content_type: Option<&'a str>,
     gzipped: bool,
     body: &'a [u8],
 }
@@ -577,6 +619,7 @@ fn git(layer: &Layer, id: &str, tail: &[&str], incoming: &Incoming<'_>) -> Reply
         method,
         query,
         credential,
+        content_type,
         gzipped,
         body,
     } = *incoming;
@@ -606,7 +649,15 @@ fn git(layer: &Layer, id: &str, tail: &[&str], incoming: &Incoming<'_>) -> Reply
     let served = layer
         .authorize(credential, &instance, route.service().action())
         .and_then(|()| match route {
-            GitRoute::Advertise(service) => layer.git_advertise(&instance, service),
+            GitRoute::Advertise(service) => layer
+                .git_advertise(&instance, service)
+                .map(Exchanged::Bytes),
+            GitRoute::Exchange(_) if !route.accepts(content_type) => {
+                Err(Failure::UnsupportedMediaType(format!(
+                    "git 의 길은 `Content-Type: {}` 인 요청만 받습니다. git 이 보낸 요청을 그대로 넘겨 주세요",
+                    route.request_type().unwrap_or_default()
+                )))
+            }
             GitRoute::Exchange(service) => {
                 let inflated;
                 let request = if gzipped {
@@ -622,22 +673,31 @@ fn git(layer: &Layer, id: &str, tail: &[&str], incoming: &Incoming<'_>) -> Reply
             }
         });
     match served {
-        Ok(body) => Reply {
-            status: 200,
-            content_type: route.content_type(),
-            body,
-            location: None,
-            cors: false,
-            challenge: false,
-        },
+        Ok(exchanged) => {
+            let (body, stream): (Vec<u8>, Option<Box<dyn std::io::Read + Send>>) = match exchanged {
+                Exchanged::Bytes(body) => (body, None),
+                Exchanged::Stream(stream) => (Vec::new(), Some(Box::new(stream))),
+            };
+            Reply {
+                status: 200,
+                content_type: route.content_type(),
+                body,
+                location: None,
+                cors: false,
+                challenge: false,
+                stream,
+            }
+        }
         Err(Failure::Unauthorized) => challenged(failure(Failure::Unauthorized)),
         Err(other) => failure(other),
     }
 }
 
 /// 요청 하나를 처리한다.
+///
+/// 흘려 보낼 본문은 모두 읽어 `body` 에 담아 돌려준다(테스트가 부른다). `Content-Type` 은 싣지 않은 것으로 본다.
 pub fn handle(layer: &Layer, method: &str, path: &str, bearer: Option<&str>, body: &[u8]) -> Reply {
-    handle_request(layer, method, path, bearer, false, body)
+    handle_request(layer, method, path, bearer, None, false, body).drained()
 }
 
 /// 요청 하나를 처리한다. `gzipped` 는 본문이 `Content-Encoding: gzip` 으로 왔는지다(git 이 받는 요청을 줄여 보낸다).
@@ -646,6 +706,7 @@ pub fn handle_request(
     method: &str,
     path: &str,
     bearer: Option<&str>,
+    content_type: Option<&str>,
     gzipped: bool,
     body: &[u8],
 ) -> Reply {
@@ -667,14 +728,21 @@ pub fn handle_request(
             method,
             query,
             credential: bearer,
+            content_type,
             gzipped,
             body,
         };
         return git(layer, id, tail, &incoming);
     }
-    // 사람의 브라우저가 입력 표로 값을 보내는 곳. 쿠키도 키도 보지 않는다(실려 와도 읽지 않는다)
-    if let ["secret-entries", ticket] = rest {
-        return entry(layer, method, ticket, body);
+    // 사람의 브라우저가 입력 표로 값을 보내는 곳. 주소는 고정이고 표는 `Authorization: Bearer` 로만 온다.
+    // 레이어 앞의 프록시가 남기는 접근 기록에 표가 실리지 않게 경로에는 싣지 않는다. 쿠키는 보지 않는다
+    if let ["secret-entries", tail @ ..] = rest {
+        return entry(
+            layer,
+            method,
+            tail.is_empty().then_some(bearer).flatten(),
+            body,
+        );
     }
     // Google 이 브라우저를 돌려보내는 곳. 열쇠 없이 오고, 무엇을 할지는 레이어가 서명한 `state` 가 정한다
     if method == "GET" && rest == ["auth", "google", "callback"] {
@@ -735,6 +803,7 @@ pub fn answer(layer: &Layer, mut request: tiny_http::Request) {
     };
     let bearer = header("authorization").and_then(|value| credential(&value));
     let gzipped = header("content-encoding").is_some_and(|value| value.trim() == "gzip");
+    let content_type = header("content-type");
     let method = request.method().as_str().to_owned();
     let path = request.url().to_owned();
     let limit = layer.upload_limit();
@@ -754,18 +823,41 @@ pub fn answer(layer: &Layer, mut request: tiny_http::Request) {
             Vec::new(),
         )
     } else {
-        handle_request(layer, &method, &path, bearer.as_deref(), gzipped, &body)
+        handle_request(
+            layer,
+            &method,
+            &path,
+            bearer.as_deref(),
+            content_type.as_deref(),
+            gzipped,
+            &body,
+        )
     };
     let header = tiny_http::Header::from_bytes("Content-Type", reply.content_type)
         .expect("고정된 머리말이다");
-    let mut response = tiny_http::Response::from_data(reply.body)
-        .with_status_code(reply.status)
-        .with_header(header);
+    // 흘려 보낼 본문은 길이를 적지 않고 조각(chunked)으로 보낸다. 나머지는 길이를 적어 한 번에 보낸다
+    let (reader, length): (Box<dyn Read + Send>, Option<usize>) = match reply.stream {
+        Some(stream) => (stream, None),
+        None => {
+            let length = reply.body.len();
+            (Box::new(std::io::Cursor::new(reply.body)), Some(length))
+        }
+    };
+    let mut response = tiny_http::Response::new(
+        tiny_http::StatusCode(reply.status),
+        vec![header],
+        reader,
+        length,
+        None,
+    );
     if reply.cors {
         for (name, value) in [
             ("Access-Control-Allow-Origin", "*"),
             ("Access-Control-Allow-Methods", "POST, OPTIONS"),
-            ("Access-Control-Allow-Headers", "content-type"),
+            (
+                "Access-Control-Allow-Headers",
+                "authorization, content-type",
+            ),
             ("Access-Control-Max-Age", "600"),
             ("Cache-Control", "no-store"),
         ] {

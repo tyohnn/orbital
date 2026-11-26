@@ -1,7 +1,8 @@
 //! 인스턴스마다의 하위 도메인. 레이어가 주소 하나에서 모든 인스턴스의 요청을 받고 `Host` 로 가른다.
 //!
 //! `<인스턴스>.<기준 도메인>` 은 그 인스턴스의 운영, `<인스턴스>-preview.<기준 도메인>` 은 프리뷰다.
-//! 인스턴스의 식별자에는 `-` 가 없어 둘이 겹치지 않는다. `Host` 는 글자 그대로 본다(대소문자를 접거나 끝의 `.` 을 떼지 않는다).
+//! 인스턴스의 식별자에는 `-` 가 없어 둘이 겹치지 않는다. 호스트 이름은 대소문자를 가리지 않으므로(RFC 4343) `Host` 를 소문자로 접고,
+//! 이름 끝의 `.` 하나(완전한 이름의 표시)를 뗀 뒤에 견준다. 그 밖에는 글자 그대로 본다(포트는 기준 도메인의 것과 글자까지 같아야 한다).
 //! 기준 도메인은 바깥에서 보이는 그대로 적는다. 포트가 붙는 자리(로컬)면 `orbital.test:7480` 처럼 포트까지 적는다.
 
 use std::fmt;
@@ -171,8 +172,10 @@ impl HostTarget {
 
 /// `Host` 머리말의 값이 가리키는 곳. 기준 도메인 바로 아래의 한 조각이고 그 조각이 인스턴스(또는 그 프리뷰)일 때만 있다.
 ///
-/// 기준 도메인 자체, 두 조각 아래, 다른 도메인, 대문자, 끝의 `.`, 기준 도메인과 다른 포트는 모두 `None` 이다.
+/// 대소문자를 접고 이름 끝의 `.` 하나를 뗀 뒤에 본다. 기준 도메인 자체, 두 조각 아래, 다른 도메인, 끝의 `.` 둘,
+/// 기준 도메인과 다른 포트는 모두 `None` 이다.
 pub fn judge_host(host: &str, base: &BaseDomain) -> Option<HostTarget> {
+    let host = fold_host(host);
     let label = host.strip_suffix(base.as_str())?.strip_suffix('.')?;
     let (id, preview) = match label.strip_suffix(PREVIEW_SUFFIX) {
         Some(id) => (id, true),
@@ -184,6 +187,20 @@ pub fn judge_host(host: &str, base: &BaseDomain) -> Option<HostTarget> {
     } else {
         HostTarget::Production(instance)
     })
+}
+
+/// 호스트를 견줄 모양으로 접는다. ASCII 소문자로 바꾸고, 포트 앞의 이름 끝에 `.` 이 하나 있으면 뗀다.
+fn fold_host(host: &str) -> String {
+    let lower = host.to_ascii_lowercase();
+    let (name, port) = match lower.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (lower.as_str(), None),
+    };
+    let name = name.strip_suffix('.').unwrap_or(name);
+    match port {
+        Some(port) => format!("{name}:{port}"),
+        None => name.to_owned(),
+    }
 }
 
 /// 그 곳의 origin(`https://<조각>.<기준 도메인>`). 쿠키 · 로그인 링크 · `Origin` 검사 · OAuth 의 발급자가 이것을 쓴다.
@@ -248,8 +265,8 @@ mod tests {
             "orbital.test",
             ".orbital.test",
             "x.k3f9x2ab.orbital.test",
-            "K3F9X2AB.orbital.test",
-            "k3f9x2ab.orbital.test.",
+            "k3f9x2ab.orbital.test..",
+            "k3f9x2ab..orbital.test",
             "k3f9x2ab.orbital.test:80",
             "k3f9x2ab.evilorbital.test",
             "k3f9x2aborbital.test",
@@ -260,6 +277,33 @@ mod tests {
         ] {
             assert_eq!(judge_host(unknown, &base), None, "{unknown}");
         }
+    }
+
+    #[test]
+    fn 호스트는_대소문자를_가리지_않고_이름_끝의_점_하나를_떼고_견준다() {
+        let base = base("orbital.test");
+        for host in [
+            "K3F9X2AB.orbital.test",
+            "k3f9x2ab.ORBITAL.TEST",
+            "k3f9x2ab.orbital.test.",
+            "K3f9x2Ab.Orbital.Test.",
+        ] {
+            assert_eq!(
+                judge_host(host, &base),
+                Some(HostTarget::Production(id("k3f9x2ab"))),
+                "{host}"
+            );
+        }
+        assert_eq!(
+            judge_host("K3F9X2AB-PREVIEW.orbital.test", &base),
+            Some(HostTarget::Preview(id("k3f9x2ab")))
+        );
+        let with_port = self::base("orbital.test:7480");
+        assert_eq!(
+            judge_host("K3F9X2AB.orbital.test.:7480", &with_port),
+            Some(HostTarget::Production(id("k3f9x2ab")))
+        );
+        assert_eq!(judge_host("k3f9x2ab.orbital.test:7480.", &with_port), None);
     }
 
     #[test]

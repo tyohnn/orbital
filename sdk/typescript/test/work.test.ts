@@ -32,7 +32,7 @@ function fakeLayer(): { sent: Sent[]; fetch: typeof fetch }
         const json = (value: unknown): Response => new Response(JSON.stringify(value), { status: 200, headers: { "content-type": "application/json" } });
         if (url.endsWith("/sessions"))
         {
-            return json({ token: WORK_TOKEN, expires_at: 1_900_000_000 });
+            return json({ token: WORK_TOKEN, expires_at: 1_900_000_000, session: "ab".repeat(16) });
         }
         if (url.includes("/git/"))
         {
@@ -78,7 +78,7 @@ async function openWork(): Promise<{ work: Work; sent: Sent[] }>
     return { work, sent: layer.sent };
 }
 
-test("작업의 함수들은 작업의 토큰으로만 부르고 service key 를 싣지 않는다", async () =>
+test("작업의 함수들은 작업의 토큰으로만 부르고 service key 를 싣지 않는다. 작업을 닫는 것만 service key 로 부른다", async () =>
 {
     const { work, sent } = await openWork();
     // 작업을 여는 것만 service key 로 부른다
@@ -122,7 +122,13 @@ test("작업의 함수들은 작업의 토큰으로만 부르고 service key 를
         assert.ok(!call.body.includes(SERVICE_KEY), call.url);
     }
     // 운영을 바꾸는 함수는 작업에 없다
-    assert.deepEqual(Object.keys(work).sort(), ["expiresAt", "git", "instance", "preview", "previewLogs", "previewSignIn", "rehearse", "requestPromotion", "rollout", "secrets"]);
+    assert.deepEqual(Object.keys(work).sort(), ["close", "expiresAt", "git", "instance", "preview", "previewLogs", "previewSignIn", "rehearse", "requestPromotion", "rollout", "secrets"]);
+    // 닫는 일은 팩토리의 것이라 service key 로 부르고, 작업의 식별자만 싣는다(토큰은 싣지 않는다)
+    await work.close();
+    const closing = sent.at(-1);
+    assert.equal(`${closing?.method} ${closing?.url}`, `DELETE http://layer.invalid/v1/instances/k3f9x2ab/sessions/${"ab".repeat(16)}`);
+    assert.equal(closing?.headers.get("authorization"), `Bearer ${SERVICE_KEY}`);
+    assert.ok(!closing?.url.includes(WORK_TOKEN) && !closing?.body.includes(WORK_TOKEN));
 });
 
 test("이어 주는 길은 정해진 셋 밖의 경로와 밖에서 온 Authorization 을 넘기지 않는다", async () =>
@@ -193,14 +199,14 @@ test("이어 주는 길은 정해진 셋 밖의 경로와 밖에서 온 Authoriz
     assert.equal(await answer.text(), "0000");
 });
 
-test("운영의 답에는 일정마다 다음 때와 마지막 실행이 숫자와 갈래로만 온다", async () =>
+test("운영의 답에는 일정마다 도는 업무 역할과 다음 때와 마지막 실행이 숫자와 갈래로만 온다", async () =>
 {
     const reply = {
         release: "r1",
         services: [{ name: "api", kind: "server", url: "https://hr.example/api" }],
         migrations: [],
         schedules: [
-            { service: "api", path: "/api/jobs/payroll", cron: "0 9 25 * *", next_at: 1_798_189_200, last_run: { due_at: 1_795_597_200, started_at: 1_795_597_210, outcome: "timed_out", status: null, millis: 600_000 } },
+            { service: "api", path: "/api/jobs/payroll", cron: "0 9 25 * *", role: "payroll_admin", next_at: 1_798_189_200, last_run: { due_at: 1_795_597_200, started_at: 1_795_597_210, outcome: "timed_out", status: null, millis: 600_000 } },
             { service: "api", path: "/api/jobs/close", cron: "0 0 1 * *", next_at: 1_798_761_600, last_run: null },
         ],
     };
@@ -211,7 +217,7 @@ test("운영의 답에는 일정마다 다음 때와 마지막 실행이 숫자�
     });
     const production = await orbital.production.get("k3f9x2ab");
     assert.deepEqual(production?.schedules, [
-        { service: "api", path: "/api/jobs/payroll", cron: "0 9 25 * *", nextAt: 1_798_189_200, lastRun: { dueAt: 1_795_597_200, startedAt: 1_795_597_210, outcome: "timed_out", status: null, millis: 600_000 } },
-        { service: "api", path: "/api/jobs/close", cron: "0 0 1 * *", nextAt: 1_798_761_600, lastRun: null },
+        { service: "api", path: "/api/jobs/payroll", cron: "0 9 25 * *", role: "payroll_admin", nextAt: 1_798_189_200, lastRun: { dueAt: 1_795_597_200, startedAt: 1_795_597_210, outcome: "timed_out", status: null, millis: 600_000 } },
+        { service: "api", path: "/api/jobs/close", cron: "0 0 1 * *", role: null, nextAt: 1_798_761_600, lastRun: null },
     ]);
 });

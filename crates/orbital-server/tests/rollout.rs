@@ -587,6 +587,70 @@ fn 한_곳이_실패하면_rollout_이_멈추고_나머지는_오르지_못한�
     assert_eq!(state(&lab.now(&rid), &a)["state"], "passed");
 }
 
+/// 포크가 DB 를 더하되 권한 표에 적지 않은 표를 마이그레이션이 만든다. 그 release 의 프리뷰는 서지만 권한 검사가 어긋난다.
+fn add_unlisted_table(work: &Path) {
+    let manifest = fs::read_to_string(work.join("orbital.toml"))
+        .unwrap()
+        .replace("path = \"/\"\n", "path = \"/\"\nroles = [\"member\"]\n");
+    fs::write(
+        work.join("orbital.toml"),
+        format!(
+            "{manifest}\n[database]\nschemas = [\"fleet\"]\nmigrations = \"db/migrations\"\nroles = [\"member\"]\n"
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(work.join("db/migrations")).unwrap();
+    fs::write(
+        work.join("db/migrations/001_item.sql"),
+        "CREATE TABLE fleet.item (id int PRIMARY KEY);\nALTER TABLE fleet.item ENABLE ROW LEVEL SECURITY;\nCREATE TABLE fleet.note (id int PRIMARY KEY);\n",
+    )
+    .unwrap();
+    fs::write(
+        work.join("db/access.toml"),
+        "[fleet.item]\nmember = \"read\"\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn 업데이트를_담은_release_의_프리뷰에서_권한이_어긋나면_그_인스턴스가_실패로_적히고_rollout_이_멈춘다()
+ {
+    let mut lab = lab!();
+    let (a, b) = (lab.instance(), lab.instance());
+    let (ta, tb) = (lab.token(FACTORY, &a), lab.token(FACTORY, &b));
+    lab.change(&b, &tb, &add_unlisted_table);
+    lab.update(FACTORY);
+    let rid = id(&lab.rollout_ok("security_update", &[&[&a, &b]]));
+    lab.apply_ok(&rid, &a);
+    lab.apply_ok(&rid, &b);
+
+    let preview_a = lab.preview(&a, &ta);
+    assert_eq!(state(&lab.now(&rid), &a)["state"], "passed");
+    // b 의 프리뷰는 서고 적합성 테스트도 통과하지만 권한 검사가 어긋난다
+    let preview_b = lab.preview(&b, &tb);
+    assert_eq!(preview_b["conformance"]["passed"], true, "{preview_b}");
+    assert!(
+        preview_b["findings"]
+            .as_array()
+            .is_some_and(|findings| findings
+                .iter()
+                .any(|finding| finding.as_str().unwrap_or_default().contains("fleet.note"))),
+        "{preview_b}"
+    );
+    let now = lab.now(&rid);
+    assert_eq!(now["status"], "halted", "{now}");
+    assert_eq!(
+        state(&now, &b),
+        json!({ "instance": b, "state": "failed", "reason": "access_check_failed" })
+    );
+    // 멈춘 동안 a 는 통과했어도 오르지 못한다
+    let (status, body) = lab.request(&a, &ta, &release(&preview_a));
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = lab.promote(&a, &release(&preview_a), "security_update", "factory");
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(lab.production(&a), Value::Null);
+}
+
 #[test]
 fn 멈춘_rollout_은_팩토리가_다시_열어야_이어진다() {
     let mut lab = lab!();
@@ -1284,4 +1348,47 @@ fn 관리_서버가_다시_떠도_rollout_의_진행이_남는다() {
     let (status, body) = lab.promote(&a, &release(&preview), "security_update", "factory");
     assert_eq!(status, 200, "{body}");
     assert_eq!(state(&lab.now(&rid), &a)["state"], "promoted");
+}
+
+// ---- 작업을 닫기 ----
+
+#[test]
+fn 닫은_작업의_토큰은_관리_서버가_다시_떠도_받지_않고_다른_팩토리는_그_작업을_닫지_못한다() {
+    let mut lab = lab!();
+    let instance = lab.instance();
+    let (status, opened) = lab.post(
+        &format!("/v1/instances/{instance}/sessions"),
+        FACTORY,
+        &json!({ "can": ALL }),
+    );
+    assert_eq!(status, 200, "{opened}");
+    let token = opened["token"].as_str().unwrap().to_owned();
+    let session = opened["session"].as_str().unwrap().to_owned();
+    let rollout_of = |lab: &Lab, token: &str| {
+        lab.call(
+            "GET",
+            &format!("/v1/instances/{instance}/rollout"),
+            token,
+            &[],
+        )
+        .0
+    };
+    assert_eq!(rollout_of(&lab, &token), 200);
+
+    // 다른 팩토리는 그 인스턴스의 작업을 닫지 못한다(없는 것과 같다)
+    let close = format!("/v1/instances/{instance}/sessions/{session}");
+    let (status, _) = lab.call("DELETE", &close, OTHER_FACTORY, &[]);
+    assert_eq!(status, 404);
+    assert_eq!(rollout_of(&lab, &token), 200);
+
+    let (status, body) = lab.call("DELETE", &close, FACTORY, &[]);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(rollout_of(&lab, &token), 401);
+    lab.restart();
+    assert_eq!(rollout_of(&lab, &token), 401);
+    // 새로 연 작업은 돈다. 같은 범위로 같은 초에 열어도 글자가 다르다
+    let fresh = lab.token(FACTORY, &instance);
+    let again = lab.token(FACTORY, &instance);
+    assert_ne!(fresh, again);
+    assert_eq!(rollout_of(&lab, &fresh), 200);
 }

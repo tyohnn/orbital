@@ -1,0 +1,32 @@
+# 일정이 업무 역할로 도는 스캐폴드. 앱(server.js 를 뺀 db/)은 `fixtures/payroll` 의 것을 그대로 쓰고 이 파일과 server.js 만 덮는다.
+# 두 일정이 같은 연결(급여 관리자)로 급여 명세를 읽고 고친다. 하나는 역할을 적어 레이어가 그 역할만의 신원을 싣고, 하나는 적지 않았다
+
+[[service]]
+name = "web"
+kind = "server"
+build = "node --check server.js"
+start = "node server.js"
+path = "/"
+roles = ["employee", "payroll_admin"]
+auth = "required"
+
+[[schedule]]                  # 매분. 급여 관리자의 역할로 돈다
+service = "web"
+cron = "* * * * *"
+path = "/jobs/payroll"
+role = "payroll_admin"
+
+[[schedule]]                  # 매분. 역할을 적지 않았다. 신원 없이 돌아 역할 제한 정책에 막힌다
+service = "web"
+cron = "* * * * *"
+path = "/jobs/blind"
+
+[database]
+schemas = ["payroll"]
+migrations = "db/migrations"
+roles = ["employee", "payroll_admin"]
+seed = "db/seed"
+
+[auth]
+methods = ["email_link"]
+login_path = "/login"

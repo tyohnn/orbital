@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::access::{Access, Grant, Reach};
+use crate::manifest::Schedule;
 use crate::name::{Ident, TableRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -97,6 +98,56 @@ pub fn changes(before: &Access, after: &Access) -> Vec<Change> {
     found
 }
 
+/// 일정이 도는 업무 역할의 변화를 문장으로 돌려준다. 승인 카드에 권한의 변화와 함께 선다.
+///
+/// 일정이 새로 생기거나 그 역할이 바뀌어 어떤 역할로 돌게 되면 「이번 변경으로 일정 … 이 `역할` 역할로 돕니다」가 선다(넓어지는 것이라 먼저).
+/// 역할을 빼거나 일정을 지우면 「… 은 더는 `역할` 역할로 돌지 않습니다」가 선다. 일정은 서비스 · cron · 경로(`Schedule::key`)로 가른다.
+/// 처음 배포라면 `before` 에 빈 목록을 넘긴다.
+pub fn schedule_changes(before: &[Schedule], after: &[Schedule]) -> Vec<String> {
+    let named = |schedule: &Schedule| {
+        format!(
+            "`{}`(`{}`, UTC)",
+            schedule.path,
+            schedule
+                .cron
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
+    let role_of = |list: &[Schedule], key: &str| {
+        list.iter()
+            .find(|schedule| schedule.key() == key)
+            .and_then(|schedule| schedule.role.clone())
+    };
+    let mut widened = Vec::new();
+    let mut narrowed = Vec::new();
+    for schedule in after {
+        let was = role_of(before, &schedule.key());
+        if let Some(role) = &schedule.role
+            && was.as_ref() != Some(role)
+        {
+            widened.push(format!(
+                "이번 변경으로 일정 {}이 `{role}` 역할로 돕니다. 그 역할의 모든 행 권한으로 읽고 씁니다",
+                named(schedule)
+            ));
+        }
+    }
+    for schedule in before {
+        let now = role_of(after, &schedule.key());
+        if let Some(role) = &schedule.role
+            && now.as_ref() != Some(role)
+        {
+            narrowed.push(format!(
+                "일정 {}은 더는 `{role}` 역할로 돌지 않습니다",
+                named(schedule)
+            ));
+        }
+    }
+    widened.extend(narrowed);
+    widened
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +158,53 @@ mod tests {
             .into_iter()
             .map(|change| change.sentence)
             .collect()
+    }
+
+    fn schedule(path: &str, role: Option<&str>) -> Schedule {
+        Schedule {
+            service: Ident::parse("api").unwrap(),
+            cron: "0 9 25 * *".to_owned(),
+            path: path.to_owned(),
+            role: role.map(|role| Ident::parse(role).unwrap()),
+        }
+    }
+
+    #[test]
+    fn 일정이_새로_생기거나_역할이_바뀌어_어떤_역할로_돌게_되면_그_문장이_먼저_선다() {
+        let payroll = schedule("/api/jobs/payroll", Some("payroll_admin"));
+        assert_eq!(
+            schedule_changes(&[], std::slice::from_ref(&payroll)),
+            vec![
+                "이번 변경으로 일정 `/api/jobs/payroll`(`0 9 25 * *`, UTC)이 `payroll_admin` 역할로 돕니다. 그 역할의 모든 행 권한으로 읽고 씁니다"
+                    .to_owned()
+            ]
+        );
+        // 같은 역할로 그대로면 문장이 없다. 역할이 없던 일정에 역할이 붙어도 선다
+        assert_eq!(
+            schedule_changes(
+                std::slice::from_ref(&payroll),
+                std::slice::from_ref(&payroll)
+            ),
+            Vec::<String>::new()
+        );
+        let bare = schedule("/api/jobs/payroll", None);
+        assert_eq!(
+            schedule_changes(std::slice::from_ref(&bare), std::slice::from_ref(&payroll)).len(),
+            1
+        );
+        // 역할이 바뀌면 새 역할의 문장(먼저)과 앞 역할의 문장이 함께 선다
+        let manager = schedule("/api/jobs/payroll", Some("manager"));
+        assert_eq!(
+            schedule_changes(std::slice::from_ref(&manager), std::slice::from_ref(&payroll)),
+            vec![
+                "이번 변경으로 일정 `/api/jobs/payroll`(`0 9 25 * *`, UTC)이 `payroll_admin` 역할로 돕니다. 그 역할의 모든 행 권한으로 읽고 씁니다"
+                    .to_owned(),
+                "일정 `/api/jobs/payroll`(`0 9 25 * *`, UTC)은 더는 `manager` 역할로 돌지 않습니다"
+                    .to_owned(),
+            ]
+        );
+        // 역할 없는 일정은 문장이 없다
+        assert_eq!(schedule_changes(&[], &[bare]), Vec::<String>::new());
     }
 
     #[test]

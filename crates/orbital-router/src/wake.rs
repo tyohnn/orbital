@@ -4,6 +4,8 @@
 //! 포트가 열릴 때까지 기다렸다가 넘긴다. 동시에 온 첫 요청들은 한 번의 깨우기를 함께 기다린다(깨우는 문은 하나다).
 //! 마지막 요청의 답이 끝까지 나간 뒤 정한 시간 동안 요청이 없으면 프로세스를 내린다. 처리 중인 요청이 있으면 재우지 않는다.
 //! 깨우지 못하면 부르는 쪽이 503 과 `Retry-After` 로 답하고, 다음 요청이 다시 깨운다.
+//! 깨우기를 기다리는 요청의 수에는 서비스마다 상한이 있다. 넘친 요청은 기다리지 않고 곧바로 503 으로 돌려보내,
+//! 자는 서비스를 향한 요청의 홍수가 기다리는 연결과 메모리를 끝없이 쌓지 못하게 한다.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,6 +30,8 @@ pub enum WakeFailure {
     Busy,
     /// 인스턴스를 내리는 중이다.
     Closed,
+    /// 깨우기를 기다리는 요청이 상한에 찼다. 기다리지 않고 돌려보낸다.
+    Overloaded,
 }
 
 impl std::fmt::Display for WakeFailure {
@@ -38,6 +42,7 @@ impl std::fmt::Display for WakeFailure {
             Self::TimedOut => "timed_out",
             Self::Busy => "busy",
             Self::Closed => "closed",
+            Self::Overloaded => "overloaded",
         })
     }
 }
@@ -65,6 +70,8 @@ struct State {
     closed: bool,
     /// 처리 중인 요청이 끝나면 곧바로 재운다. 앱에 건넬 값(비밀)이 바뀌었을 때 선다.
     refresh: bool,
+    /// 깨우기를 기다리는 요청의 수(깨우는 문을 쥔 것까지).
+    waiting: usize,
 }
 
 /// 서버 서비스 하나.
@@ -73,6 +80,8 @@ pub struct AppServer {
     starter: Arc<dyn Starter>,
     sleep_after: Duration,
     wake_timeout: Duration,
+    /// 깨우기를 기다리는 요청의 상한.
+    wait_limit: usize,
     state: Mutex<State>,
     /// 깨우는 문. 깨우기와 재우기는 이 문을 쥔 하나만 한다. 그래서 내리는 중인 프로세스의 포트에 새 프로세스가 겹치지 않는다.
     gate: tokio::sync::Mutex<()>,
@@ -94,12 +103,47 @@ impl Drop for Visit {
     }
 }
 
+/// 깨우기를 기다리는 자리 하나. 기다림이 끝나면(깨웠든, 못 깨웠든, 요청이 끊겼든) 떨어지며 자리를 돌려준다.
+struct Waiting<'a> {
+    server: &'a AppServer,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut state = self.server.lock();
+        state.waiting = state.waiting.saturating_sub(1);
+    }
+}
+
+/// 포트를 열기 전에 끝난 앱을 포트를 바꿔 띄워 보는 횟수(처음 것 포함).
+const START_ATTEMPTS: usize = 2;
+
+/// 빈 포트를 받아 서비스를 띄운다. 띄운 프로세스와 그 포트를 돌려준다.
+///
+/// 받은 포트는 잡았다 놓은 것이라, 앱이 듣기 전에 이 기계의 다른 프로세스가 먼저 잡을 수 있다(나가는 연결의 임시 포트도 같은
+/// 범위에서 나온다). 그러면 앱은 듣지 못하고 끝난다. 포트를 바꿔 한 번 더 띄운다. 앱이 제 잘못으로 끝나는 것이면 다시 띄워도
+/// 끝나므로 두 번에서 멈춘다.
+pub fn start_on_free_port(starter: &dyn Starter) -> Result<(Box<dyn Running>, u16), WakeFailure> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let port = orbital_run::free_port().ok_or(WakeFailure::Refused)?;
+        match starter.start(port) {
+            Ok(process) => return Ok((process, port)),
+            Err(WakeFailure::Exited) if attempts < START_ATTEMPTS => {}
+            Err(failure) => return Err(failure),
+        }
+    }
+}
+
 impl AppServer {
+    /// `wait_limit` 은 깨우기를 기다리는 요청의 상한이다(0 이면 1 로 본다).
     pub fn new(
         name: impl Into<String>,
         starter: Arc<dyn Starter>,
         sleep_after: Duration,
         wake_timeout: Duration,
+        wait_limit: usize,
         runtime: tokio::runtime::Handle,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -107,6 +151,7 @@ impl AppServer {
             starter,
             sleep_after,
             wake_timeout,
+            wait_limit: wait_limit.max(1),
             state: Mutex::new(State::default()),
             gate: tokio::sync::Mutex::new(()),
             note: Mutex::new(None),
@@ -225,6 +270,15 @@ impl AppServer {
         if let Some(visit) = self.try_enter()? {
             return Ok(visit);
         }
+        // 기다리는 자리가 찼으면 기다리지 않는다
+        let _waiting = {
+            let mut state = self.lock();
+            if state.waiting >= self.wait_limit {
+                return Err(WakeFailure::Overloaded);
+            }
+            state.waiting += 1;
+            Waiting { server: self }
+        };
         // 깨우는 문을 기다리는 시간에도 상한을 둔다. 앞의 깨우기 하나가 끝나기를 기다리는 만큼이다
         let Ok(_gate) = tokio::time::timeout(self.wake_timeout * 2, self.gate.lock()).await else {
             self.record(WakeFailure::Busy);
@@ -240,12 +294,9 @@ impl AppServer {
             let _ = tokio::task::spawn_blocking(move || dead.process.stop()).await;
         }
         let starter = Arc::clone(&self.starter);
-        let started = tokio::task::spawn_blocking(move || {
-            let port = orbital_run::free_port().ok_or(WakeFailure::Refused)?;
-            starter.start(port).map(|process| (process, port))
-        })
-        .await
-        .unwrap_or(Err(WakeFailure::Refused));
+        let started = tokio::task::spawn_blocking(move || start_on_free_port(starter.as_ref()))
+            .await
+            .unwrap_or(Err(WakeFailure::Refused));
         let (process, port) = match started {
             Ok(started) => started,
             Err(failure) => {
@@ -326,4 +377,81 @@ impl AppServer {
 fn new_client() -> Client<HttpConnector, Body> {
     // 앱으로 가는 연결은 살려 두고 다시 쓴다. 잘 때 이 묶음을 버린다
     Client::builder(TokioExecutor::new()).build_http()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// 살아 있는 척하는 프로세스.
+    struct Fake;
+
+    impl Running for Fake {
+        fn alive(&mut self) -> bool {
+            true
+        }
+
+        fn stop(&mut self) {}
+    }
+
+    /// 처음 `exits` 번은 포트를 열기 전에 끝나고, 그 뒤로는 뜬다. 받은 포트를 적어 둔다.
+    struct Flaky {
+        exits: usize,
+        calls: AtomicUsize,
+        ports: Mutex<Vec<u16>>,
+    }
+
+    impl Starter for Flaky {
+        fn start(&self, port: u16) -> Result<Box<dyn Running>, WakeFailure> {
+            self.ports.lock().unwrap().push(port);
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.exits {
+                return Err(WakeFailure::Exited);
+            }
+            Ok(Box::new(Fake))
+        }
+    }
+
+    fn server(exits: usize) -> (tokio::runtime::Runtime, Arc<Flaky>, Arc<AppServer>) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let starter = Arc::new(Flaky {
+            exits,
+            calls: AtomicUsize::new(0),
+            ports: Mutex::new(Vec::new()),
+        });
+        let server = AppServer::new(
+            "web",
+            Arc::clone(&starter) as Arc<dyn Starter>,
+            Duration::from_secs(3600),
+            Duration::from_secs(5),
+            8,
+            runtime.handle().clone(),
+        );
+        (runtime, starter, server)
+    }
+
+    #[test]
+    fn 포트를_열기_전에_끝나면_다른_포트로_한_번_더_띄운다() {
+        // 받은 포트를 그사이 다른 프로세스가 잡으면 앱은 듣지 못하고 끝난다. 포트를 바꿔 한 번 더 띄운다
+        let (runtime, starter, server) = server(1);
+        let visit = runtime.block_on(server.enter());
+        assert!(visit.is_ok(), "{:?}", visit.err());
+        let ports = starter.ports.lock().unwrap().clone();
+        assert_eq!(ports.len(), 2);
+        assert_ne!(ports[0], ports[1]);
+        drop(visit);
+    }
+
+    #[test]
+    fn 다시_띄워도_끝나면_더_띄우지_않고_끝났다고_알린다() {
+        // 앱이 제 잘못으로 끝나는 것이면 되풀이해도 소용없다. 두 번에서 멈춘다
+        let (runtime, starter, server) = server(usize::MAX);
+        let failure = runtime.block_on(server.enter()).err();
+        assert_eq!(failure, Some(WakeFailure::Exited));
+        assert_eq!(starter.calls.load(Ordering::SeqCst), 2);
+    }
 }

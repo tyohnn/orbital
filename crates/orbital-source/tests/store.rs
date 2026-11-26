@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use orbital_core::name::InstanceId;
 use orbital_source::assemble::{AssembleError, assemble, release_id};
-use orbital_source::{Commit, Error, SourceStore};
+use orbital_source::{Commit, Error, Merged, SourceStore};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -578,4 +578,246 @@ fn 풀면_커지는_요청은_한도까지만_풀고_멈춰_메모리를_한도�
     let grew = peak_kib().saturating_sub(before);
     assert!(grew < 64 * 1024, "풀면서 {grew} KiB 를 더 썼습니다");
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+
+// ---- 업데이트: 받아 두기 · 합치기 · 담았는지 ----
+
+/// 앱(위쪽)에 업데이트 commit 을 하나 더한다. `file` 을 `text` 로 쓴다.
+fn upstream_commit(scaffold: &Path, file: &str, text: &str, message: &str) -> Commit {
+    write(scaffold, file, text);
+    commit_all(scaffold, message)
+}
+
+/// 에이전트가 하듯이 작업 폴더에서 고쳐 묶음으로 올린다.
+fn push_change(
+    scratch: &Scratch,
+    store: &SourceStore,
+    id: &InstanceId,
+    work: &Path,
+    file: &str,
+    text: &str,
+) -> Commit {
+    write(work, file, text);
+    let commit = commit_all(work, "포크를 고친다");
+    assert_eq!(
+        store.receive(id, &bundle_of(scratch, work)).unwrap(),
+        commit
+    );
+    commit
+}
+
+#[test]
+fn 받아_둔_업데이트는_묶음에_update_로_담기고_앱에_없는_commit_은_받지_않는다() {
+    let scratch = Scratch::new();
+    let (store, id, _, _) = setup(&scratch);
+    let scaffold = scratch.path("scaffold");
+    let update = upstream_commit(&scaffold, "server.js", "// 서버 v2\n", "업데이트 v2");
+    // 앱에 없는 commit 은 받지 않고 묶음에도 담기지 않는다
+    let stray = Commit::parse(&"ab".repeat(20)).unwrap();
+    assert!(matches!(
+        store.fetch_upstream(&id, &scaffold, &stray),
+        Err(Error::NoSuchCommit)
+    ));
+    let before = clone(&scratch, &store, &id, "before");
+    assert_eq!(
+        git(&before, &["branch", "-r", "--list", "origin/update"]),
+        ""
+    );
+
+    store.fetch_upstream(&id, &scaffold, &update).unwrap();
+    let after = clone(&scratch, &store, &id, "after");
+    assert_eq!(
+        git(&after, &["rev-parse", "origin/update"]),
+        update.as_str()
+    );
+    // 거두면 묶음에서 빠진다
+    store.clear_update(&id).unwrap();
+    let cleared = clone(&scratch, &store, &id, "cleared");
+    assert_eq!(
+        git(&cleared, &["branch", "-r", "--list", "origin/update"]),
+        ""
+    );
+}
+
+#[test]
+fn 충돌_없는_업데이트는_main_위에_합쳐지고_합친_commit_의_부모는_main_과_업데이트다() {
+    let scratch = Scratch::new();
+    let (store, id, work, _) = setup(&scratch);
+    let scaffold = scratch.path("scaffold");
+    let fork = push_change(
+        &scratch,
+        &store,
+        &id,
+        &work,
+        "custom.json",
+        "{\"greeting\": \"A\"}\n",
+    );
+    let update = upstream_commit(&scaffold, "server.js", "// 서버 v2\n", "업데이트 v2");
+    store.fetch_upstream(&id, &scaffold, &update).unwrap();
+
+    let Merged::Merged(merged) = store.merge(&id, &update).unwrap() else {
+        panic!("합치지 않았습니다");
+    };
+    assert_eq!(store.head(&id).unwrap(), merged);
+    let merged_work = clone(&scratch, &store, &id, "merged");
+    assert_eq!(
+        git(&merged_work, &["rev-parse", "HEAD^1", "HEAD^2"]),
+        format!("{fork}\n{update}")
+    );
+    // 포크의 손과 업데이트가 함께 있다
+    assert_eq!(
+        fs::read_to_string(merged_work.join("server.js")).unwrap(),
+        "// 서버 v2\n"
+    );
+    assert_eq!(
+        fs::read_to_string(merged_work.join("custom.json")).unwrap(),
+        "{\"greeting\": \"A\"}\n"
+    );
+    assert!(store.descends(&id, &merged, &update).unwrap());
+    assert!(!store.descends(&id, &fork, &update).unwrap());
+}
+
+#[test]
+fn 충돌하면_main_을_건드리지_않고_충돌한_파일의_이름만_돌려준다() {
+    let scratch = Scratch::new();
+    let (store, id, work, _) = setup(&scratch);
+    let scaffold = scratch.path("scaffold");
+    let fork = push_change(
+        &scratch,
+        &store,
+        &id,
+        &work,
+        "server.js",
+        "// 포크의 서버\n",
+    );
+    let update = upstream_commit(&scaffold, "server.js", "// 서버 v2\n", "업데이트 v2");
+    store.fetch_upstream(&id, &scaffold, &update).unwrap();
+
+    assert_eq!(
+        store.merge(&id, &update).unwrap(),
+        Merged::Conflicts(vec!["server.js".to_owned()])
+    );
+    assert_eq!(store.head(&id).unwrap(), fork);
+    assert!(!store.descends(&id, &fork, &update).unwrap());
+}
+
+#[test]
+fn main_이_이미_업데이트를_담으면_합치지_않고_그대로_둔다() {
+    let scratch = Scratch::new();
+    let (store, id, work, _) = setup(&scratch);
+    let scaffold = scratch.path("scaffold");
+    push_change(
+        &scratch,
+        &store,
+        &id,
+        &work,
+        "custom.json",
+        "{\"greeting\": \"A\"}\n",
+    );
+    let update = upstream_commit(&scaffold, "server.js", "// 서버 v2\n", "업데이트 v2");
+    store.fetch_upstream(&id, &scaffold, &update).unwrap();
+    // 에이전트가 받은 저장소의 `origin/update` 를 손으로 합쳐 올렸다(앞으로 감기가 아닌 합친 commit)
+    let fresh = clone(&scratch, &store, &id, "fresh");
+    git(&fresh, &["merge", "--quiet", "--no-edit", "origin/update"]);
+    let head = Commit::parse(&git(&fresh, &["rev-parse", "HEAD"])).unwrap();
+    assert_eq!(
+        store.receive(&id, &bundle_of(&scratch, &fresh)).unwrap(),
+        head
+    );
+
+    assert_eq!(
+        store.merge(&id, &update).unwrap(),
+        Merged::Already(head.clone())
+    );
+    assert_eq!(store.head(&id).unwrap(), head);
+    // 받지 않은 commit 으로는 합치지 않는다
+    let stray = Commit::parse(&"cd".repeat(20)).unwrap();
+    assert!(matches!(store.merge(&id, &stray), Err(Error::NoSuchCommit)));
+}
+
+#[test]
+fn 업데이트를_받은_뒤_main_이_옮겨져도_옮겨진_main_위에_합쳐_그_commit_을_잃지_않는다() {
+    let scratch = Scratch::new();
+    let (store, id, work, _) = setup(&scratch);
+    let scaffold = scratch.path("scaffold");
+    let update = upstream_commit(&scaffold, "server.js", "// 서버 v2\n", "업데이트 v2");
+    store.fetch_upstream(&id, &scaffold, &update).unwrap();
+    // 받아 둔 뒤, 합치기 전에 에이전트가 main 을 옮겼다
+    let moved = push_change(
+        &scratch,
+        &store,
+        &id,
+        &work,
+        "custom.json",
+        "{\"greeting\": \"B\"}\n",
+    );
+
+    let Merged::Merged(merged) = store.merge(&id, &update).unwrap() else {
+        panic!("합치지 않았습니다");
+    };
+    assert!(store.descends(&id, &merged, &moved).unwrap());
+    assert!(store.descends(&id, &merged, &update).unwrap());
+    // 합친 뒤 에이전트가 앞의 main 에서 고친 것을 올리면 앞으로 가지 않아 받지 않는다
+    write(&work, "custom.json", "{\"greeting\": \"C\"}\n");
+    commit_all(&work, "합치기 전의 main 에서 고친다");
+    assert!(matches!(
+        store.receive(&id, &bundle_of(&scratch, &work)),
+        Err(Error::NotFastForward)
+    ));
+    assert_eq!(store.head(&id).unwrap(), merged);
+}
+
+#[test]
+fn 위쪽_commit_이_여럿이면_commit_이_담은_것_가운데_가장_새_것을_고른다() {
+    let scratch = Scratch::new();
+    let (store, id, work, base) = setup(&scratch);
+    let scaffold = scratch.path("scaffold");
+    let fork = push_change(
+        &scratch,
+        &store,
+        &id,
+        &work,
+        "custom.json",
+        "{\"greeting\": \"A\"}\n",
+    );
+    // 아무 업데이트도 담지 않은 commit 의 가장 새 위쪽은 갈라진 기준점이다
+    assert_eq!(
+        store.newest_upstream(&id, &fork).unwrap(),
+        Some(base.clone())
+    );
+
+    // 업데이트 넷을 받아 둔다. 받아 두기만 하고 담지 않았으면 여전히 기준점이다
+    let updates: Vec<Commit> = (2..6)
+        .map(|version| {
+            let update = upstream_commit(
+                &scaffold,
+                "server.js",
+                &format!("// 서버 v{version}\n"),
+                &format!("업데이트 v{version}"),
+            );
+            store.fetch_upstream(&id, &scaffold, &update).unwrap();
+            update
+        })
+        .collect();
+    assert_eq!(store.newest_upstream(&id, &fork).unwrap(), Some(base));
+    // 하나씩 합칠 때마다 그 commit 이 담은 것 가운데 가장 새 것(방금 합친 것)을 고른다. 받아 둔 차례나 이름의 차례가 아니다
+    let mut merged = Vec::new();
+    for update in &updates {
+        let Merged::Merged(commit) = store.merge(&id, update).unwrap() else {
+            panic!("합치지 않았습니다");
+        };
+        assert_eq!(
+            store.newest_upstream(&id, &commit).unwrap(),
+            Some(update.clone())
+        );
+        merged.push(commit);
+    }
+    // 앞의 commit 은 여전히 그때의 위쪽을 가리킨다
+    assert_eq!(
+        store.newest_upstream(&id, &merged[0]).unwrap(),
+        Some(updates[0].clone())
+    );
+    // 이 저장소에 없는 commit 은 무엇도 담지 않는다
+    let stray = Commit::parse(&"ef".repeat(20)).unwrap();
+    assert_eq!(store.newest_upstream(&id, &stray).unwrap(), None);
 }

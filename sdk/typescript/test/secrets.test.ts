@@ -170,11 +170,13 @@ test("비밀을 요청하고 사람이 입력 표로 넣으면 운영에 오른�
 
     // 사람의 브라우저(카드)가 입력 표의 주소로 레이어에 바로 보낸다. 팩토리의 서버를 지나지 않는다
     const entry = await orbital.secrets.entry(instance, "BANK_API_KEY", { stage: "production" });
-    assert.ok(entry.url.startsWith(`${url}/v1/secret-entries/`), entry.url);
+    // 주소는 고정이고 표는 머리말로만 간다
+    assert.equal(entry.url, `${url}/v1/secret-entries`);
+    assert.equal(entry.ticket.length, 64);
     assert.ok(entry.expiresAt > Date.now() / 1000 + 590);
     const sent = await fetch(entry.url, {
         method: "POST",
-        headers: { origin: "https://factory-card.example", "content-type": "application/json" },
+        headers: { origin: "https://factory-card.example", "content-type": "application/json", authorization: `Bearer ${entry.ticket}` },
         body: JSON.stringify({ value: BANK }),
     });
     assert.equal(sent.status, 200);

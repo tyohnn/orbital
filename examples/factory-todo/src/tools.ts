@@ -536,7 +536,7 @@ export function createFactory(options: FactoryOptions): Factory
             return {
                 content: [text("입력 표를 열었습니다. 카드가 값을 레이어로 바로 보냅니다.")],
                 structuredContent: { name, stage, expires_at: entry.expiresAt },
-                _meta: { [ENTRY_META]: { url: entry.url, expires_at: entry.expiresAt } },
+                _meta: { [ENTRY_META]: { url: entry.url, ticket: entry.ticket, expires_at: entry.expiresAt } },
             };
         }
         catch (error)

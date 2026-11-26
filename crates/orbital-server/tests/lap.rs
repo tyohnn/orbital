@@ -1222,3 +1222,152 @@ fn 빌드가_실패하면_로그의_끝을_돌려주되_레이어의_폴더_경�
         assert!(!log.contains(&hidden.display().to_string()), "{log}");
     }
 }
+
+// ---- 선언에서 뺀 역할 ----
+
+/// 이 인스턴스의 역할 가운데 `auditor` 의 것.
+fn auditor_roles(instance: &str) -> Vec<String> {
+    let url = std::env::var("ORBITAL_PG").unwrap();
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    client
+        .query(
+            "SELECT rolname FROM pg_roles WHERE rolname LIKE $1 ORDER BY 1",
+            &[&format!("i_{instance}_%auditor")],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+/// 작업 폴더의 선언과 권한 표에 업무 역할 `auditor`(읽기만)를 더하거나 뺀다.
+fn with_auditor(work: &Path, on: bool) {
+    let manifest = fs::read_to_string(work.join("orbital.toml")).unwrap();
+    let access = fs::read_to_string(work.join("db/access.toml")).unwrap();
+    let (manifest, access) = if on {
+        (
+            manifest.replace("roles = [\"member\"]", "roles = [\"member\", \"auditor\"]"),
+            format!("{access}auditor = \"read\"\n"),
+        )
+    } else {
+        (
+            manifest.replace("roles = [\"member\", \"auditor\"]", "roles = [\"member\"]"),
+            access.replace("auditor = \"read\"\n", ""),
+        )
+    };
+    fs::write(work.join("orbital.toml"), manifest).unwrap();
+    fs::write(work.join("db/access.toml"), access).unwrap();
+}
+
+#[test]
+fn 선언에서_뺀_업무_역할은_승격에서_걷고_주인인_것이_있으면_멈추며_앞의_release_로_되돌리면_다시_선다()
+ {
+    let mut bench = bench!();
+    let instance = bench.instance();
+    let token = bench.token(&instance, &ALL);
+    let path = |tail: &str| format!("/v1/instances/{instance}/{tail}");
+    let ship = |bench: &Bench| -> (u16, Value) {
+        let (status, preview) = bench.preview(&instance, &token);
+        assert_eq!(status, 200, "{preview}");
+        let release = preview["release"].as_str().unwrap().to_owned();
+        let (status, body) = bench.post(
+            &path("promotion-requests"),
+            &token,
+            json!({ "release": release }),
+        );
+        assert_eq!(status, 200, "{body}");
+        bench.promote(&instance, &release, "customer")
+    };
+    let work = bench.clone(&instance, &token, "work");
+
+    // 역할을 더해 올린다
+    with_auditor(&work, true);
+    assert_eq!(
+        bench.push(&instance, &token, &work, "감사 역할을 더한다").0,
+        200
+    );
+    let (status, body) = ship(&bench);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        auditor_roles(&instance),
+        vec![
+            format!("i_{instance}_r_auditor"),
+            format!("i_{instance}_s_web_auditor")
+        ]
+    );
+
+    // 뺀 release 를 올리면 묶음과 로그인이 걷히고 권한 검사를 지난다(남았으면 어긋남으로 보아 오르지 못한다)
+    with_auditor(&work, false);
+    assert_eq!(
+        bench.push(&instance, &token, &work, "감사 역할을 뺀다").0,
+        200
+    );
+    let (status, body) = ship(&bench);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(auditor_roles(&instance), Vec::<String>::new());
+
+    // 다시 더하면 다시 선다
+    with_auditor(&work, true);
+    assert_eq!(bench.push(&instance, &token, &work, "다시 더한다").0, 200);
+    let (status, body) = ship(&bench);
+    assert_eq!(status, 200, "{body}");
+    let (_, production) = bench.call("GET", &path("production"), Some(FACTORY), &[]);
+    let with_role = production["release"].as_str().unwrap().to_owned();
+    assert_eq!(auditor_roles(&instance).len(), 2);
+
+    // 그 역할이 무엇의 주인이면 걷지 않고 승격을 멈춘다. 운영은 그대로다
+    let pg_url = std::env::var("ORBITAL_PG").unwrap();
+    let mut config: postgres::Config = pg_url.parse().unwrap();
+    config.dbname(&format!("i_{instance}"));
+    let mut admin = config.connect(postgres::NoTls).unwrap();
+    admin
+        .batch_execute(&format!(
+            "CREATE SEQUENCE todo.held; ALTER SEQUENCE todo.held OWNER TO i_{instance}_r_auditor"
+        ))
+        .unwrap();
+    with_auditor(&work, false);
+    assert_eq!(bench.push(&instance, &token, &work, "또 뺀다").0, 200);
+    let (status, body) = ship(&bench);
+    assert_eq!(status, 409, "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("i_{instance}_r_auditor")),
+        "{message}"
+    );
+    assert!(message.contains("주인"), "{message}");
+    let (_, production) = bench.call("GET", &path("production"), Some(FACTORY), &[]);
+    assert_eq!(production["release"], json!(with_role));
+    assert_eq!(auditor_roles(&instance).len(), 2);
+    assert_eq!(
+        app("GET", &format!("{}/health", url(&production)), None, "").0,
+        200
+    );
+    admin.batch_execute("DROP SEQUENCE todo.held").unwrap();
+
+    // 역할을 걷은 뒤 새 release 가 운영에서 서지 못하면 앞의 release 로 되돌아가고, 걷은 역할이 다시 선다
+    let original = fs::read_to_string(work.join("server.js")).unwrap();
+    fs::write(
+        work.join("server.js"),
+        format!("if (process.env.ORBITAL_STAGE === \"production\") process.exit(1);\n{original}"),
+    )
+    .unwrap();
+    assert_eq!(
+        bench
+            .push(&instance, &token, &work, "운영에서 뜨지 않는다")
+            .0,
+        200
+    );
+    let (status, body) = ship(&bench);
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (422, Some("start_failed")),
+        "{body}"
+    );
+    let (_, production) = bench.call("GET", &path("production"), Some(FACTORY), &[]);
+    assert_eq!(production["release"], json!(with_role));
+    assert_eq!(auditor_roles(&instance).len(), 2);
+    // 다시 선 로그인으로 DB 에 붙는다
+    let mut login = config.clone();
+    login.user(&format!("i_{instance}_s_web_auditor"));
+    assert!(login.connect(postgres::NoTls).is_ok());
+}

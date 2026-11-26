@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orbital_backup::{Cluster, LocalStore, Store, Tools};
 use orbital_core::backup::{Check, DrillFailure, DrillRecord, RestoreRefusal};
@@ -870,6 +870,148 @@ fn 되살리기_전의_상태가_되돌릴_지점으로_남는다() {
     );
 }
 
+impl Bench {
+    fn undo(&self, key: &str, instance: &str) -> (u16, Value) {
+        self.post(
+            &format!("/v1/instances/{instance}/restore/undo"),
+            key,
+            &json!({}),
+        )
+    }
+}
+
+#[test]
+fn 되살리기를_무르면_되살리기_전의_행이_보이고_다시_무르지는_못한다() {
+    let mut bench = bench!();
+    let (instance, url) = bench.shipped();
+    let admin = bench.person(&instance, "a1@example.test", "admin");
+    // 되살린 적이 없으면 무를 것이 없다
+    let (status, body) = bench.undo(FACTORY, &instance);
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("되살린"),
+        "{body}"
+    );
+
+    bench.base_backup();
+    bench.note(&instance, &admin.id, "before");
+    let at = moment();
+    bench.note(&instance, &admin.id, "after");
+    let (status, report) = bench.restore(FACTORY, &instance, at);
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(bench.notes(&instance), vec!["before".to_owned()]);
+
+    let (status, undone) = bench.undo(FACTORY, &instance);
+    assert_eq!(status, 200, "{undone}");
+    assert_eq!(undone["instance"], json!(instance));
+    assert!(undone["millis"].as_u64().is_some(), "{undone}");
+    assert_eq!(
+        bench.notes(&instance),
+        vec!["before".to_owned(), "after".to_owned()]
+    );
+    // 다음 요청이 무른 DB 에 닿는다
+    assert_eq!(
+        http_get(&format!("{url}/notes?as=admin"), Some(&admin.cookie)),
+        (200, json!(["before", "after"]))
+    );
+    // 되돌릴 지점은 하나라 다시 무르지 못한다. 그 지점은 운영 자리로 옮겨 갔다
+    let (status, body) = bench.undo(FACTORY, &instance);
+    assert_eq!(status, 409, "{body}");
+    let point = report["restore_point"].as_str().unwrap();
+    let left: i64 = bench
+        .client("postgres")
+        .query_one(
+            "SELECT count(*) FROM pg_database WHERE datname = $1",
+            &[&point],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(left, 0);
+    assert_eq!(
+        bench.notes(&instance),
+        vec!["before".to_owned(), "after".to_owned()]
+    );
+}
+
+#[test]
+fn 되살린_뒤_승격이_있었으면_되살리기를_무르지_못하고_까닭을_알린다() {
+    let mut bench = bench!();
+    let (instance, _) = bench.shipped();
+    bench.base_backup();
+    bench.note(&instance, "x", "before");
+    let at = moment();
+    bench.note(&instance, "x", "after");
+    let (status, report) = bench.restore(FACTORY, &instance, at);
+    assert_eq!(status, 200, "{report}");
+    // 그 뒤에 승격이 있었다. 되돌릴 지점이 그 승격의 것으로 바뀌었다
+    let token = bench.token(FACTORY, &instance);
+    let release = bench.preview(&instance, &token);
+    let (status, body) = bench.promote(&instance, &release);
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = bench.undo(FACTORY, &instance);
+    assert_eq!(status, 409, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("승격"), "{body}");
+    assert_eq!(bench.notes(&instance), vec!["before".to_owned()]);
+}
+
+#[test]
+fn 한_인스턴스를_되살리는_동안_다른_인스턴스의_요청은_기다리지_않고_같은_인스턴스는_한_번에_하나만_되살린다()
+ {
+    let mut bench = bench!();
+    let (first, _) = bench.shipped();
+    let (second, _) = bench.shipped();
+    bench.base_backup();
+    bench.note(&first, "x", "before");
+    let at = moment();
+    bench.note(&first, "x", "after");
+
+    let layer = Arc::clone(bench.layer.as_ref().unwrap());
+    let target = first.clone();
+    let restoring = std::thread::spawn(move || {
+        let started = Instant::now();
+        let reply = handle(
+            &layer,
+            "POST",
+            &format!("/v1/instances/{target}/restore"),
+            Some(FACTORY),
+            json!({ "at": at }).to_string().as_bytes(),
+        );
+        (reply.status, started.elapsed())
+    });
+    // 되살리기가 옆에 클러스터를 세우는 동안(초 단위)
+    std::thread::sleep(Duration::from_millis(150));
+    let asked = Instant::now();
+    let (status, body) = bench.call(
+        "GET",
+        &format!("/v1/instances/{second}/production"),
+        FACTORY,
+        &[],
+    );
+    let waited = asked.elapsed();
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = bench.restore(FACTORY, &first, at);
+    let still_running = !restoring.is_finished();
+    let (restored, took) = restoring.join().unwrap();
+    assert_eq!(restored, 200);
+    // 다른 인스턴스의 요청은 되살리기를 기다리지 않는다
+    assert!(
+        waited < Duration::from_millis(500),
+        "{waited:?} (되살리기 {took:?})"
+    );
+    assert!(
+        still_running,
+        "되살리기가 너무 빨리 끝나 재지 못했습니다({took:?})"
+    );
+    // 같은 인스턴스를 겹쳐 되살리지 않는다
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("되살리는 중"),
+        "{body}"
+    );
+    assert_eq!(bench.notes(&first), vec!["before".to_owned()]);
+}
+
 #[test]
 fn 에이전트의_토큰으로는_되살리지_못한다() {
     let mut bench = bench!();
@@ -883,6 +1025,9 @@ fn 에이전트의_토큰으로는_되살리지_못한다() {
     let (status, body) = bench.restore(&token, &instance, at);
     assert_eq!(status, 403, "{body}");
     assert_eq!(body["error"], json!("forbidden"));
+    // 무르는 길도 그렇다
+    let (status, body) = bench.undo(&token, &instance);
+    assert_eq!(status, 403, "{body}");
     assert_eq!(
         bench.notes(&instance),
         vec!["before".to_owned(), "after".to_owned()]

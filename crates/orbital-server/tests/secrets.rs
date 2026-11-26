@@ -181,6 +181,8 @@ struct Bench {
     public: String,
     /// 레이어의 시계를 앞으로 돌리는 초.
     ahead: Arc<AtomicU64>,
+    /// 다시 봉인할 때 함께 주는 옛 열쇠(`ORBITAL_SEAL_KEY_PREVIOUS`).
+    previous_seal: Option<SealKey>,
     layer: Option<Arc<Layer>>,
     front: Option<Front>,
     instances: Vec<(String, &'static str)>,
@@ -203,6 +205,7 @@ impl Bench {
             pg_url,
             public,
             ahead: Arc::new(AtomicU64::new(0)),
+            previous_seal: None,
             layer: None,
             front: None,
             instances: Vec::new(),
@@ -219,6 +222,7 @@ impl Bench {
         let layer = Arc::new(
             Layer::open(Options {
                 seal_key: seal,
+                previous_seal_key: self.previous_seal.clone(),
                 public_url: self.public.clone(),
                 dev_mailbox: true,
                 clock: Arc::new(move || now() + ahead.load(Ordering::SeqCst)),
@@ -383,8 +387,8 @@ impl Bench {
         assert_eq!(status, 200, "{body}");
     }
 
-    /// 입력 표를 받는다(service key). 표가 든 주소를 돌려준다.
-    fn entry(&self, instance: &str, stage: &str) -> String {
+    /// 입력 표를 받는다(service key). 보낼 주소와 표를 돌려준다.
+    fn entry(&self, instance: &str, stage: &str) -> Ticket {
         let (status, body) = self.post(
             &format!("/v1/instances/{instance}/secrets/BANK_API_KEY/entries"),
             FACTORY,
@@ -392,17 +396,17 @@ impl Bench {
         );
         assert_eq!(status, 200, "{body}");
         let url = body["url"].as_str().unwrap().to_owned();
-        assert!(
-            url.starts_with(&format!("{}/v1/secret-entries/", self.public)),
-            "{url}"
-        );
+        let ticket = body["ticket"].as_str().unwrap().to_owned();
+        // 주소는 고정이고 표를 싣지 않는다. 표는 머리말로만 간다
+        assert_eq!(url, format!("{}/v1/secret-entries", self.public), "{body}");
+        assert!(!url.contains(&ticket), "{body}");
         let expires_at = body["expires_at"].as_u64().unwrap();
         let issued = now() + self.ahead.load(Ordering::SeqCst);
         assert!(
             expires_at >= issued + 599 && expires_at <= issued + 601,
             "{body}"
         );
-        url
+        Ticket { url, ticket }
     }
 
     fn list(&self, bearer: &str, instance: &str) -> Value {
@@ -524,14 +528,27 @@ fn texts(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 입력 표의 주소로 카드(다른 출처의 브라우저)가 하듯이 값을 보낸다.
-fn send_entry(url: &str, body: &Value) -> Http {
+/// 입력 표. 보낼 주소(고정)와 `Authorization: Bearer` 에 실을 표.
+struct Ticket {
+    url: String,
+    ticket: String,
+}
+
+impl Ticket {
+    fn bearer(&self) -> String {
+        format!("Bearer {}", self.ticket)
+    }
+}
+
+/// 입력 표의 주소로 카드(다른 출처의 브라우저)가 하듯이 표를 머리말에 실어 값을 보낸다.
+fn send_entry(ticket: &Ticket, body: &Value) -> Http {
     http(
         "POST",
-        url,
+        &ticket.url,
         &[
             ("Origin", CARD_ORIGIN),
             ("Content-Type", "application/json"),
+            ("Authorization", &ticket.bearer()),
         ],
         &body.to_string(),
     )
@@ -722,6 +739,34 @@ fn 입력_표로_넣은_값이_운영의_앱에_닿는다() {
 }
 
 #[test]
+fn 입력_표는_주소의_경로에_실리지_않고_경로에_표를_적은_요청은_받지_않는다() {
+    let mut bench = bench!();
+    let instance = bench.instance(FACTORY);
+    let token = bench.token(FACTORY, &instance, &ALL);
+    bench.preview(&instance, &token);
+    let entry = bench.entry(&instance, "production");
+    // 앞의 모양(경로의 표)으로 보내면 표가 맞아도 넣지 않는다
+    let old = send_entry(
+        &Ticket {
+            url: format!("{}/{}", entry.url, entry.ticket),
+            ticket: String::new(),
+        },
+        &json!({ "value": BANK }),
+    );
+    assert_eq!(old.status, 404, "{}", old.body);
+    assert_eq!(
+        bank(&bench.list(FACTORY, &instance))["production"]["set"],
+        false
+    );
+    // 표가 아직 쓰이지 않았으니 머리말로 보내면 넣는다
+    assert_eq!(send_entry(&entry, &json!({ "value": BANK })).status, 200);
+    assert_eq!(
+        bank(&bench.list(FACTORY, &instance))["production"]["set"],
+        true
+    );
+}
+
+#[test]
 fn 입력_표는_한_번만_쓸_수_있다() {
     let mut bench = bench!();
     let instance = bench.instance(FACTORY);
@@ -808,14 +853,17 @@ fn 입력_표의_주소는_쿠키와_키_없이_다른_출처의_요청을_받�
     bench.preview(&instance, &token);
     let url = bench.entry(&instance, "production");
 
-    // 브라우저의 사전 요청
+    // 브라우저의 사전 요청. 표를 싣는 `Authorization` 머리말을 받는다
     let preflight = http(
         "OPTIONS",
-        &url,
+        &url.url,
         &[
             ("Origin", CARD_ORIGIN),
             ("Access-Control-Request-Method", "POST"),
-            ("Access-Control-Request-Headers", "content-type"),
+            (
+                "Access-Control-Request-Headers",
+                "authorization, content-type",
+            ),
         ],
         "",
     );
@@ -827,24 +875,24 @@ fn 입력_표의_주소는_쿠키와_키_없이_다른_출처의_요청을_받�
             .unwrap()
             .contains("POST")
     );
-    assert!(
-        preflight
-            .header("access-control-allow-headers")
-            .unwrap()
-            .contains("content-type")
-    );
+    let allowed = preflight
+        .header("access-control-allow-headers")
+        .unwrap()
+        .to_owned();
+    assert!(allowed.contains("content-type"), "{allowed}");
+    assert!(allowed.contains("authorization"), "{allowed}");
     // 자격 증명은 열지 않는다
     assert_eq!(preflight.header("access-control-allow-credentials"), None);
 
-    // 쿠키도 키도 없이, 또는 아무 쿠키와 아무 키를 실어도 표만 본다
+    // 쿠키를 실어도 표만 본다
     let sent = http(
         "POST",
-        &url,
+        &url.url,
         &[
             ("Origin", CARD_ORIGIN),
             ("Content-Type", "application/json"),
             ("Cookie", "__Host-orbital-session=made-up"),
-            ("Authorization", "Bearer orb1.made-up"),
+            ("Authorization", &url.bearer()),
         ],
         &json!({ "value": BANK }).to_string(),
     );
@@ -853,13 +901,34 @@ fn 입력_표의_주소는_쿠키와_키_없이_다른_출처의_요청을_받�
     assert_eq!(sent.header("access-control-allow-credentials"), None);
     assert_eq!(sent.header("cache-control"), Some("no-store"));
 
-    // 모르는 표는 없는 것으로 답하되 브라우저가 읽을 수 있게 연다
-    let unknown = send_entry(
-        &format!("{}/v1/secret-entries/{}", bench.public, "ab".repeat(32)),
-        &json!({ "value": BANK }),
+    // 모르는 표, 표가 없는 것, service key 나 작업의 토큰을 실은 것은 없는 것으로 답하되 브라우저가 읽을 수 있게 연다
+    let token = bench.token(FACTORY, &instance, &ALL);
+    for bearer in [
+        Some(format!("Bearer {}", "ab".repeat(32))),
+        Some(format!("Bearer {FACTORY}")),
+        Some(format!("Bearer {token}")),
+        None,
+    ] {
+        let mut headers = vec![
+            ("Origin", CARD_ORIGIN),
+            ("Content-Type", "application/json"),
+        ];
+        if let Some(bearer) = &bearer {
+            headers.push(("Authorization", bearer.as_str()));
+        }
+        let unknown = http(
+            "POST",
+            &url.url,
+            &headers,
+            &json!({ "value": "sk_live_other" }).to_string(),
+        );
+        assert_eq!(unknown.status, 404, "{bearer:?}: {}", unknown.body);
+        assert_eq!(unknown.header("access-control-allow-origin"), Some("*"));
+    }
+    assert_eq!(
+        bank(&bench.list(FACTORY, &instance))["production"]["set"],
+        true
     );
-    assert_eq!(unknown.status, 404);
-    assert_eq!(unknown.header("access-control-allow-origin"), Some("*"));
     // 관리 API 의 다른 길은 열지 않는다
     let other = http(
         "GET",
@@ -1085,6 +1154,93 @@ fn 관리_서버가_다시_떠도_운영의_앱이_비밀을_받는다() {
 }
 
 #[test]
+fn 옛_열쇠를_함께_주면_옛_열쇠로만_풀리는_금고의_값과_팩토리의_설정을_새_열쇠로_다시_봉인한다() {
+    const THIRD: [u8; 32] = [9; 32];
+    const NEW: [u8; 32] = [8; 32];
+    let mut bench = bench!();
+    let instance = bench.instance(FACTORY);
+    let token = bench.token(FACTORY, &instance, &ALL);
+    bench.preview(&instance, &token);
+    bench.put_ok(&instance, "preview", BANK_PREVIEW);
+    bench.put_ok(&instance, "production", BANK);
+    let mail = json!({ "mail": { "provider": "resend", "api_key": "re_test_mail_Wk3", "from": "no-reply@factory.example" } });
+    let (status, body) = bench.call(
+        "PUT",
+        "/v1/settings/auth",
+        FACTORY,
+        mail.to_string().as_bytes(),
+    );
+    assert_eq!(status, 200, "{body}");
+    bench.ship_ok(&instance, &token);
+
+    // 어느 열쇠로도 풀리지 않을 줄: 다른 열쇠로 봉인한 다른 팩토리의 값
+    bench.restart(Some(SealKey::from_bytes(THIRD)));
+    let stranger = bench.instance(OTHER_FACTORY);
+    let stranger_token = bench.token(OTHER_FACTORY, &stranger, &ALL);
+    bench.preview(&stranger, &stranger_token);
+    let (status, body) = bench.put(OTHER_FACTORY, &stranger, "preview", BANK_PREVIEW);
+    assert_eq!(status, 200, "{body}");
+    let stranger_sealed =
+        |vault: &Value| vault["values"][&stranger]["BANK_API_KEY"]["preview"]["sealed"].clone();
+    let read_vault = |bench: &Bench| -> Value {
+        serde_json::from_slice(&fs::read(bench.home.join(VAULT)).unwrap()).unwrap()
+    };
+    let before = read_vault(&bench);
+
+    // 새 열쇠와 옛 열쇠로 뜬다. 옛 열쇠로만 풀리는 줄을 새 열쇠로 다시 적고, 몇 줄인지와 풀리지 않는 줄의 이름만 알린다
+    bench.previous_seal = Some(SealKey::from_bytes(SEAL));
+    bench.restart(Some(SealKey::from_bytes(NEW)));
+    let report = serde_json::to_value(bench.layer().resealed().unwrap()).unwrap();
+    assert_eq!(report["vault"], 2, "{report}");
+    assert_eq!(report["settings"], 1, "{report}");
+    assert_eq!(
+        report["unopened"],
+        json!([format!("vault {stranger} preview BANK_API_KEY")]),
+        "{report}"
+    );
+    let text = report.to_string();
+    for value in [BANK, BANK_PREVIEW, "re_test_mail_Wk3"] {
+        assert!(!text.contains(value), "{text}");
+    }
+    let after = read_vault(&bench);
+    // 풀리지 않는 줄은 건드리지 않는다
+    assert_eq!(stranger_sealed(&after), stranger_sealed(&before));
+    assert_ne!(
+        after["values"][&instance]["BANK_API_KEY"]["production"]["sealed"],
+        before["values"][&instance]["BANK_API_KEY"]["production"]["sealed"]
+    );
+    // 다시 봉인은 임시 파일에 쓰고 옮긴다. 남은 임시 파일이 없다
+    assert!(!bench.home.join("vault.json.writing").exists());
+    assert!(!bench.home.join("settings.json.writing").exists());
+
+    // 마친 뒤에는 옛 열쇠 없이 뜬다. 운영의 앱이 값을 받고, 팩토리의 메일 키가 풀린다
+    bench.previous_seal = None;
+    bench.restart(Some(SealKey::from_bytes(NEW)));
+    assert!(bench.layer().resealed().is_none());
+    let live = url(&bench.production(&instance));
+    assert_eq!(
+        secret_at(&live),
+        json!({ "present": true, "sha256": sha(BANK) })
+    );
+    let shown = bank(&bench.list(FACTORY, &instance));
+    assert_eq!(
+        [&shown["preview"]["set"], &shown["production"]["set"]],
+        [true, true]
+    );
+    let (status, settings) = bench.call("GET", "/v1/settings/auth", FACTORY, &[]);
+    assert_eq!(status, 200, "{settings}");
+    assert_eq!(settings["mail"]["configured"], true, "{settings}");
+
+    // 옛 열쇠로는 더 이상 풀리지 않는다
+    bench.restart(Some(SealKey::from_bytes(SEAL)));
+    let shown = bank(&bench.list(FACTORY, &instance));
+    assert_eq!(
+        [&shown["preview"]["set"], &shown["production"]["set"]],
+        [false, false]
+    );
+}
+
+#[test]
 fn 봉인_열쇠가_없으면_값을_넣지_못하고_무엇을_고칠지_알려_준다() {
     let mut bench = bench!(None);
     let instance = bench.instance(FACTORY);
@@ -1290,8 +1446,11 @@ fn 값은_어떤_답과_로그와_오류에도_실리지_않는다() {
     }
     let sent = http(
         "POST",
-        &ticket,
-        &[("Content-Type", "application/json")],
+        &ticket.url,
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &ticket.bearer()),
+        ],
         &format!("{{\"value\": \"{BANK}"),
     );
     assert_eq!(sent.status, 422);

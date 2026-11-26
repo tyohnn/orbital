@@ -415,7 +415,7 @@ const workspaces = new Map<string, Workspace>();
 /** 그 고객의 인스턴스. 팩토리의 파일에서 읽는다(도구의 답에는 레이어의 식별자가 없다) */
 const instanceOf = (account: string): string => pairs()[account] ?? "";
 
-test("작업을 열면 고객의 인스턴스가 한 번만 서고, 다시 열면 같은 인스턴스에 새 자격이 온다 — 고객마다 인스턴스는 하나다", { skip }, async () =>
+test("작업을 열면 고객의 인스턴스가 한 번만 서고, 다시 열면 같은 인스턴스에 새 자격이 오고 앞 작업은 닫힌다 — 고객마다 인스턴스는 하나다", { skip }, async () =>
 {
     const created = (): number => sent.filter((each) => each.method === "POST" && each.path === "/v1/instances").length;
     const before = created();
@@ -432,8 +432,19 @@ test("작업을 열면 고객의 인스턴스가 한 번만 서고, 다시 열�
     // 다시 열면 같은 인스턴스에 레이어의 작업이 새로 열리고, 새 원격과 새 자격이 온다
     const sessions = (): number => sent.filter((each) => each.method === "POST" && each.path === `/v1/instances/${instance}/sessions`).length;
     const opened = sessions();
+    const closes = (): number => sent.filter((each) => each.method === "DELETE" && each.path.startsWith(`/v1/instances/${instance}/sessions/`)).length;
+    const closed = closes();
     const again = structured<Workspace>(await call(alice, "workspace_open"));
     assert.equal(sessions() - opened, 1);
+    // 앞 작업 둘은 레이어에서 닫히고, 그 원격과 자격은 더는 통하지 않는다
+    assert.equal(closes() - closed, 2);
+    for (const old of [one, two])
+    {
+        const refused = await fetch(`${old.remote}/info/refs?service=git-upload-pack`, { headers: { authorization: `Bearer ${old.credential}` } });
+        assert.equal(refused.status, 403);
+    }
+    const fresh = await fetch(`${again.remote}/info/refs?service=git-upload-pack`, { headers: { authorization: `Bearer ${again.credential}` } });
+    assert.equal(fresh.status, 200);
     assert.equal(new Set([one.credential, two.credential, again.credential]).size, 3);
     assert.equal(new Set([one.remote, two.remote, again.remote]).size, 3);
     assert.ok(again.expires_at >= Math.max(one.expires_at, two.expires_at));
@@ -567,7 +578,8 @@ test("git 의 자격은 그 고객의 그 인스턴스에서만, 두 시간 동�
 
     // 두 시간 동안만: 팩토리의 자격은 레이어의 작업이 끝나는 때에 함께 끝난다(시계를 갈아 끼워 잰다)
     let clock = 1_000;
-    const work = { instance: "k3f9x2ab", expiresAt: clock + 7200 } as unknown as Work;
+    let closedWorks = 0;
+    const work = { instance: "k3f9x2ab", expiresAt: clock + 7200, close: async () => { closedWorks += 1; } } as unknown as Work;
     const works = createWorks({ works: { open: async () => work } } as unknown as Orbital, () => clock);
     const { opened, credential } = await works.open("alice", "k3f9x2ab");
     assert.equal(works.forGit(opened.id, credential)?.instance, "k3f9x2ab");
@@ -578,6 +590,16 @@ test("git 의 자격은 그 고객의 그 인스턴스에서만, 두 시간 동�
     clock += 1;
     assert.equal(works.forGit(opened.id, credential), undefined);
     assert.equal(works.current("alice"), undefined);
+    // 같은 고객이 다시 열면 앞 작업(아직 살아 있는 것)을 닫고 그 자격을 끊는다. 다른 고객의 작업은 그대로다
+    clock = 1_000;
+    const first = await works.open("alice", "k3f9x2ab");
+    const others = await works.open("bob", "k3f9x2ab");
+    const before = closedWorks;
+    const second = await works.open("alice", "k3f9x2ab");
+    assert.equal(closedWorks - before, 1);
+    assert.equal(works.forGit(first.opened.id, first.credential), undefined);
+    assert.equal(works.forGit(second.opened.id, second.credential)?.customer, "alice");
+    assert.equal(works.forGit(others.opened.id, others.credential)?.customer, "bob");
 });
 
 test("MCP 의 토큰으로는 git 에 닿지 못하고 git 의 자격으로는 도구를 부르지 못한다", { skip }, async () =>
@@ -880,10 +902,15 @@ function daveDeclares(): Promise<{ instance: string }>
 async function cardSends(client: Client, stage: "preview" | "production", value: string): Promise<{ url: string; status: number; opened: CallToolResult }>
 {
     const opened = await call(client, "secret_entry_open", { name: "BANK_API_KEY", stage });
-    const entry = opened._meta?.[ENTRY_META] as { url?: unknown } | undefined;
+    const entry = opened._meta?.[ENTRY_META] as { url?: unknown; ticket?: unknown } | undefined;
     assert.equal(typeof entry?.url, "string", JSON.stringify(opened));
+    assert.equal(typeof entry?.ticket, "string", JSON.stringify(opened));
     const url = entry?.url as string;
-    const sent = await fetch(url, { method: "POST", headers: { origin: "https://card.example", "content-type": "application/json" }, body: JSON.stringify({ value }) });
+    const sent = await fetch(url, {
+        method: "POST",
+        headers: { origin: "https://card.example", "content-type": "application/json", authorization: `Bearer ${entry?.ticket as string}` },
+        body: JSON.stringify({ value }),
+    });
     return { url, status: sent.status, opened };
 }
 
@@ -926,11 +953,12 @@ test("입력 표를 내는 도구는 모델에게 보이지 않는다", { skip }
     assert.deepEqual((open._meta as { ui?: { visibility?: unknown } } | undefined)?.ui?.visibility, ["app"]);
     assert.ok(tools.filter((tool) => modelVisible(tool._meta)).every((tool) => tool.name !== "secret_entry_open"));
 
-    // 화면이 부르면 표가 든 주소는 화면에만 가는 _meta 에 온다. 모델이 읽는 글과 structuredContent 에는 없다
+    // 화면이 부르면 표는 화면에만 가는 _meta 에 온다. 모델이 읽는 글과 structuredContent 에는 없고, 주소에도 실리지 않는다
     const opened = await call(client, "secret_entry_open", { name: "BANK_API_KEY", stage: "preview" });
-    const url = (opened._meta?.[ENTRY_META] as { url: string }).url;
-    const ticket = url.split("/").at(-1) ?? "";
+    const { url, ticket } = opened._meta?.[ENTRY_META] as { url: string; ticket: string };
     assert.equal(ticket.length, 64);
+    assert.ok(url.endsWith("/v1/secret-entries"), url);
+    assert.ok(!url.includes(ticket));
     assert.ok(!textOf(opened).includes(ticket));
     assert.ok(!JSON.stringify(opened.structuredContent).includes(ticket));
 });

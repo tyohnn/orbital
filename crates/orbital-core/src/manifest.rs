@@ -209,13 +209,17 @@ impl Service {
 /// 서버가 자는 동안에도 레이어가 정한 시각(UTC 의 cron 식)에 깨워 부르는 일.
 ///
 /// 레이어가 router 를 거쳐 그 경로에 `POST` 로 보내고 `x-orbital-schedule` 에 [`Schedule::key`] 를 싣는다. 사람의 신원은 싣지 않는다.
-/// 이 경로는 밖에서 부르지 못한다(router 가 거절한다).
+/// `role` 을 적으면 사람 없이 그 업무 역할만 실린 서명된 신원을 함께 싣는다(일정의 제한 시간만큼 통한다). 그 역할의 「모든 행」 권한만 쓰고
+/// 「자기 행」은 읽지 못한다. 역할은 그 서비스의 `roles` 가운데 하나여야 한다. 이 경로는 밖에서 부르지 못한다(router 가 거절한다).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Schedule {
     pub service: Ident,
     pub cron: String,
     pub path: String,
+    /// 일정이 도는 업무 역할. 없으면 신원 없이 부른다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Ident>,
 }
 
 impl Schedule {
@@ -312,6 +316,11 @@ pub enum ManifestProblem {
     /// 같은 서비스 · 경로 · 식의 일정이 두 번 적혀 있다.
     DuplicateSchedule {
         path: String,
+    },
+    /// 일정의 업무 역할이 그 서비스의 `roles` 에 없다.
+    ScheduleRoleNotOfService {
+        service: Ident,
+        role: Ident,
     },
     /// `[build].command` 가 비었다.
     BuildCommandEmpty,
@@ -466,6 +475,10 @@ impl fmt::Display for ManifestProblem {
             Self::DuplicateSchedule { path } => write!(
                 f,
                 "경로 `{path}` 의 같은 일정이 두 번 적혀 있습니다. 하나만 남겨 주세요"
+            ),
+            Self::ScheduleRoleNotOfService { service, role } => write!(
+                f,
+                "일정의 업무 역할 `{role}` 이 서비스 `{service}` 의 `roles` 에 없습니다. 그 서비스가 쓸 수 있는 업무 역할 가운데 하나를 적어 주세요"
             ),
             Self::BuildCommandEmpty => write!(
                 f,
@@ -735,6 +748,14 @@ impl Manifest {
                         problems.push(ManifestProblem::SchedulePathOutsideService {
                             service: schedule.service.clone(),
                             path: schedule.path.clone(),
+                        });
+                    }
+                    if let Some(role) = &schedule.role
+                        && !service.roles.contains(role)
+                    {
+                        problems.push(ManifestProblem::ScheduleRoleNotOfService {
+                            service: schedule.service.clone(),
+                            role: role.clone(),
                         });
                     }
                 }
@@ -1120,6 +1141,42 @@ path = "/"
             problems(&unknown),
             vec![ManifestProblem::ScheduleUnknownService {
                 service: ident("worker")
+            }]
+        );
+    }
+
+    #[test]
+    fn 일정의_업무_역할은_그_서비스가_쓸_수_있는_역할_가운데_하나여야_한다() {
+        let with_role = |role: &str| {
+            NEST_VITE.replace(
+                "path = \"/api/jobs/payroll\"\n",
+                &format!("path = \"/api/jobs/payroll\"\nrole = \"{role}\"\n"),
+            )
+        };
+        let valid = parse(&with_role("payroll_admin")).check().unwrap();
+        assert_eq!(valid.get().schedules[0].role, Some(ident("payroll_admin")));
+        // 적지 않으면 앞처럼 신원 없이 돈다
+        assert_eq!(
+            parse(NEST_VITE).check().unwrap().get().schedules[0].role,
+            None
+        );
+        // 선언에 있어도 그 서비스의 역할이 아니면 받지 않는다
+        let narrowed = with_role("payroll_admin").replace(
+            "roles = [\"employee\", \"manager\", \"payroll_admin\"]\n\n[[service]]",
+            "roles = [\"employee\", \"manager\"]\n\n[[service]]",
+        );
+        assert_eq!(
+            problems(&narrowed),
+            vec![ManifestProblem::ScheduleRoleNotOfService {
+                service: ident("api"),
+                role: ident("payroll_admin")
+            }]
+        );
+        assert_eq!(
+            problems(&with_role("auditor")),
+            vec![ManifestProblem::ScheduleRoleNotOfService {
+                service: ident("api"),
+                role: ident("auditor")
             }]
         );
     }

@@ -11,9 +11,9 @@
 
 use std::fmt;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use orbital_core::git::{self as wire, Refusal, Service};
@@ -190,6 +190,53 @@ pub enum Merged {
     Merged(Commit),
     /// 충돌했다. 저장소를 건드리지 않았다. 충돌한 파일의 이름이다.
     Conflicts(Vec<String>),
+}
+
+/// 흘려 보내는 받기의 답(`git upload-pack` 의 출력). 읽는 만큼만 git 이 만든다.
+///
+/// 흘려 보내기 시작한 뒤에 git 이 실패하면 거기서 끝낸다. 답의 상태(200)는 이미 나갔으므로, 받는 쪽은 git 이 보낸 `ERR` 줄이나
+/// 끊긴 pack 을 보고 실패한다(읽기 오류로 돌려주면 HTTP 의 조각 끝을 보내지 못해 받는 쪽이 기다리기만 한다).
+/// 끝까지 읽기 전에 버리면(받는 쪽이 끊으면) git 을 멈춘다.
+pub struct PackStream {
+    child: Child,
+    stdout: ChildStdout,
+    /// 첫 출력. 실패를 가르려고 미리 읽어 둔 것이다.
+    head: Vec<u8>,
+    at: usize,
+    finished: bool,
+    writer: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Read for PackStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.at < self.head.len() {
+            let count = buffer.len().min(self.head.len() - self.at);
+            buffer[..count].copy_from_slice(&self.head[self.at..self.at + count]);
+            self.at += count;
+            return Ok(count);
+        }
+        if self.finished {
+            return Ok(0);
+        }
+        let count = self.stdout.read(buffer)?;
+        if count == 0 {
+            self.finished = true;
+            let _ = self.child.wait();
+        }
+        Ok(count)
+    }
+}
+
+impl Drop for PackStream {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
+    }
 }
 
 /// 레이어의 코드 저장소들이 사는 폴더.
@@ -528,14 +575,50 @@ impl SourceStore {
     }
 
     /// 받는 쪽(`git clone` · `git fetch`)과 객체를 주고받는다. 요청은 한 번에 하나이고 상태를 갖지 않는다.
-    pub fn upload_pack(&self, instance: &InstanceId, request: &[u8]) -> Result<Vec<u8>, Error> {
+    ///
+    /// 답(pack)은 다 만든 뒤에 돌려주지 않고 `git upload-pack` 의 출력을 그대로 흘려 보낸다([`PackStream`]). 저장소가 커도
+    /// 레이어의 메모리는 pack 의 크기만큼 늘지 않는다. 첫 출력이 나오기 전에 git 이 실패하면(틀린 요청) 그 자리에서 `BadBundle` 이다.
+    pub fn upload_pack(
+        &self,
+        instance: &InstanceId,
+        request: Vec<u8>,
+    ) -> Result<PackStream, Error> {
         let path = self.existing(instance)?;
-        Self::fed(
-            Self::upload_pack_command(&path).arg(&path),
-            request,
-            "객체를 보내",
-        )?
-        .ok_or(Error::BadBundle)
+        let doing = "객체를 보내";
+        let mut child = Self::upload_pack_command(&path)
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|_| failed(doing))?;
+        let mut stdin = child.stdin.take().ok_or(failed(doing))?;
+        let stdout = child.stdout.take().ok_or(failed(doing))?;
+        // 요청을 넣는 일은 따로 돈다. 명령이 먼저 끝나 입력을 닫아도 결과는 종료 코드로 본다
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&request);
+        });
+        let mut stream = PackStream {
+            child,
+            stdout,
+            head: Vec::new(),
+            at: 0,
+            finished: false,
+            writer: Some(writer),
+        };
+        // 첫 출력을 기다린다. 출력 없이 끝났거나 첫 줄이 git 의 거절(`ERR`)이면 흘려 보내지 않고 틀린 요청으로 답한다
+        let mut first = vec![0u8; 64 * 1024];
+        let read = stream.stdout.read(&mut first).map_err(|_| failed(doing))?;
+        first.truncate(read);
+        let refused = first.get(4..8) == Some(&b"ERR "[..]);
+        if read == 0 || refused {
+            stream.finished = true;
+            let status = stream.child.wait().map_err(|_| failed(doing))?;
+            if refused || !status.success() {
+                return Err(Error::BadBundle);
+            }
+        }
+        stream.head = first;
+        Ok(stream)
     }
 
     /// 올리는 쪽(`git push`)의 요청을 받는다. 묶음과 같은 자리(`ingest`)를 지나고, 결과는 git 이 읽는 줄(report-status)로 돌려준다.
