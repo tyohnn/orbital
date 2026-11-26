@@ -58,7 +58,7 @@ paths:
 | 프리뷰 | release 를 씨앗 데이터의 DB 와 함께 임시로 세운 것. 인스턴스마다 하나 | `Layer::preview` |
 | 승격 | 사람이 승인한 release 를 운영에 올리는 일. 팩토리의 서버만 부른다 | `release::promote`, `Layer::promote` |
 | 되돌릴 지점 | 승격 직전(또는 되살리기 직전)의 운영 DB 를 떠 둔 것. 하나만 둔다. 되살리기가 남긴 것이면 한 번 무를 수 있다 | `RestorePoint`, `Admin::mark` · `restore`, `Layer::undo_restore` |
-| service key | 팩토리의 서버가 쓰는 열쇠. 운영을 바꾸는 길은 이 열쇠에만 있다 | `Layer::organization` |
+| 조직 · service key · 운영자의 열쇠 | 조직은 팩토리 하나의 기록(`live` 와 시험용 `test`. 시험용은 인스턴스의 수에만 상한이 있다). service key 는 그 서버가 쓰는 열쇠(`sk_live_` · `sk_test_`)로 운영을 바꾸는 길은 이 열쇠에만 있다. 기록에는 sha256 만 두고 값은 낼 때 한 번 답에 싣는다. 새것을 내고 옛것을 거두며 살아 있는 마지막 하나는 거두지 못한다. 설정(`ORBITAL_SERVICE_KEYS`)의 열쇠도 함께 산다. 운영자의 열쇠(`ORBITAL_OPERATOR_KEY`)는 조직을 만들고 보고 닫고 열쇠를 내기만 한다 | `Layer::caller`, `organization::{judge_key, judge_revoke, judge_new_instance, judge_close}`, `/v1/keys`, `/v1/operator/organizations` |
 | 실행기 | 빌드 명령(저장소에서 한 번 도는 `[build]` 뒤에 서비스마다)을 돌리고 서버를 띄우는 자리. 갈아 끼운다. 빌드에만 운영자가 정한 환경과 인스턴스마다의 홈(캐시의 자리)을 건넨다 | `Runner`, `LocalRunner`, `build_env`(`ORBITAL_BUILD_ENV`), `Job::home` |
 | 업데이트 | 팩토리가 스캐폴드(위쪽)에 올린 commit 하나. 인스턴스의 release 가 이 commit 을 조상으로 담으면 「적용됐다」고 본다 | `Rollout::update`, `SourceStore::fetch_upstream` · `descends` |
 | 밀기 · 당기기 | 업데이트를 인스턴스에 들이는 두 길. 법 · 보안 · 핵심 패키지는 팩토리가 밀고 팩토리가 승인한다. 기능 업데이트는 고객이 당기고 고객이 승인한다. 같은 기계다 | `Change`, `Change::approver` |
@@ -76,5 +76,5 @@ paths:
 | 지문 | database 하나의 스키마 해시와 표마다의 행 수. 이름과 숫자만 있고 행의 값은 없다 | `Fingerprint`, `fingerprint` |
 | 잃을 수 있는 구간 | 훈련을 시작한 때 − 마지막으로 보관된 WAL 의 시각(초). 운영 클러스터를 잃으면 이만큼을 잃는다 | `DrillRecord::exposure_seconds` |
 | 낡은 훈련 | 마지막으로 통과한 훈련이 여드레를 넘겼거나 한 번도 통과하지 않은 것. 켠 레이어(`ORBITAL_REQUIRE_DRILL=1`)는 그동안 새 인스턴스만 받지 않는다 | `Freshness`, `freshness`, `DRILL_FRESH_FOR` |
-| control database | 레이어의 기록(인스턴스 · 일정 · rollout · 설정 · 금고 · 요청 · 입력 표 · 닫은 작업 · 훈련 · 기계 · 앱)을 두는, 운영 클러스터 안의 레이어 전용 database(`ORBITAL_CONTROL_DB`, 기본 `orbital_control`). 인스턴스의 역할은 붙지 못한다. 마이그레이션은 번호 붙은 SQL 을 차례로 한 번씩 | `Records`, `migrate`, `control::pending` |
+| control database | 레이어의 기록(인스턴스 · 일정 · rollout · 설정 · 금고 · 요청 · 입력 표 · 닫은 작업 · 훈련 · 기계 · 앱 · 조직 · service key)을 두는, 운영 클러스터 안의 레이어 전용 database(`ORBITAL_CONTROL_DB`, 기본 `orbital_control`). 인스턴스의 역할은 붙지 못한다. 마이그레이션은 번호 붙은 SQL 을 차례로 한 번씩 | `Records`, `migrate`, `control::pending` |
 | 보관 기간 | 기반 백업을 두는 기간(14일). 지난 것과 거기에만 딸린 WAL 을 지우되 마지막 기반 백업은 언제나 남긴다 | `prune`, `Pruning`, `KEEP_FOR` |
