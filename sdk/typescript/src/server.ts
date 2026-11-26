@@ -6,6 +6,8 @@
 // 타입은 관리 서버가 주고받는 JSON 의 모양을 옮긴 것이다. Rust 쪽의 serde 모양을 바꾸면 같은 PR 에서 함께 고친다.
 // 누가 승인할 자격이 있는지는 팩토리가 정한다. Orbital 은 승인이 어느 쪽(고객 · 팩토리)의 것인지만 받는다.
 
+import { createHmac, timingSafeEqual } from "node:crypto";
+
 /** 토큰에 실을 수 있는 능력. 운영을 바꾸는 능력은 없다. `source_read` 는 코드를 받기만 한다. */
 export type Capability = "source" | "source_read" | "preview" | "rehearse" | "secrets_request";
 
@@ -216,6 +218,76 @@ export interface IssuedServiceKey
     label: string;
     key: string;
     createdAt: number;
+}
+
+/** 이벤트의 종류(`무엇.어찌됨`). 종류는 늘 수 있으니 받는 쪽은 모르는 종류를 건너뛴다. */
+export type EventType =
+    | "promotion.requested"
+    | "promotion.succeeded"
+    | "promotion.failed"
+    | "rollout.advanced"
+    | "rollout.halted"
+    | "rollout.resumed"
+    | "rollout.completed"
+    | "rollout.cancelled"
+    | "secret.requested"
+    | "instance.created"
+    | "instance.deleted";
+
+/**
+ * 레이어의 이벤트 하나. 목록(`events.list`)과 웹훅의 본문이 같은 모양이다. `data` 에는 이름과 숫자만 있다(값 · 행 · 로그 · 토큰은 없다).
+ * 웹훅은 적어도 한 번 가므로 같은 이벤트가 두 번 올 수 있다. 받는 쪽은 `id` 로 겹침을 거른다. 한 조직의 이벤트는 `id` 의 차례로 온다.
+ */
+export interface OrbitalEvent
+{
+    id: number;
+    /** 원래의 글. 아는 종류는 `EventType` 이다. */
+    type: EventType | (string & {});
+    /** 생긴 때(Unix 초). */
+    createdAt: number;
+    organization: string;
+    /** 인스턴스 하나의 일이면 그 인스턴스. */
+    instance: string | null;
+    data: Record<string, unknown>;
+}
+
+/** 이벤트 목록의 한 쪽. 다음에는 `after: next` 로 이어 받는다. */
+export interface EventPage
+{
+    events: OrbitalEvent[];
+    /** 이 쪽의 마지막 id(없으면 물은 `after`). */
+    next: number;
+    hasMore: boolean;
+}
+
+/** 웹훅의 전달 모습. 숫자와 갈래만 있다(받은 답의 본문은 없다). */
+export interface WebhookDelivery
+{
+    /** 이 id 까지는 보냈거나 그만뒀다. */
+    deliveredThrough: number;
+    /** 아직 보내지 않은 이벤트의 수. */
+    pending: number;
+    /** 다음에 보낼 때(Unix 초). 보낼 것이 없으면 `null` 이다. */
+    nextAt: number | null;
+    /** 지금 보내는 이벤트를 보내지 못한 횟수. 30초 · 2분 · 10분 · 1시간 · 6시간 뒤에 다시 보내고, 하루가 지나면 그만둔다. */
+    failures: number;
+    lastAttemptAt: number | null;
+    lastStatus: number | null;
+    lastError: "refused_address" | "unresolved" | "unreachable" | "timed_out" | "status" | "unsealed" | null;
+    /** 마지막으로 2xx 를 받은 때. */
+    deliveredAt: number | null;
+    /** 하루 동안 보내지 못해 그만둔 이벤트의 수와 마지막 것의 id. 그만둔 것은 `events.list` 로 받는다. */
+    abandoned: number;
+    lastAbandoned: number | null;
+}
+
+/** 조직의 웹훅. 서명의 비밀은 없다(걸 때의 답에만 온다). */
+export interface Webhook
+{
+    url: string;
+    /** 건 때(Unix 초). */
+    createdAt: number;
+    delivery: WebhookDelivery;
 }
 
 /** 레이어의 마지막 복구 훈련. 숫자와 참 · 거짓만 있다. */
@@ -475,6 +547,28 @@ export interface Orbital
          * 살아 있는 마지막 열쇠는 거두지 않는다(409. 새 열쇠를 먼저 낸다). 이미 거둔 것이면 그대로 돌려준다.
          */
         revoke(id: string): Promise<ServiceKey>;
+    };
+    /**
+     * 이 조직의 이벤트(승격의 요청 · 승격 · 되돌려진 승격 · rollout 의 진행 · 비밀의 요청 · 인스턴스의 생김과 지워짐). 30일 동안 둔다.
+     * 웹훅을 걸지 않았거나 놓친 것을 받을 때 `after` 에 앞에서 받은 마지막 `id` 를 주어 차례대로 이어 받는다.
+     */
+    events: {
+        list(input?: { after?: number; limit?: number }): Promise<EventPage>;
+    };
+    /**
+     * 조직의 웹훅(주소 하나). 레이어는 `https://` 이고 바깥(공인)의 주소로만 풀리는 호스트로만 보낸다. 리다이렉트는 따라가지 않는다.
+     * 받은 본문은 `verifyWebhook` 으로 확인한다.
+     */
+    webhook: {
+        /** 걸지 않았으면 `null` 이다. */
+        get(): Promise<Webhook | null>;
+        /**
+         * 건다. 서명의 비밀(`secret`, `whsec_…`)은 이 답에만 있다. 팩토리의 서버의 비밀 저장소에 옮겨 둔다. 비밀을 바꾸려면 다시 건다.
+         * 처음 걸면 그 뒤에 생긴 이벤트부터 간다. 레이어에 봉인의 열쇠가 없으면 409 다.
+         */
+        set(input: { url: string }): Promise<{ webhook: Webhook; secret: string }>;
+        /** 뗀다. 걸려 있었으면 참이다. */
+        remove(): Promise<boolean>;
     };
     sessions: {
         /** 작업의 토큰을 받는다. 보통은 이것을 감싼 `works.open` 을 쓴다. 토큰은 에이전트에게 건네지 않는다. */
@@ -759,6 +853,131 @@ function toRehearsal(value: unknown): Rehearsal
     };
 }
 
+const DELIVERY_ERRORS: readonly NonNullable<WebhookDelivery["lastError"]>[] = [
+    "refused_address",
+    "unresolved",
+    "unreachable",
+    "timed_out",
+    "status",
+    "unsealed",
+];
+
+function toEvent(value: unknown): OrbitalEvent
+{
+    const record = isRecord(value) ? value : {};
+    return {
+        id: number(record.id),
+        type: text(record.type),
+        createdAt: number(record.created_at),
+        organization: text(record.organization),
+        instance: typeof record.instance === "string" ? record.instance : null,
+        data: isRecord(record.data) ? record.data : {},
+    };
+}
+
+function toWebhook(value: Record<string, unknown>): Webhook
+{
+    const delivery = isRecord(value.delivery) ? value.delivery : {};
+    return {
+        url: text(value.url),
+        createdAt: number(value.created_at),
+        delivery: {
+            deliveredThrough: number(delivery.delivered_through),
+            pending: number(delivery.pending),
+            nextAt: orNull(delivery.next_at),
+            failures: number(delivery.failures),
+            lastAttemptAt: orNull(delivery.last_attempt_at),
+            lastStatus: orNull(delivery.last_status),
+            lastError: DELIVERY_ERRORS.find((error) => error === delivery.last_error) ?? null,
+            deliveredAt: orNull(delivery.delivered_at),
+            abandoned: number(delivery.abandoned),
+            lastAbandoned: orNull(delivery.last_abandoned),
+        },
+    };
+}
+
+/** 웹훅의 본문을 받지 않은 까닭. `malformed` 머리말이나 본문의 모양이 틀림, `stale` 서명의 때가 허용 시간차 밖, `mismatch` 서명이 맞지 않음. */
+export class OrbitalWebhookError extends Error
+{
+    readonly code: "malformed" | "stale" | "mismatch";
+
+    constructor(code: "malformed" | "stale" | "mismatch", message: string)
+    {
+        super(message);
+        this.name = "OrbitalWebhookError";
+        this.code = code;
+    }
+}
+
+/**
+ * 레이어가 보낸 웹훅의 본문을 확인하고 이벤트로 읽는다. 맞지 않으면 `OrbitalWebhookError` 를 던진다.
+ *
+ * - `body` 는 받은 그대로의 바이트(또는 글)여야 한다. JSON 으로 읽었다가 다시 쓴 것은 맞지 않는다.
+ * - `signature` 는 `orbital-signature` 머리말(`t=<Unix 초>,v1=<hex>`)이다. `v1` 은 `HMAC-SHA256(비밀, "<t>.<본문>")` 이고, 견주기는
+ *   시간이 값에 따라 달라지지 않게 한다. `t` 가 지금(`now`, Unix 초)에서 `toleranceSeconds`(기본 300초)보다 멀면 받지 않는다(되풀이 막기).
+ * - 웹훅은 적어도 한 번 간다. 같은 `id` 가 다시 올 수 있으니 처리한 `id` 를 기억해 겹침을 거른다.
+ */
+export function verifyWebhook(input: {
+    secret: string;
+    signature: string | null | undefined;
+    body: string | Uint8Array;
+    toleranceSeconds?: number;
+    now?: number;
+}): OrbitalEvent
+{
+    const tolerance = input.toleranceSeconds ?? 300;
+    const now = input.now ?? Math.floor(Date.now() / 1000);
+    let at: number | null = null;
+    const given: string[] = [];
+    for (const part of (input.signature ?? "").split(","))
+    {
+        const split = part.indexOf("=");
+        const key = split < 0 ? part.trim() : part.slice(0, split).trim();
+        const value = split < 0 ? "" : part.slice(split + 1).trim();
+        if (key === "t" && /^[0-9]{1,12}$/.test(value))
+        {
+            at = Number(value);
+        }
+        else if (key === "v1" && /^[0-9a-f]{64}$/.test(value))
+        {
+            given.push(value);
+        }
+    }
+    if (at === null || given.length === 0)
+    {
+        throw new OrbitalWebhookError("malformed", "orbital-signature 머리말이 `t=<Unix 초>,v1=<hex>` 모양이 아닙니다");
+    }
+    if (Math.abs(now - at) > tolerance)
+    {
+        throw new OrbitalWebhookError("stale", `서명의 때가 지금과 ${tolerance}초보다 멉니다. 시계를 맞추거나 다시 보낸 것을 기다려 주세요`);
+    }
+    const bytes = typeof input.body === "string" ? Buffer.from(input.body, "utf8") : Buffer.from(input.body);
+    const expected = createHmac("sha256", input.secret).update(`${at}.`).update(bytes).digest();
+    const matched = given.some((value) =>
+    {
+        const candidate = Buffer.from(value, "hex");
+        return candidate.length === expected.length && timingSafeEqual(candidate, expected);
+    });
+    if (!matched)
+    {
+        throw new OrbitalWebhookError("mismatch", "서명이 맞지 않습니다. 받은 본문을 고치지 않고 그대로 넘기고, 웹훅을 건 때 받은 비밀을 쓰는지 봐 주세요");
+    }
+    let parsed: unknown;
+    try
+    {
+        parsed = JSON.parse(bytes.toString("utf8"));
+    }
+    catch
+    {
+        throw new OrbitalWebhookError("malformed", "본문이 JSON 이 아닙니다");
+    }
+    if (!isRecord(parsed))
+    {
+        throw new OrbitalWebhookError("malformed", "본문이 이벤트의 모양이 아닙니다");
+    }
+    return toEvent(parsed);
+}
+
 /** git 의 길 셋. 주소의 끝과 방법으로 고르고, 레이어의 `…/git/` 뒤에 붙일 것을 돌려준다. 셋이 아니면 `undefined` 다. */
 function gitTail(method: string, url: URL): string | undefined
 {
@@ -1024,6 +1243,46 @@ export function createOrbital(options: OrbitalOptions): Orbital
             async revoke(id)
             {
                 return toServiceKey(await call("DELETE", `keys/${encodeURIComponent(id)}`));
+            },
+        },
+        events: {
+            async list(input = {})
+            {
+                const query = new URLSearchParams();
+                if (input.after !== undefined)
+                {
+                    query.set("after", String(input.after));
+                }
+                if (input.limit !== undefined)
+                {
+                    query.set("limit", String(input.limit));
+                }
+                const tail = query.size === 0 ? "" : `?${query.toString()}`;
+                const reply = await call("GET", `events${tail}`);
+                const record = isRecord(reply) ? reply : {};
+                return {
+                    events: (Array.isArray(record.events) ? record.events : []).map(toEvent),
+                    next: number(record.next),
+                    hasMore: record.has_more === true,
+                };
+            },
+        },
+        webhook: {
+            async get()
+            {
+                const reply = await call("GET", "settings/webhook");
+                return isRecord(reply) && isRecord(reply.webhook) ? toWebhook(reply.webhook) : null;
+            },
+            async set({ url })
+            {
+                const reply = await call("PUT", "settings/webhook", { url });
+                const record = isRecord(reply) ? reply : {};
+                return { webhook: toWebhook(isRecord(record.webhook) ? record.webhook : {}), secret: text(record.secret) };
+            },
+            async remove()
+            {
+                const reply = await call("DELETE", "settings/webhook");
+                return isRecord(reply) && reply.removed === true;
             },
         },
         sessions: {
