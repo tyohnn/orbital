@@ -1873,3 +1873,89 @@ mod event {
         }
     }
 }
+
+// ---- 목록의 쪽 ----
+
+mod listing {
+    use orbital_core::listing::Cursor;
+    use proptest::prelude::*;
+
+    /// 식별자의 글자. 경계가 자주 나오게 허락하는 글자 몇과 허락하지 않는 글자 몇만 쓴다.
+    fn allowed() -> impl Strategy<Value = char> {
+        proptest::sample::select(vec!['a', 'z', '0', '9', '_'])
+    }
+
+    /// 표식의 식별자 자리에 올 글자. 대부분 허락하는 글자이고, 가끔 허락하지 않는 글자(대문자 · 기호 · 빈칸 · 한글)가 섞인다.
+    fn id_char() -> impl Strategy<Value = char> {
+        prop_oneof![
+            8 => allowed(),
+            1 => proptest::sample::select(vec!['A', 'Z', '-', '.', ' ', '가', '/']),
+        ]
+    }
+
+    /// 표식의 때 자리에 올 글. 대부분 숫자이고, 가끔 숫자가 아닌 것이 섞인다.
+    fn at_text() -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => proptest::collection::vec(proptest::sample::select(vec!['0', '1', '9']), 0..5)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            1 => proptest::collection::vec(proptest::sample::select(vec!['1', '-', '+', 'x', ' ']), 0..4)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn 어떤_표식이든_글로_적었다_읽으면_같다(
+            created_at in prop_oneof![Just(0_u64), Just(u64::MAX), any::<u64>()],
+            id in proptest::collection::vec(allowed(), 1..=64)
+        ) {
+            let cursor = Cursor { created_at, id: id.into_iter().collect() };
+            prop_assert_eq!(Cursor::parse(&cursor.text()), Some(cursor));
+        }
+
+        #[test]
+        fn 점이_없거나_때가_수가_아니거나_식별자에_없는_글자가_든_표식은_받지_않는다(
+            at in at_text(),
+            id in proptest::collection::vec(id_char(), 0..70)
+        ) {
+            let id: String = id.into_iter().collect();
+            let text = format!("{at}.{id}");
+            // 오라클: 표식의 규칙을 구현과 따로 적는다
+            let at_ok = !at.is_empty() && at.chars().all(|c| c.is_ascii_digit());
+            let id_ok = !id.is_empty() && id.chars().count() <= 64
+                && id.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9' | '_'));
+            prop_assert_eq!(Cursor::parse(&text).is_some(), at_ok && id_ok, "{}", text);
+            // 점이 없는 글은 무엇이든 받지 않는다
+            let joined = format!("{at}{id}");
+            if !joined.contains('.') {
+                prop_assert_eq!(Cursor::parse(&joined), None);
+            }
+        }
+    }
+}
+
+// ---- 운영의 로그 ----
+
+mod fleet {
+    use orbital_core::fleet::{CLIPPED_MARK, LOG_LINE_MAX, clip_line};
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn 어떤_줄이든_자른_줄은_상한의_글자_수를_넘지_않고_원래_줄의_머리다(
+            pieces in proptest::collection::vec(proptest::sample::select(vec!["a", "가", "😀", " ", "\t"]), 0..2100)
+        ) {
+            let line: String = pieces.concat();
+            let (clipped, cut) = clip_line(&line);
+            let count = line.chars().count();
+            // 오라클: 글자 수로만 가른다
+            prop_assert_eq!(cut, count > LOG_LINE_MAX);
+            let body = clipped.strip_suffix(CLIPPED_MARK).filter(|_| cut).unwrap_or(&clipped);
+            prop_assert!(body.chars().count() <= LOG_LINE_MAX);
+            prop_assert!(line.starts_with(body));
+            if !cut {
+                prop_assert_eq!(&clipped, &line);
+            }
+        }
+    }
+}

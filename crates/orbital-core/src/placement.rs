@@ -36,6 +36,8 @@ pub enum Errand {
     Work,
     /// 운영의 모습(release · 주소 · 일정)을 보기.
     ProductionView,
+    /// 운영의 로그와 서비스마다의 상태(자는지 · 깨어 있는지). 놓인 기계의 파일과 메모리에만 있다.
+    ProductionLive,
     /// 운영의 사용자 · 초대 · 역할 · MCP 클라이언트. 인스턴스의 DB 에만 닿는다.
     Users,
     /// 비밀의 목록 · 요청 · 값 넣기와 지우기 · 입력 표. 서비스를 재우는 일은 놓인 기계에 DB 로 알린다.
@@ -53,7 +55,7 @@ pub enum Errand {
 }
 
 impl Errand {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::SourceBundle,
         Self::Push,
         Self::Git,
@@ -67,6 +69,7 @@ impl Errand {
         Self::Destroy,
         Self::Work,
         Self::ProductionView,
+        Self::ProductionLive,
         Self::Users,
         Self::Secrets,
         Self::Rollout,
@@ -102,7 +105,8 @@ pub fn reach(errand: Errand) -> Reach {
         | Errand::CreateRollout
         | Errand::Destroy
         | Errand::App
-        | Errand::Traffic => Reach::Placed,
+        | Errand::Traffic
+        | Errand::ProductionLive => Reach::Placed,
         Errand::Work
         | Errand::ProductionView
         | Errand::Users
@@ -197,6 +201,7 @@ mod tests {
             Errand::Destroy,
             Errand::App,
             Errand::Traffic,
+            Errand::ProductionLive,
         ];
         let anywhere = [
             Errand::Work,
