@@ -1,0 +1,8 @@
+{
+    "mcpServers": {
+        "starter": {
+            "type": "http",
+            "url": "http://127.0.0.1:3840/mcp"
+        }
+    }
+}

@@ -13,10 +13,12 @@
         "check:layers": "node scripts/check-layers.mjs",
         "check:claude-md": "node scripts/check-claude-md.mjs",
         "check": "npm run check:layers && npm run check:claude-md",
-        "typecheck": "npm run typecheck --workspaces --if-present",
+        "typecheck": "npm run typecheck --workspaces --if-present && tsc --noEmit -p templates",
         "test:sdk": "cargo build -p orbital-server && npm test -w @harmony/orbital",
-        "pr:check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && npm run check && npm run typecheck && npm run test:sdk && npm run test:factory",
+        "pr:check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && npm run check && npm run typecheck && npm run test:sdk && npm run test:factory && npm run test:starter",
         "test:factory": "cargo build -p orbital-server && npm test -w @harmony/factory-todo",
-        "test:frameworks": "ORBITAL_FRAMEWORKS=1 cargo test -p orbital-server --test frameworks --test git -- --nocapture --test-threads=2"
+        "test:frameworks": "ORBITAL_FRAMEWORKS=1 cargo test -p orbital-server --test frameworks --test git -- --nocapture --test-threads=2 && npm run test:starter:lap",
+        "test:starter": "cargo build -p orbital-cli && node --conditions=orbital-source --test templates/factory-starter/server/test/*.test.ts templates/test/new-factory.test.ts",
+        "test:starter:lap": "cargo build -p orbital-server && ORBITAL_FRAMEWORKS=1 node --conditions=orbital-source --test templates/test/lap.test.ts"
     }
 }

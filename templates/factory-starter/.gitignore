@@ -1,0 +1,8 @@
+# 깐 것과 지은 것, 서버가 쓰는 폴더. 복사 스크립트도 이것들을 빼고 복사한다
+node_modules/
+.factory/
+.next/
+# 플러그인의 ZIP(npm run pack)
+*.zip
+# npm run try 가 받는 고객의 사본. 고객의 코드이지 팩토리의 코드가 아니다
+try-app/

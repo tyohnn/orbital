@@ -1,0 +1,8 @@
+{
+    "//": "저장소 안에서만 쓴다. 템플릿의 서버는 워크스페이스가 아니어서 SDK 를 소스(.ts)로 읽는 조건(orbital-source)을 여기서 붙인다. 복사본은 server/tsconfig.json 을 쓴다",
+    "extends": "./factory-starter/server/tsconfig.json",
+    "compilerOptions": {
+        "customConditions": ["orbital-source"]
+    },
+    "include": ["factory-starter/server/src", "factory-starter/server/test", "test"]
+}

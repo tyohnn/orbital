@@ -1,0 +1,29 @@
+# 고객마다 복사될 앱(스캐폴드)의 선언이다. ✏️ 표시한 자리를 당신의 앱으로 바꾼다.
+# 지금은 「메모」 하나를 적고 읽는 Next.js(App Router) 앱이다. 빌드는 레이어가 그 commit 에서 직접 돌리고, 의존성은 package-lock.json 대로 받는다(npm ci).
+
+[[service]]
+name = "web"
+kind = "server"
+build = "npm ci && npm run build"
+start = "npm run start"           # next start 는 PORT 를 읽는다. 듣는 주소는 package.json 의 -H 127.0.0.1 이 정한다
+path = "/"
+roles = ["member"]                # ✏️ 이 서비스가 DB 에 붙는 업무 역할
+auth = "required"                 # 로그인한 사람만 들어온다. 아니면 레이어가 [auth].login_path 로 보낸다
+public = ["/_next/static", "/health"]   # 로그인 없이 내주는 경로. 신원은 싣지 않는다(적합성 테스트가 /health 를 부른다)
+
+[database]
+schemas = ["app"]                 # ✏️ 당신의 스키마. 마이그레이션이 이 안에 표를 만든다
+migrations = "db/migrations"
+roles = ["member"]                # ✏️ 업무 역할. 권한은 db/access.toml 이 정한다
+seed = "db/seed"                  # 프리뷰에만 들어가는 가짜 데이터와 씨앗 사용자
+
+# 로그인은 레이어가 맡는다. 로그인 화면(/login)과 그 아래, 공개 경로는 로그인 없이 열린다
+[auth]
+methods = ["email_link"]
+login_path = "/login"
+
+# 적합성 테스트. 모든 프리뷰에서 돌고, 통과하지 못하면 승격을 요청하지 못한다.
+# 레이어는 이 칸과 폴더를 고객의 사본이 아니라 위쪽(팩토리가 올린 스캐폴드)의 것으로 돌린다. 에이전트가 고쳐도 소용없다
+[conformance]
+run = "node conformance/check.mjs"
+files = "conformance"

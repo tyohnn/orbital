@@ -59,6 +59,8 @@ jobs:
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-19
       - run: sudo PG_DATA=/tmp/orbital-pg scripts/pg-local.sh
+      # 시작 템플릿의 한 바퀴(templates/test/lap.test.ts)가 저장소의 SDK 와 MCP client 를 쓴다
+      - run: npm ci
       # 실제 브라우저의 테스트(crates/orbital-server/tests/browser/*.cjs)가 require('playwright') 로 Chromium 을 띄운다.
       # 전역에 깔고 NODE_PATH 로 찾게 한다. CI 에서는 브라우저가 없으면 건너뛰지 않고 실패한다
       - run: npm install --global playwright@1.63.0 && npx --yes playwright@1.63.0 install --with-deps chromium

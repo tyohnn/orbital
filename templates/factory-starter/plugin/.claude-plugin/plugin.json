@@ -1,0 +1,6 @@
+{
+    "name": "starter",
+    "version": "0.1.0",
+    "description": "내 앱을 에이전트가 고치고, 내가 승인한 것만 운영에 올라가요.",
+    "author": { "name": "내 팩토리" }
+}
