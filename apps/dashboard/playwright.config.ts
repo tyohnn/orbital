@@ -28,7 +28,7 @@ export default defineConfig({
             ALLOW_LOCAL_ACCOUNTS: "1",
             NEXT_PUBLIC_SUPABASE_URL: SUPABASE_URL,
             NEXT_PUBLIC_SUPABASE_ANON_KEY: process.env.E2E_SUPABASE_ANON_KEY ?? "",
-            DASHBOARD_DATABASE_URL: process.env.E2E_DASHBOARD_DATABASE_URL ?? "postgresql://postgres:postgres@127.0.0.1:54422/postgres",
+            DASHBOARD_DATABASE_URL: "postgresql://dashboard_app:dashboard-app-local@127.0.0.1:54422/postgres",
             DASHBOARD_SEAL_KEY: "33".repeat(32),
             ORBITAL_URL: "http://127.0.0.1:7699",
             ORBITAL_ADMIN_KEY: "admin_key_for_dashboard_e2e_0123456789ab",

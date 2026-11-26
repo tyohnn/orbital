@@ -41,7 +41,7 @@ export class PgStore implements Store
         {
             await client.query("begin");
             const inserted = await client.query(
-                `insert into dashboard.factory (id, label, dashboard_key_id, sealed_key) values ($1, $2, $3, $4)
+                `insert into org.factory (id, label, dashboard_key_id, sealed_key) values ($1, $2, $3, $4)
                  on conflict (id) do nothing`,
                 [factory.id, factory.label, factory.dashboardKeyId, factory.sealedKey],
             );
@@ -51,7 +51,7 @@ export class PgStore implements Store
                 return false;
             }
             await client.query(
-                "insert into dashboard.member (factory_id, account_id, email, role) values ($1, $2, $3, 'owner')",
+                "insert into org.member (factory_id, account_id, email, role) values ($1, $2, $3, 'owner')",
                 [factory.id, owner.id, normalizeEmail(owner.email)],
             );
             await client.query("commit");
@@ -71,7 +71,7 @@ export class PgStore implements Store
     async factory(id: string): Promise<Factory | null>
     {
         const { rows } = await this.pool.query(
-            "select id, label, dashboard_key_id, sealed_key from dashboard.factory where id = $1",
+            "select id, label, dashboard_key_id, sealed_key from org.factory where id = $1",
             [id],
         );
         const row: Record<string, unknown> | undefined = rows[0];
@@ -83,7 +83,7 @@ export class PgStore implements Store
     async members(factoryId: string): Promise<Member[]>
     {
         const { rows } = await this.pool.query(
-            "select account_id, email, role from dashboard.member where factory_id = $1 order by created_at, account_id",
+            "select account_id, email, role from org.member where factory_id = $1 order by created_at, account_id",
             [factoryId],
         );
         return rows.map((row: Record<string, unknown>) => ({ accountId: text(row.account_id), email: text(row.email), role: role(row.role) }));
@@ -92,7 +92,7 @@ export class PgStore implements Store
     async memberships(accountId: string): Promise<Membership[]>
     {
         const { rows } = await this.pool.query(
-            `select f.id, f.label, m.role from dashboard.member m join dashboard.factory f on f.id = m.factory_id
+            `select f.id, f.label, m.role from org.member m join org.factory f on f.id = m.factory_id
              where m.account_id = $1 order by f.created_at, f.id`,
             [accountId],
         );
@@ -102,8 +102,8 @@ export class PgStore implements Store
     async invite(factoryId: string, email: string, invited: Role): Promise<void>
     {
         await this.pool.query(
-            `insert into dashboard.invitation (factory_id, email, role)
-             select $1, $2, $3 where not exists (select 1 from dashboard.member where factory_id = $1 and email = $2)
+            `insert into org.invitation (factory_id, email, role)
+             select $1, $2, $3 where not exists (select 1 from org.member where factory_id = $1 and email = $2)
              on conflict (factory_id, email) do update set role = excluded.role`,
             [factoryId, normalizeEmail(email), invited],
         );
@@ -112,7 +112,7 @@ export class PgStore implements Store
     async invitations(factoryId: string): Promise<Invitation[]>
     {
         const { rows } = await this.pool.query(
-            "select email, role from dashboard.invitation where factory_id = $1 order by created_at, email",
+            "select email, role from org.invitation where factory_id = $1 order by created_at, email",
             [factoryId],
         );
         return rows.map((row: Record<string, unknown>) => ({ email: text(row.email), role: role(row.role) }));
@@ -121,8 +121,8 @@ export class PgStore implements Store
     async acceptInvitations(account: Account): Promise<number>
     {
         const { rowCount } = await this.pool.query(
-            `with taken as (delete from dashboard.invitation where email = $2 returning factory_id, role)
-             insert into dashboard.member (factory_id, account_id, email, role)
+            `with taken as (delete from org.invitation where email = $2 returning factory_id, role)
+             insert into org.member (factory_id, account_id, email, role)
              select factory_id, $1, $2, role from taken
              on conflict (factory_id, account_id) do nothing`,
             [account.id, normalizeEmail(account.email)],
@@ -132,11 +132,11 @@ export class PgStore implements Store
 
     async setRole(factoryId: string, accountId: string, next: Role): Promise<void>
     {
-        await this.pool.query("update dashboard.member set role = $3 where factory_id = $1 and account_id = $2", [factoryId, accountId, next]);
+        await this.pool.query("update org.member set role = $3 where factory_id = $1 and account_id = $2", [factoryId, accountId, next]);
     }
 
     async removeMember(factoryId: string, accountId: string): Promise<void>
     {
-        await this.pool.query("delete from dashboard.member where factory_id = $1 and account_id = $2", [factoryId, accountId]);
+        await this.pool.query("delete from org.member where factory_id = $1 and account_id = $2", [factoryId, accountId]);
     }
 }

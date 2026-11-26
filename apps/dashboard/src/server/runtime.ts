@@ -19,7 +19,7 @@ const need = (name: string): string =>
     const value = process.env[name];
     if (value === undefined || value === "")
     {
-        throw new Error(`${name} 을 적어 주세요(apps/dashboard/.env.example)`);
+        throw new Error(`${name} 을 적어 주세요(apps/dashboard/.env.local.example)`);
     }
     return value;
 };

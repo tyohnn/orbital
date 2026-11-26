@@ -29,3 +29,6 @@ select gen_random_uuid(), id, id::text, 'email', jsonb_build_object('sub', id::t
   from auth.users
  where id in ('00000000-0000-4000-8000-00000000000a', '00000000-0000-4000-8000-00000000000b', '00000000-0000-4000-8000-00000000000c')
 on conflict do nothing;
+
+-- 대시보드 전용 롤(`dashboard_app`)의 로컬 비밀번호. 원격의 비밀번호는 여기 두지 않는다.
+alter role dashboard_app with login bypassrls password 'dashboard-app-local';

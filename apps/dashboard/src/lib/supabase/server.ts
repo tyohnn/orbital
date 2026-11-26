@@ -14,7 +14,7 @@ export const supabaseConfig = (): { url: string; anonKey: string } =>
     const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
     if (url === undefined || url === "" || anonKey === undefined || anonKey === "")
     {
-        throw new Error("NEXT_PUBLIC_SUPABASE_URL 과 NEXT_PUBLIC_SUPABASE_ANON_KEY 를 적어 주세요(apps/dashboard/.env.example)");
+        throw new Error("NEXT_PUBLIC_SUPABASE_URL 과 NEXT_PUBLIC_SUPABASE_ANON_KEY 를 적어 주세요(apps/dashboard/.env.local.example)");
     }
     return { url, anonKey };
 };
