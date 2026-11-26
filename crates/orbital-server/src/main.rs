@@ -3,7 +3,12 @@
 //! 설정은 환경 변수로 받는다.
 //! - `ORBITAL_HOME`: 레이어가 저장소 · 빌드 · 기록을 두는 폴더
 //! - `ORBITAL_PG`: DB 의 관리 주소
-//! - `ORBITAL_SERVICE_KEYS`: `조직=열쇠,조직=열쇠`. 팩토리의 서버가 쓰는 service key
+//! - `ORBITAL_SERVICE_KEYS`: `조직=열쇠,조직=열쇠`. 팩토리의 서버가 쓰는 service key 를 설정에 적는다(개발과 테스트). 없어도 뜬다.
+//!   기록(control database)에 둔 열쇠와 함께 산다. 같은 조직 이름을 가리켜도 되고, 그 조직이 기록에서 닫혔으면 이 열쇠도 받지 않는다
+//! - `ORBITAL_OPERATOR_KEY`: 운영자의 열쇠(32자 이상, `sk_` · `orb1.` 로 시작하지 않는다. `openssl rand -hex 32`). 주면 운영자의 길
+//!   (`/v1/operator/organizations`)이 열려 조직을 만들고(종류 `live` · `test`, 첫 service key 를 함께 낸다) 보고 닫고 열쇠를 낸다.
+//!   이 열쇠로는 조직의 일(인스턴스 · 승격 · 비밀 · 사용자)을 하지 못한다. 주지 않으면 그 길이 없다(404). 기록에는 두지 않는다
+//! - `ORBITAL_TEST_INSTANCE_LIMIT`: 시험용 조직(`test`)이 세울 수 있는 인스턴스의 수(기본 10). 그 밖의 규칙은 운영의 조직과 같다
 //! - `ORBITAL_LISTEN`: 듣는 주소(기본 `127.0.0.1:7400`)
 //! - `ORBITAL_PUBLIC_URL`: 레이어의 바깥 주소(기본 `http://<ORBITAL_LISTEN>`). Google 의 콜백이 `<바깥 주소>/v1/auth/google/callback` 에 서고,
 //!   팩토리는 이 주소 하나를 Google 콘솔에 등록한다
@@ -190,13 +195,47 @@ fn drill_once() -> Result<bool, String> {
 }
 
 fn start() -> Result<(), String> {
-    let service_keys = setting("ORBITAL_SERVICE_KEYS")?
-        .split(',')
-        .filter_map(|pair| pair.split_once('='))
-        .map(|(organization, key)| (key.trim().to_owned(), organization.trim().to_owned()))
-        .collect::<Vec<_>>();
-    if service_keys.is_empty() {
-        return Err("`ORBITAL_SERVICE_KEYS` 를 `조직=열쇠` 모양으로 적어 주세요".to_owned());
+    let service_keys = match std::env::var("ORBITAL_SERVICE_KEYS") {
+        Err(_) => Vec::new(),
+        Ok(text) => {
+            let pairs = text
+                .split(',')
+                .filter(|pair| !pair.trim().is_empty())
+                .map(|pair| {
+                    pair.split_once('=')
+                        .map(|(organization, key)| {
+                            (key.trim().to_owned(), organization.trim().to_owned())
+                        })
+                        .filter(|(key, organization)| !key.is_empty() && !organization.is_empty())
+                })
+                .collect::<Option<Vec<_>>>();
+            match pairs {
+                Some(pairs) if !pairs.is_empty() => pairs,
+                _ => {
+                    return Err(
+                        "`ORBITAL_SERVICE_KEYS` 를 `조직=열쇠,조직=열쇠` 모양으로 적어 주세요. 쓰지 않으면 지워 주세요".to_owned(),
+                    );
+                }
+            }
+        }
+    };
+    let operator_key = std::env::var("ORBITAL_OPERATOR_KEY")
+        .ok()
+        .map(|key| key.trim().to_owned());
+    let test_instance_limit = match std::env::var("ORBITAL_TEST_INSTANCE_LIMIT") {
+        Err(_) => orbital_core::organization::TEST_INSTANCE_LIMIT,
+        Ok(text) => text
+            .parse::<u32>()
+            .ok()
+            .filter(|limit| *limit > 0)
+            .ok_or_else(|| {
+                "`ORBITAL_TEST_INSTANCE_LIMIT` 는 1 이상의 수로 적어 주세요(기본 10)".to_owned()
+            })?,
+    };
+    if service_keys.is_empty() && operator_key.is_none() {
+        eprintln!(
+            "orbitald: `ORBITAL_SERVICE_KEYS` 도 `ORBITAL_OPERATOR_KEY` 도 없습니다. 기록에 있는 service key 만 받습니다"
+        );
     }
     let listen = std::env::var("ORBITAL_LISTEN").unwrap_or_else(|_| "127.0.0.1:7400".to_owned());
     let seal_key = seal_key()?;
@@ -300,6 +339,8 @@ fn start() -> Result<(), String> {
         machine_router_url: std::env::var("ORBITAL_MACHINE_ROUTER_URL")
             .ok()
             .filter(|url| !url.trim().is_empty()),
+        operator_key,
+        test_instance_limit,
         ..Options::new(
             setting("ORBITAL_HOME")?.into(),
             setting("ORBITAL_PG")?,

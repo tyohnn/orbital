@@ -1,7 +1,7 @@
 //! 레이어의 기록. 관리 연결(`ORBITAL_PG`)의 클러스터 안에 레이어 전용 database(control database) 하나를 두고 그 안의 `orbital` 스키마에 둔다.
 //!
 //! 관리 서버는 기록을 자기 디스크에 두지 않는다. 그래서 같은 control database 를 보는 관리 서버가 여럿 떠도 같은 기록을 본다.
-//! 따로 고쳐지는 것마다 줄을 두고(인스턴스 · 일정 · rollout · 팩토리의 설정 · 금고의 값 · 비밀의 요청 · 입력 표 · 닫은 작업 · 훈련 · 기계 · 앱),
+//! 따로 고쳐지는 것마다 줄을 두고(인스턴스 · 일정 · rollout · 팩토리의 설정 · 금고의 값 · 비밀의 요청 · 입력 표 · 닫은 작업 · 훈련 · 기계 · 앱 · 조직 · service key),
 //! 줄을 고칠 때는 그 줄을 잠그고(`FOR UPDATE`) 읽어 고친 뒤 한 트랜잭션으로 적는다. 두 관리 서버가 같은 줄을 동시에 고쳐도 한쪽의 변경을 잃지 않는다.
 //!
 //! 인스턴스의 database 와 섞지 않고, `PUBLIC` 의 접속을 걷어 인스턴스의 어떤 역할도 이 database 에 붙지 못한다.
@@ -28,6 +28,10 @@ use crate::registry::{InstanceRecord, RolloutRecord, ScheduleRecord, ScheduleRun
 use crate::seal::{Rekeyed, SealKey, open, production_binding, reseal, seal};
 use crate::token::hex;
 
+mod organizations;
+
+pub use organizations::{FoundKey, KeyRow, NewKey, OrganizationRow};
+
 /// control database 의 기본 이름(`ORBITAL_CONTROL_DB`).
 pub const CONTROL_DATABASE: &str = "orbital_control";
 /// 기계의 기본 이름(`ORBITAL_MACHINE`). 관리 서버가 한 대일 때의 이름이다.
@@ -36,7 +40,7 @@ pub const DEFAULT_MACHINE: &str = "local";
 pub const REFRESH_CHANNEL: &str = "orbital_refresh";
 
 /// 저장소에 둔 control database 의 마이그레이션(파일 이름, 내용). 번호는 이름의 앞 네 자리다.
-pub const MIGRATIONS: [(&str, &str); 2] = [
+pub const MIGRATIONS: [(&str, &str); 3] = [
     (
         "0001_records.sql",
         include_str!("../migrations/0001_records.sql"),
@@ -44,6 +48,10 @@ pub const MIGRATIONS: [(&str, &str); 2] = [
     (
         "0002_machine_address.sql",
         include_str!("../migrations/0002_machine_address.sql"),
+    ),
+    (
+        "0003_organizations.sql",
+        include_str!("../migrations/0003_organizations.sql"),
     ),
 ];
 

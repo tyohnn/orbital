@@ -75,8 +75,11 @@ use crate::settings::{Settings, SettingsError};
 use crate::token;
 use crate::vault::{RedeemError, SecretValue, Vault, VaultError};
 
+mod organizations;
 mod rollout;
+
 use orbital_core::rollout::Event as RolloutEvent;
+pub use organizations::{IssuedKey, OrganizationReport, key_refusal_text};
 use rollout::refusal_text;
 pub use rollout::{
     AgentRollout, ApplyReport, ConformanceReport, InstanceProgress, NewRollout, RolloutReport,
@@ -88,6 +91,8 @@ pub enum Failure {
     /// 없거나, 있어도 이 토큰의 범위 밖이다. 둘을 구분하지 않는다.
     NotFound,
     Unauthorized,
+    /// 열쇠를 알지만 받지 않는다(거둔 열쇠 · 닫힌 조직의 열쇠). 401 이고 까닭을 싣는다. 열쇠를 가진 쪽만 이 답을 본다.
+    KeyRejected(orbital_core::organization::KeyRefusal),
     Forbidden(String),
     /// 코드에 고칠 것이 있다.
     Problems(Vec<String>),
@@ -570,8 +575,12 @@ pub struct Options {
     pub home: PathBuf,
     /// DB 의 관리 주소.
     pub pg_url: String,
-    /// (service key, 조직). 팩토리의 서버가 쓴다.
+    /// (service key, 조직). 팩토리의 서버가 쓴다(`ORBITAL_SERVICE_KEYS`). 기록(control database)의 열쇠와 함께 산다.
     pub service_keys: Vec<(String, String)>,
+    /// 운영자의 열쇠(`ORBITAL_OPERATOR_KEY`). 조직을 만들고 보고 닫고 열쇠를 내는 길(`/v1/operator/…`)만 연다. 없으면 그 길이 없다(404).
+    pub operator_key: Option<String>,
+    /// 시험용 조직이 세울 수 있는 인스턴스의 수(`ORBITAL_TEST_INSTANCE_LIMIT`, 기본 10).
+    pub test_instance_limit: u32,
     pub runner: Box<dyn Runner>,
     /// 팩토리의 키를 봉인하는 열쇠. 기록 밖에서 온다(`ORBITAL_SEAL_KEY`). 없으면 팩토리가 설정을 넣지 못한다.
     pub seal_key: Option<SealKey>,
@@ -642,6 +651,8 @@ impl Options {
             home,
             pg_url,
             service_keys,
+            operator_key: None,
+            test_instance_limit: orbital_core::organization::TEST_INSTANCE_LIMIT,
             runner,
             seal_key: None,
             previous_seal_key: None,
@@ -739,6 +750,9 @@ pub struct LayerCore {
     runtime: Runtime,
     token_key: Vec<u8>,
     service_keys: Vec<([u8; 32], String)>,
+    /// 운영자의 열쇠의 sha256. 없으면 운영자의 길이 없다.
+    operator_key: Option<[u8; 32]>,
+    test_instance_limit: u32,
     /// 백업을 켠 레이어에만 있다.
     backup: Option<Backup>,
     /// 지금 되살리거나 무르는 인스턴스. 같은 인스턴스의 되살리기를 겹치지 않게 한다.
@@ -901,6 +915,7 @@ impl Layer {
     }
 
     pub fn open(options: Options) -> Result<Self, String> {
+        organizations::check_options(&options)?;
         fs::create_dir_all(&options.home)
             .map_err(|_| "레이어의 폴더를 만들지 못했습니다".to_owned())?;
         let config: postgres::Config = options
@@ -1088,6 +1103,8 @@ impl Layer {
                 .iter()
                 .map(|(key, organization)| (digest(key), organization.clone()))
                 .collect(),
+            operator_key: options.operator_key.as_deref().map(digest),
+            test_instance_limit: options.test_instance_limit,
             building: Mutex::new(BTreeMap::new()),
             resealed,
             restoring: Mutex::new(BTreeSet::new()),
@@ -1514,14 +1531,9 @@ impl Layer {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// service key 의 조직. 팩토리의 서버만 갖는 열쇠다.
+    /// service key 의 조직. 팩토리의 서버만 갖는 열쇠다. 판정은 [`Layer::caller`] 가 한다.
     pub fn organization(&self, key: &str) -> Outcome<String> {
-        let given = digest(key);
-        self.service_keys
-            .iter()
-            .find(|(known, _)| known == &given)
-            .map(|(_, organization)| organization.clone())
-            .ok_or(Failure::Unauthorized)
+        self.caller(key).map(|caller| caller.organization.0)
     }
 
     /// 토큰이 이 인스턴스에서 이 일을 해도 되는지 본다. 판정은 core 가 한다.
@@ -1676,7 +1688,8 @@ impl Layer {
                 other => internal(other),
             })?;
         // 인스턴스는 세운 관리 서버의 기계에 놓인다. 코드 저장소가 이 기계에 생겼다
-        let written = self.records.insert_instance(
+        // 시험용 조직의 상한과 닫힌 조직은 그 조직의 차례를 잡고 센다. 두 관리 서버가 함께 세워도 상한을 넘지 않는다
+        let written = self.records.insert_instance_checked(
             instance.as_str(),
             &InstanceRecord {
                 organization: organization.to_owned(),
@@ -1684,10 +1697,11 @@ impl Layer {
                 machine: self.machine().to_owned(),
                 ..InstanceRecord::default()
             },
+            |state, existing| self.judge_new_instance(state, existing),
         );
         if let Err(error) = written {
             let _ = self.sources.destroy(&instance);
-            return Err(error.into());
+            return Err(error);
         }
         Ok(instance)
     }
