@@ -102,6 +102,7 @@ scripts/drill-local.sh                 # 따로 세운 클러스터로 복구 �
 | 무엇 | 어디 |
 |---|---|
 | 기능 영역마다 되는 것과 남은 일 | `docs/지도.md` |
+| 팩토리가 복사해 쓰는 시작 템플릿 | `templates/factory-starter/`(`node scripts/new-factory.mjs`) |
 | 결정의 경위 | `docs/decisions/` |
 | 용어 | `.claude/rules/glossary/orbital.md` |
 | 이름의 근거 | [Harmony 제품 브랜딩 안](https://claude.ai/artifact/XbyuA8p4srQNCBeP9AbPEe) |
