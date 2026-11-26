@@ -11,7 +11,7 @@
 | `src/server/dashboard.ts` | 할 일(팩토리 만들기 · 키 · 팀원). 테스트 이름의 정본은 `dashboard.test.ts` 이고 실제 orbitald 에 붙는다 |
 | `src/server/store.ts` · `pg-store.ts` | 기록의 포트와 메모리 · Postgres 구현. `store.contract.test.ts` 가 함께 잰다 |
 | `src/actions/` | 서버 액션. 매번 `currentAccount()` 로 계정을 다시 확인한다 |
-| `supabase/` | 로컬 Supabase(API 54421 · DB 54422), `dashboard` 스키마, 시드 계정(비밀번호 `orbital-local`) |
+| `supabase/` | 로컬 Supabase(API 54421 · DB 54422), `org` 스키마, 시드 계정(비밀번호 `orbital-local`) |
 
 ## 지키는 것
 
@@ -19,7 +19,8 @@
   로그인 화면과 서버 액션이 함께 읽습니다. 배포 환경에 `ALLOW_LOCAL_ACCOUNTS` 를 넣지 않습니다.
 - ⚠ **운영자 키 · 봉인의 열쇠 · 팩토리의 키는 서버에만 있습니다.** 화면에는 첫 키와 새 키의 비밀이 한 번씩만 갑니다. 대시보드가 쓰는 키는
   `DASHBOARD_SEAL_KEY` 로 봉인해 기록에 두고 화면에서 폐기하지 못합니다.
-- ⚠ **`dashboard` 스키마는 서버만 읽고 씁니다.** RLS 를 켜고 정책을 두지 않습니다. 브라우저의 Supabase 키로는 닿지 않습니다.
+- ⚠ **대시보드는 전용 롤 `dashboard_app` 으로만 DB 에 붙습니다.** `bypassrls` 라 GRANT 가 유일한 경계이고, 표마다 RLS 와 `deny_all` 을 둡니다.
+  스키마는 업무 영역으로 짓습니다(`org`). 롤의 LOGIN · 비밀번호는 마이그레이션에 두지 않습니다(로컬은 `supabase/seed.sql`).
 - 속하지 않은 팩토리는 없는 것과 같습니다(`not_found`, 화면은 404).
 
 ## 명령
