@@ -656,6 +656,7 @@ fn 두_관리_서버가_같은_줄을_동시에_고쳐도_한쪽의_변경을_�
                                     rehearsal: orbital_core::release::Rehearsed::NotNeeded,
                                     external: Vec::new(),
                                     conformance: orbital_core::release::Conformed::NotDeclared,
+                                    rehearsed: None,
                                 },
                             );
                             Ok::<(), orbital_server::records::RecordError>(())
@@ -1919,6 +1920,7 @@ fn 열쇠를_나중에_준_레이어는_평문이던_줄을_봉인으로_바꾼�
                         port: None,
                         origin: None,
                         manifest: None,
+                        promoted_at: None,
                     }),
                     ..InstanceRecord::default()
                 },

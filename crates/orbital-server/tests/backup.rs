@@ -953,6 +953,45 @@ fn 되살리기를_무르면_되살리기_전의_행이_보이고_다시_무르�
 }
 
 #[test]
+fn 되살리기와_무르기는_이력에_시점과_함께_한_줄씩_남는다() {
+    let mut bench = bench!();
+    let (instance, _) = bench.shipped();
+    bench.base_backup();
+    bench.note(&instance, "x", "before");
+    let at = moment();
+    bench.note(&instance, "x", "after");
+    let (status, report) = bench.restore(FACTORY, &instance, at);
+    assert_eq!(status, 200, "{report}");
+    let (status, undone) = bench.undo(FACTORY, &instance);
+    assert_eq!(status, 200, "{undone}");
+    // 되살리지 못한 것(무를 것이 없다)은 이력에 남지 않는다
+    let (status, body) = bench.undo(FACTORY, &instance);
+    assert_eq!(status, 409, "{body}");
+    let (status, history) = bench.call(
+        "GET",
+        &format!("/v1/instances/{instance}/history"),
+        FACTORY,
+        &[],
+    );
+    assert_eq!(status, 200, "{history}");
+    let lines = history["history"].as_array().unwrap();
+    let kinds: Vec<&str> = lines
+        .iter()
+        .map(|line| line["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["promoted", "restored", "restore_undone"]);
+    let release = lines[0]["release"].clone();
+    assert_eq!(lines[1]["to"], json!(at));
+    assert_eq!(lines[1]["release"], release);
+    assert_eq!(lines[2]["release"], release);
+    assert!(lines[2]["at"].as_u64().unwrap() >= lines[1]["at"].as_u64().unwrap());
+    // 이력에는 되돌릴 지점의 이름도 행도 없다
+    let point = report["restore_point"].as_str().unwrap();
+    assert!(!history.to_string().contains(point), "{history}");
+    assert!(!history.to_string().contains("before"), "{history}");
+}
+
+#[test]
 fn 되살린_뒤_승격이_있었으면_되살리기를_무르지_못하고_까닭을_알린다() {
     let mut bench = bench!();
     let (instance, _) = bench.shipped();

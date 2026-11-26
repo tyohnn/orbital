@@ -232,14 +232,29 @@ impl Layer {
         })
     }
 
-    /// 이벤트를 쌓는다. 그 일을 적는 트랜잭션 밖에서 쌓는 자리만 쓴다. 쌓지 못하면 알리기만 하고 일을 되돌리지 않는다.
-    pub(super) fn note_after(&self, organization: &str, notes: &[Note]) {
+    /// 되돌려진 승격의 이력과 이벤트를 한 트랜잭션에 쌓는다. 운영을 앞의 모습으로 돌린 뒤라 고칠 몸이 없어 따로 쌓는다.
+    /// 쌓지 못하면 알리기만 하고 일을 되돌리지 않는다.
+    pub(super) fn note_rolled_back(
+        &self,
+        organization: &str,
+        instance: &orbital_core::name::InstanceId,
+        entry: orbital_core::history::Entry,
+        notes: &[Note],
+    ) {
         if self
             .records
-            .append_events(organization, (self.clock)(), notes)
+            .note_rolled_back(
+                organization,
+                instance.as_str(),
+                (self.clock)(),
+                notes,
+                &entry,
+            )
             .is_err()
         {
-            eprintln!("orbitald: 이벤트를 쌓지 못했습니다. 그 일은 됐고 이벤트만 빠졌습니다");
+            eprintln!(
+                "orbitald: 되돌려진 승격의 이력과 이벤트를 쌓지 못했습니다. 운영은 되돌렸고 이력과 이벤트만 빠졌습니다"
+            );
         }
     }
 

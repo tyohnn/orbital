@@ -75,10 +75,14 @@ use crate::settings::{Settings, SettingsError};
 use crate::token;
 use crate::vault::{RedeemError, SecretValue, Vault, VaultError};
 
+mod dashboard;
 mod events;
 mod organizations;
 mod rollout;
 
+pub use dashboard::{
+    GrantReport, OrganizationView, ProductionLogs, ProductionServices, ServiceStatus,
+};
 pub use events::DeliveryReport;
 use orbital_core::event::{Body as EventBody, Note};
 use orbital_core::rollout::Event as RolloutEvent;
@@ -630,6 +634,10 @@ pub struct Options {
     /// 다른 관리 서버에서 닿는 이 기계의 공용 listener(`ORBITAL_MACHINE_ROUTER_URL`, `http://` 만). 하위 도메인을 쓰는 레이어에서
     /// 다른 기계가 받은 이 기계에 놓인 인스턴스의 고객 요청을 이리로 넘긴다. 없으면 다른 기계는 그 요청에 404 로 답한다.
     pub machine_router_url: Option<String>,
+    /// 운영의 서버가 찍은 로그를 service key 에 내줄지(`ORBITAL_PRODUCTION_LOGS=service_key`). 기본은 내주지 않는다.
+    /// 앱이 찍은 글에는 고객의 데이터가 섞일 수 있어 「값은 레이어 밖으로 나가지 않는다」와 맞닿는다. 레이어의 운영자가 명시해 켰을 때만
+    /// 끝의 몇 줄을 경로를 가려 내준다. 꺼져 있어도 빌드의 로그는 내준다(빌드는 운영의 데이터와 비밀 없이 돈다).
+    pub production_logs: bool,
     /// 개발용 웹훅(`ORBITAL_DEV_WEBHOOK=private`). 명시해 켰을 때만 웹훅의 주소로 `http://` 와 loopback · 사설 주소를 받는다.
     /// 로컬의 받는 서버로 재는 테스트와 개발에만 쓴다. 꺼져 있으면 `https://` 와 바깥(공인)의 주소만 받는다.
     pub dev_webhooks: bool,
@@ -687,6 +695,7 @@ impl Options {
             token_key: None,
             machine_url: None,
             machine_router_url: None,
+            production_logs: false,
             dev_webhooks: false,
             webhook_resolver: Arc::new(crate::webhook::SystemResolver),
             webhook_timeout: Duration::from_secs(10),
@@ -770,6 +779,8 @@ pub struct LayerCore {
     /// 운영자의 열쇠의 sha256. 없으면 운영자의 길이 없다.
     operator_key: Option<[u8; 32]>,
     test_instance_limit: u32,
+    /// 운영의 서버가 찍은 로그를 service key 에 내주는가.
+    production_logs: bool,
     /// 백업을 켠 레이어에만 있다.
     backup: Option<Backup>,
     /// 지금 되살리거나 무르는 인스턴스. 같은 인스턴스의 되살리기를 겹치지 않게 한다.
@@ -1128,6 +1139,7 @@ impl Layer {
                 .collect(),
             operator_key: options.operator_key.as_deref().map(digest),
             test_instance_limit: options.test_instance_limit,
+            production_logs: options.production_logs,
             building: Mutex::new(BTreeMap::new()),
             webhooks: events::Webhooks {
                 allow: if options.dev_webhooks {
@@ -1731,6 +1743,7 @@ impl Layer {
                 organization: organization.to_owned(),
                 app: app.to_string(),
                 machine: self.machine().to_owned(),
+                version: Some(version.to_owned()),
                 ..InstanceRecord::default()
             },
             (
@@ -2591,6 +2604,7 @@ impl Layer {
                 .map(|name| name.as_str().to_owned())
                 .collect(),
             conformance: conformed,
+            rehearsed: None,
         };
         self.update(instance, |stored| {
             stored.releases.insert(assembled.release.0.clone(), release);
@@ -2782,6 +2796,7 @@ impl Layer {
             tables: Vec::new(),
         };
         let mut outcome = Rehearsed::NotNeeded;
+        let mut numbers = None;
         if record.production.is_some() {
             let all: Vec<&str> = assembled
                 .migrations
@@ -2819,11 +2834,27 @@ impl Layer {
                     .into_iter()
                     .map(|count| (count.table, count.before, count.after))
                     .collect();
+                // 이력의 승격 줄에 옮길 숫자. 행의 내용과 오류의 문구는 없다
+                numbers = Some(orbital_core::history::Rehearsal {
+                    millis: report.millis,
+                    failed_at: report.failed_at.clone(),
+                    sqlstate: report.sqlstate.clone(),
+                    tables: report
+                        .tables
+                        .iter()
+                        .map(|(table, before, after)| orbital_core::history::TableRows {
+                            table: table.clone(),
+                            before: *before,
+                            after: *after,
+                        })
+                        .collect(),
+                });
             }
         }
         self.update(instance, |stored| {
             if let Some(stored) = stored.releases.get_mut(release) {
                 stored.rehearsal = outcome;
+                stored.rehearsed = numbers;
             }
             Ok(())
         })?;
@@ -2831,7 +2862,13 @@ impl Layer {
     }
 
     /// 승격을 요청한다. 막는 것이 있으면 요청하지 못한다. 올리는 것은 사람의 승인을 받은 팩토리의 서버다.
-    pub fn request_promotion(&self, instance: &InstanceId, release: &str) -> Outcome<()> {
+    /// `work` 는 요청한 작업의 식별자다. 요청한 때와 함께 적어 두고, 오르면 이력의 줄에 옮긴다.
+    pub fn request_promotion(
+        &self,
+        instance: &InstanceId,
+        release: &str,
+        work: Option<String>,
+    ) -> Outcome<()> {
         let record = self.here(instance, Errand::PromotionRequest)?;
         let known = record.releases.get(release).ok_or_else(|| {
             Failure::Conflict(
@@ -2859,6 +2896,8 @@ impl Layer {
         self.records
             .update_instance_noting(instance.as_str(), (self.clock)(), |record, notes| {
                 record.promotion_requested = Some(release.to_owned());
+                record.promotion_requested_at = Some((self.clock)());
+                record.promotion_requested_by = work;
                 notes.push(Note {
                     instance: Some(instance.clone()),
                     body: EventBody::PromotionRequested {
@@ -2876,14 +2915,32 @@ impl Layer {
 
 impl Layer {
     /// 사람이 승인한 release 를 운영에 올린다. 올리기 직전의 DB 를 되돌릴 지점으로 떠 두고, 중간에 깨지면 거기로 돌아간다.
+    /// `approver` 는 팩토리가 붙인 승인한 사람의 이름표다(이력에만 남는다). 오르거나 되돌려지면 이력에 한 줄을 쌓는다.
     pub fn promote(
         &self,
         organization: &str,
         instance: &InstanceId,
         release: &str,
-        change: Change,
-        approved_by: Approver,
+        (change, approved_by): (Change, Approver),
+        approver: Option<&str>,
     ) -> Outcome<PromotionReport> {
+        let approver = approver
+            .map(|text| {
+                orbital_core::history::check_approver(text).map_err(|problem| {
+                    Failure::Problems(vec![match problem {
+                        orbital_core::organization::LabelProblem::Empty => {
+                            "승인한 사람의 이름표(`approver`)가 비어 있습니다. 적지 않으려면 칸을 빼 주세요".to_owned()
+                        }
+                        orbital_core::organization::LabelProblem::TooLong { max } => {
+                            format!("승인한 사람의 이름표(`approver`)는 {max}자까지입니다")
+                        }
+                        orbital_core::organization::LabelProblem::Control => {
+                            "승인한 사람의 이름표(`approver`)에 줄바꿈 같은 제어 문자를 넣지 않습니다".to_owned()
+                        }
+                    }])
+                })
+            })
+            .transpose()?;
         // 빌드 폴더가 없으면(걷었거나 기계를 옮겼다) 레이어의 자물쇠 밖에서 먼저 빌드한다. 판정은 자물쇠를 쥔 뒤에 한다
         let commit = {
             let record = self.owned(organization, instance)?;
@@ -2939,6 +2996,28 @@ impl Layer {
         let folder = self.build(instance, &assembled)?;
         let names = Names::new(instance.clone());
         let key = (instance.as_str().to_owned(), Stage::Production);
+        // 이력의 줄. 권한의 변화는 승인 카드와 같은 문장이고, 지금(올리기 전)의 운영과 견준다
+        let requested = record.promotion_requested.as_deref() == Some(release);
+        let mut promotion = orbital_core::history::Promotion {
+            release: release.to_owned(),
+            commit: commit.to_string(),
+            previous_release: record
+                .production
+                .as_ref()
+                .map(|production| production.release.clone()),
+            change,
+            approved_by,
+            approver,
+            requested_at: record.promotion_requested_at.filter(|_| requested),
+            requested_by: record.promotion_requested_by.clone().filter(|_| requested),
+            access_findings: known.access_findings,
+            rehearsal: known.rehearsal,
+            rehearsed: known.rehearsed.clone(),
+            conformance: known.conformance,
+            migrations: 0,
+            changes: self.change_sentences(instance, &record, &assembled)?,
+            rollout: governing.clone(),
+        };
 
         // 선언에서 뺀 역할은 이 승격에서 걷는다. 그 역할이 아직 무엇의 주인이면 운영을 건드리기 전에 멈춘다
         if record.production.is_some() {
@@ -3027,9 +3106,14 @@ impl Layer {
                     names: &names,
                 };
                 let failure = self.back_out(&mut inner, &prior, point.as_ref(), kind, failure);
-                // 운영은 바꾸지 않았으므로(되돌렸다) 인스턴스의 줄을 고치는 트랜잭션이 없다. 되돌린 바로 뒤에 따로 쌓는다
-                self.note_after(
+                // 운영은 바꾸지 않았으므로(되돌렸다) 인스턴스의 몸을 고치는 트랜잭션이 없다. 되돌린 바로 뒤에 이력과 이벤트를 한 트랜잭션에 쌓는다
+                self.note_rolled_back(
                     organization,
+                    instance,
+                    orbital_core::history::Entry::RolledBack {
+                        promotion,
+                        migrated,
+                    },
                     &[Note {
                         instance: Some(instance.clone()),
                         body: EventBody::PromotionFailed {
@@ -3088,7 +3172,9 @@ impl Layer {
             port: launched.port,
             origin: Some(launched.origin.clone()),
             manifest: Some(assembled.manifest.get().clone()),
+            promoted_at: Some((self.clock)()),
         };
+        promotion.migrations = u32::try_from(report.migrations.len()).unwrap_or(u32::MAX);
         let succeeded = EventBody::PromotionSucceeded {
             release: release.to_owned(),
             commit: commit.to_string(),
@@ -3099,15 +3185,22 @@ impl Layer {
             rollout: governing.clone(),
         };
         self.records
-            .update_instance_noting(instance.as_str(), (self.clock)(), |stored, notes| {
-                stored.production = Some(production);
-                stored.promotion_requested = None;
-                notes.push(Note {
-                    instance: Some(instance.clone()),
-                    body: succeeded,
-                });
-                Ok::<(), Failure>(())
-            })?
+            .update_instance_logged(
+                instance.as_str(),
+                (self.clock)(),
+                |stored, notes, entries| {
+                    stored.production = Some(production);
+                    stored.promotion_requested = None;
+                    stored.promotion_requested_at = None;
+                    stored.promotion_requested_by = None;
+                    notes.push(Note {
+                        instance: Some(instance.clone()),
+                        body: succeeded,
+                    });
+                    entries.push(orbital_core::history::Entry::Promoted(promotion));
+                    Ok::<(), Failure>(())
+                },
+            )?
             .ok_or(Failure::NotFound)?;
         if let Some(id) = &governing {
             self.record(
@@ -4578,13 +4671,18 @@ impl Layer {
             .tables(&names, &assembled.manifest)
             .map_err(internal)?
             .len();
-        self.update(instance, |stored| {
-            if let Some(production) = stored.production.as_mut() {
-                production.restore_point = None;
-                production.restored = None;
-            }
-            Ok(())
-        })?;
+        self.records
+            .update_instance_logged(instance.as_str(), (self.clock)(), |stored, _, entries| {
+                if let Some(production) = stored.production.as_mut() {
+                    production.restore_point = None;
+                    production.restored = None;
+                    entries.push(orbital_core::history::Entry::RestoreUndone {
+                        release: production.release.clone(),
+                    });
+                }
+                Ok::<(), Failure>(())
+            })?
+            .ok_or(Failure::NotFound)?;
         sleep(&inner);
         Ok(UndoReport {
             instance: instance.as_str().to_owned(),
@@ -4741,13 +4839,19 @@ impl Layer {
         if let Some(old) = production.restore_point.clone() {
             let _ = inner.admin.forget(RestorePoint::named(old));
         }
-        self.update(instance, |stored| {
-            if let Some(production) = stored.production.as_mut() {
-                production.restore_point = Some(point.database().to_owned());
-                production.restored = Some(point.database().to_owned());
-            }
-            Ok(())
-        })?;
+        self.records
+            .update_instance_logged(instance.as_str(), (self.clock)(), |stored, _, entries| {
+                if let Some(production) = stored.production.as_mut() {
+                    production.restore_point = Some(point.database().to_owned());
+                    production.restored = Some(point.database().to_owned());
+                    entries.push(orbital_core::history::Entry::Restored {
+                        release: production.release.clone(),
+                        to: at,
+                    });
+                }
+                Ok::<(), Failure>(())
+            })?
+            .ok_or(Failure::NotFound)?;
         // 앞의 DB 에 붙어 있던 프로세스를 다시 재운다. 다음 요청이 되살린 DB 로 깬다
         sleep(&inner);
         Ok(RestoreReport {

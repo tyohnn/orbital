@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use orbital_core::history::Rehearsal;
 use orbital_core::manifest::Manifest;
 use orbital_core::release::{Conformed, Rehearsed};
 use orbital_core::rollout::Rollout;
@@ -23,6 +24,9 @@ pub struct ReleaseRecord {
     /// 위쪽의 적합성 테스트가 이 release 의 프리뷰에서 어떻게 끝났는가.
     #[serde(default)]
     pub conformance: Conformed,
+    /// 리허설의 숫자(걸린 시간 · 멈춘 자리 · 표마다의 행 수). 리허설을 돌려 마이그레이션이 있었을 때만 있다. 이력의 승격 줄에 옮긴다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehearsed: Option<Rehearsal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +53,9 @@ pub struct ProductionRecord {
     /// 운영의 선언. 다른 기계의 관리 서버가 코드 저장소 없이 사용자 · 비밀 · 운영의 모습을 다룰 때 쓴다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<Manifest>,
+    /// 이 release 가 운영에 오른 때(유닉스 초). 이 칸을 적기 전에 오른 운영은 모른다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -65,6 +72,14 @@ pub struct InstanceRecord {
     /// 에이전트가 승격을 요청한 release. 사람의 승인을 기다린다.
     #[serde(default)]
     pub promotion_requested: Option<String>,
+    /// 승격을 요청한 때와 그 작업의 식별자(토큰의 sha256 앞 16바이트). 이력의 승격 줄에 옮긴다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_requested_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_requested_by: Option<String>,
+    /// 인스턴스가 갈라진 스캐폴드의 버전(태그). 이 칸을 적기 전에 선 인스턴스는 모른다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// 프리뷰가 쓰는 database 의 식별자. 관리 서버가 다시 뜨면 프리뷰는 되살리지 않고 이것으로 남은 database 를 걷는다.
     #[serde(default)]
     pub preview: Option<String>,

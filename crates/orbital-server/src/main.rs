@@ -36,6 +36,8 @@
 //!   평문이던 줄을 봉인으로 바꾼다. 기록(control database)과 다른 자리에 둔다. 바꾸면 앞에서 넣은 키와 값이 풀리지 않아 다시 넣어야 한다
 //! - `ORBITAL_DEV_MAIL`: `outbox` 일 때만 개발용 메일함을 켠다. 팩토리의 메일 키가 없어도 운영에 오르고, 로그인 링크를 보내지 않고
 //!   `ORBITAL_HOME/outbox.jsonl`(주인만 읽는 파일)에 한 줄씩 쌓는다. 테스트가 이 파일에서 링크를 꺼낸다. 운영의 레이어에서는 켜지 않는다
+//! - `ORBITAL_PRODUCTION_LOGS`: `service_key` 일 때만 운영의 서버가 찍은 로그를 service key 에 내준다(`GET …/production/logs`, 끝의 몇 줄, 경로를 가려서).
+//!   앱이 찍은 글에는 고객의 데이터가 섞일 수 있어 기본은 내주지 않는다. 켜지 않아도 빌드의 로그와 서비스의 상태는 내준다. 작업의 토큰에는 어느 쪽이든 열지 않는다
 //! - `ORBITAL_DEV_WEBHOOK`: `private` 일 때만 개발용 웹훅을 켠다. 웹훅의 주소로 `http://` 와 loopback · 사설 · CGNAT · ULA 주소를 받는다
 //!   (link-local 과 메타데이터 주소는 그래도 받지 않는다). 로컬의 받는 서버로 재는 테스트와 개발에만 쓰고, 운영의 레이어에서는 켜지 않는다.
 //!   켜지 않으면 웹훅은 `https://` 이고 호스트가 바깥(공인)의 주소로만 풀려야 하며, 보낼 때마다 풀어 판정한 그 주소에 붙는다.
@@ -259,6 +261,15 @@ fn start() -> Result<(), String> {
         }
         Err(_) => false,
     };
+    let production_logs = match std::env::var("ORBITAL_PRODUCTION_LOGS") {
+        Ok(mode) if mode == "service_key" => true,
+        Ok(_) => {
+            return Err(
+                "`ORBITAL_PRODUCTION_LOGS` 는 `service_key` 만 받습니다. 운영의 서버 로그를 내주지 않으려면 지워 주세요".to_owned(),
+            );
+        }
+        Err(_) => false,
+    };
     let dev_webhooks = match std::env::var("ORBITAL_DEV_WEBHOOK") {
         Ok(mode) if mode == "private" => true,
         Ok(_) => {
@@ -355,6 +366,7 @@ fn start() -> Result<(), String> {
             .filter(|url| !url.trim().is_empty()),
         operator_key,
         test_instance_limit,
+        production_logs,
         dev_webhooks,
         ..Options::new(
             setting("ORBITAL_HOME")?.into(),
@@ -396,6 +408,11 @@ fn start() -> Result<(), String> {
     eprintln!("orbitald: http://{listen} 에서 듣습니다");
     if let Some(address) = layer.router_address() {
         eprintln!("orbitald: 인스턴스의 하위 도메인은 {address} 에서 받습니다");
+    }
+    if production_logs {
+        eprintln!(
+            "orbitald: 운영의 서버 로그를 service key 에 내줍니다(끝의 몇 줄, 경로를 가려서). 앱이 찍은 글에 고객의 데이터가 섞일 수 있습니다"
+        );
     }
     if dev_webhooks {
         eprintln!(

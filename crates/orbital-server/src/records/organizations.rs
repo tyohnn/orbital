@@ -425,7 +425,7 @@ impl Records {
         Ok(())
     }
 
-    /// 새 인스턴스를 적는다. 그 조직의 차례를 잡고, 조직의 모습과 지금 인스턴스의 수를 `judge` 에 넘겨 받아들일 때만 적는다.
+    /// 새 인스턴스를 적는다(만든 때는 `now`). 그 조직의 차례를 잡고, 조직의 모습과 지금 인스턴스의 수를 `judge` 에 넘겨 받아들일 때만 적는다.
     pub fn insert_instance_checked<E: From<RecordError>>(
         &self,
         id: &str,
@@ -448,8 +448,8 @@ impl Records {
         judge(state.as_ref(), u32::try_from(existing).unwrap_or(u32::MAX))?;
         transaction
             .execute(
-                "INSERT INTO orbital.instance (id, organization, app, machine, body) VALUES ($1, $2, $3, $4, $5::text::jsonb)",
-                &[&id, &record.organization, &record.app, &record.machine, &body],
+                "INSERT INTO orbital.instance (id, organization, app, machine, body, created_at) VALUES ($1, $2, $3, $4, $5::text::jsonb, $6)",
+                &[&id, &record.organization, &record.app, &record.machine, &body, &signed(now)],
             )
             .map_err(pg("적"))?;
         super::append_in(&mut transaction, &record.organization, now, notes)?;

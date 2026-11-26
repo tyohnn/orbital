@@ -455,6 +455,9 @@ struct NewPromotion {
     release: String,
     change: Change,
     approved_by: Approver,
+    /// 팩토리가 붙인 승인한 사람의 이름표. 이력에만 남는다.
+    #[serde(default)]
+    approver: Option<String>,
 }
 
 /// 에이전트의 토큰으로 되는 일.
@@ -530,11 +533,20 @@ fn with_token(
         ("POST", ["promotion-requests"]) => {
             allow(Action::RequestPromotion)?;
             let request: OfRelease = parse(body)?;
-            layer.request_promotion(&instance, &request.release)?;
+            // 요청한 작업의 식별자를 이력에 옮기려고 적어 둔다
+            layer.request_promotion(
+                &instance,
+                &request.release,
+                Some(crate::token::session_of(token)),
+            )?;
             Ok(ok(json!({ "requested": true })))
         }
         // 운영을 바꾸는 길을 토큰으로 두드리면 core 가 「service key 로만」이라고 답한다
         ("POST", ["promotions"]) => allow(Action::Promote).map(|()| ok(json!({}))),
+        // 운영의 로그와 상태도 그렇다. 운영의 로그는 앱이 찍은 글이라 고객의 데이터가 섞일 수 있어 에이전트에게 열지 않는다
+        ("GET", ["production", "logs" | "services"]) => {
+            allow(Action::ProductionLogs).map(|()| ok(json!({})))
+        }
         // 비밀은 이름과 채워졌는지만 본다
         ("GET", ["secrets"]) => {
             allow(Action::SecretsList)?;
@@ -616,7 +628,12 @@ fn with_service_key(
                 request
             )?)))
         }
+        ("GET", ["rollouts"]) => Ok(ok(layer.list_rollouts(&organization, query)?)),
         ("GET", ["rollouts", id]) => Ok(ok(json!(layer.rollout(&organization, id)?))),
+        // 조직 자신의 모습(이름 · 종류 · 인스턴스의 수와 상한)
+        ("GET", ["organization"]) => Ok(ok(json!(layer.organization_view(&organization)?))),
+        // 함대: 이 조직의 인스턴스를 만든 차례로 쪽을 나눠
+        ("GET", ["instances"]) => Ok(ok(layer.fleet(&organization, query)?)),
         ("POST", ["rollouts", id, "instances", instance, "apply"]) => {
             let instance = InstanceId::parse(instance).map_err(|_| Failure::NotFound)?;
             Ok(ok(json!(layer.apply_update(
@@ -639,6 +656,20 @@ fn with_service_key(
         (_, ["instances", id, tail @ ..]) => {
             let instance = InstanceId::parse(id).map_err(|_| Failure::NotFound)?;
             match (method, tail) {
+                ("GET", []) => Ok(ok(json!(layer.fleet_row(&organization, &instance)?))),
+                ("GET", ["history"]) => Ok(ok(layer.history(&organization, &instance, query)?)),
+                // 놓인 기계가 답한다. 운영의 로그는 service key 로만 본다(토큰의 길에는 없다)
+                ("GET", ["production", "logs"]) => Ok(ok(json!(layer.production_logs(
+                    &organization,
+                    &instance,
+                    query
+                )?))),
+                ("GET", ["production", "services"]) => Ok(ok(json!(
+                    layer.production_services(&organization, &instance)?
+                ))),
+                ("GET", ["oauth-grants"]) => Ok(ok(
+                    json!({ "grants": layer.oauth_grants(&organization, &instance)? }),
+                )),
                 ("POST", ["sessions"]) => {
                     let request: NewSession = parse(body)?;
                     let (token, expires_at, session) = layer.open_session(
@@ -661,8 +692,8 @@ fn with_service_key(
                         &organization,
                         &instance,
                         &request.release,
-                        request.change,
-                        request.approved_by,
+                        (request.change, request.approved_by),
+                        request.approver.as_deref(),
                     )?;
                     Ok(ok(json!(report)))
                 }

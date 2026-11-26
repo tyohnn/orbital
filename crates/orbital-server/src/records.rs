@@ -29,9 +29,11 @@ use crate::registry::{InstanceRecord, RolloutRecord, ScheduleRecord, ScheduleRun
 use crate::seal::{Rekeyed, SealKey, open, production_binding, reseal, seal};
 use crate::token::hex;
 
+mod dashboard;
 mod events;
 mod organizations;
 
+pub use dashboard::{FleetProduction, FleetRow, HistoryRow, LastPromotion};
 pub(crate) use events::append_in;
 pub use events::{Attempt, Delivered, DeliveryRow, EventRow, Head, Miss, WebhookRow};
 pub use organizations::{FoundKey, KeyRow, NewKey, OrganizationRow};
@@ -44,7 +46,7 @@ pub const DEFAULT_MACHINE: &str = "local";
 pub const REFRESH_CHANNEL: &str = "orbital_refresh";
 
 /// 저장소에 둔 control database 의 마이그레이션(파일 이름, 내용). 번호는 이름의 앞 네 자리다.
-pub const MIGRATIONS: [(&str, &str); 4] = [
+pub const MIGRATIONS: [(&str, &str); 5] = [
     (
         "0001_records.sql",
         include_str!("../migrations/0001_records.sql"),
@@ -60,6 +62,10 @@ pub const MIGRATIONS: [(&str, &str); 4] = [
     (
         "0004_events.sql",
         include_str!("../migrations/0004_events.sql"),
+    ),
+    (
+        "0005_dashboard.sql",
+        include_str!("../migrations/0005_dashboard.sql"),
     ),
 ];
 
@@ -788,6 +794,21 @@ impl Records {
         now: u64,
         change: impl FnOnce(&mut InstanceRecord, &mut Vec<Note>) -> Result<T, E>,
     ) -> Result<Option<T>, E> {
+        self.update_instance_logged(id, now, |record, notes, _| change(record, notes))
+    }
+
+    /// [`Records::update_instance_noting`] 와 같고, `change` 가 적은 이력의 줄(core 의 `history::Entry`)도 같은 트랜잭션에 쌓는다.
+    /// 고친 것이 commit 될 때만 이벤트와 이력이 남는다.
+    pub fn update_instance_logged<T, E: From<RecordError>>(
+        &self,
+        id: &str,
+        now: u64,
+        change: impl FnOnce(
+            &mut InstanceRecord,
+            &mut Vec<Note>,
+            &mut Vec<orbital_core::history::Entry>,
+        ) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
         let mut client = self.client()?;
         let mut transaction = client.transaction().map_err(pg("고치"))?;
         let Some(row) = transaction
@@ -804,8 +825,8 @@ impl Records {
             (row.get(0), row.get(1), row.get(2)),
             &row.get::<_, String>(3),
         )?;
-        let mut notes = Vec::new();
-        let made = change(&mut record, &mut notes)?;
+        let (mut notes, mut entries) = (Vec::new(), Vec::new());
+        let made = change(&mut record, &mut notes, &mut entries)?;
         let body = self.encode(id, &record)?;
         transaction
             .execute(
@@ -814,6 +835,13 @@ impl Records {
             )
             .map_err(pg("고쳐 적"))?;
         append_in(&mut transaction, &record.organization, now, &notes)?;
+        dashboard::append_history_in(
+            &mut transaction,
+            id,
+            now,
+            &entries,
+            orbital_core::history::KEEP,
+        )?;
         transaction.commit().map_err(pg("고쳐 적"))?;
         Ok(Some(made))
     }
@@ -1007,11 +1035,22 @@ impl Records {
     }
 
     pub fn insert_rollout(&self, id: &str, record: &RolloutRecord) -> Result<(), RecordError> {
+        self.insert_rollout_at(id, record, None)
+    }
+
+    /// rollout 을 적는다. `created_at` 은 목록의 차례가 된다(모르면 맨 앞에 선다).
+    pub fn insert_rollout_at(
+        &self,
+        id: &str,
+        record: &RolloutRecord,
+        created_at: Option<u64>,
+    ) -> Result<(), RecordError> {
         let body = serde_json::to_string(record).map_err(json("적"))?;
+        let created_at = created_at.map(|at| i64::try_from(at).unwrap_or(i64::MAX));
         self.client()?
             .execute(
-                "INSERT INTO orbital.rollout (id, organization, body) VALUES ($1, $2, $3::text::jsonb)",
-                &[&id, &record.organization, &body],
+                "INSERT INTO orbital.rollout (id, organization, body, created_at) VALUES ($1, $2, $3::text::jsonb, $4)",
+                &[&id, &record.organization, &body, &created_at],
             )
             .map_err(pg("적"))?;
         Ok(())

@@ -171,7 +171,7 @@ struct Trial<'a> {
     origin: &'a str,
 }
 
-fn report(id: &str, rollout: &Rollout) -> RolloutReport {
+pub(super) fn report(id: &str, rollout: &Rollout) -> RolloutReport {
     RolloutReport {
         id: id.to_owned(),
         app: rollout.app.clone(),
@@ -444,12 +444,13 @@ impl Layer {
         }
         let id = fresh_id('r')?.as_str().to_owned();
         let made = report(&id, &rollout);
-        self.records.insert_rollout(
+        self.records.insert_rollout_at(
             &id,
             &RolloutRecord {
                 organization: organization.to_owned(),
                 rollout,
             },
+            Some((self.clock)()),
         )?;
         Ok(made)
     }
