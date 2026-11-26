@@ -346,6 +346,140 @@ export interface RestoreUndone
 }
 
 /** 위쪽(앱)이 정한 적합성 테스트의 결과. */
+/** 함대(조직의 인스턴스 목록)의 한 줄. 레이어의 기록만으로 짓는다. 이름과 숫자만 있다. */
+export interface FleetInstance
+{
+    id: string;
+    app: string;
+    /** 갈라진 스캐폴드의 버전. 이 칸을 적기 전에 선 인스턴스는 `null` 이다. */
+    version: string | null;
+    /** 놓인 기계. */
+    machine: string;
+    createdAt: number | null;
+    /** 운영에 오른 것. `promotedAt` 은 이 칸을 적기 전에 오른 운영이면 `null` 이다. */
+    production: { release: string; promotedAt: number | null } | null;
+    /** 사람의 승인을 기다리는 release. */
+    promotionRequested: string | null;
+    /** 프리뷰의 database 가 기록에 있는가. */
+    preview: boolean;
+    /** 마지막 승격(올랐거나 되돌려졌다). 「실패한 곳」은 `outcome` 이 `rolled_back` 이다. */
+    lastPromotion: { release: string; at: number; outcome: "promoted" | "rolled_back" } | null;
+}
+
+/** 함대의 한 쪽. `hasMore` 면 `after: next` 로 이어 받는다. */
+export interface FleetPage
+{
+    instances: FleetInstance[];
+    /** 이 쪽의 마지막 줄의 표식. 처음부터 비었으면 `null` 이다. */
+    next: string | null;
+    hasMore: boolean;
+}
+
+/** 리허설의 숫자. 행의 내용은 없다. */
+export interface RehearsalNumbers
+{
+    millis: number;
+    failedAt: string | null;
+    sqlstate: string | null;
+    tables: { table: string; before: number | null; after: number | null }[];
+}
+
+/** release 의 이력의 승격 줄(올랐거나 되돌려졌다). */
+export interface HistoryPromotion
+{
+    release: string;
+    commit: string;
+    previousRelease: string | null;
+    change: Change;
+    approvedBy: Approver;
+    /** 팩토리가 붙인 승인한 사람의 이름표(`releases.promote` 의 `approver`). */
+    approver: string | null;
+    requestedAt: number | null;
+    /** 승격을 요청한 작업의 식별자(`Session.id`). */
+    requestedBy: string | null;
+    /** 프리뷰에서 권한 검사가 찾은 어긋남의 수. */
+    accessFindings: number;
+    rehearsal: "not_needed" | "not_run" | "passed" | "failed";
+    rehearsed: RehearsalNumbers | null;
+    conformance: Conformance["outcome"];
+    /** 돈 마이그레이션의 수. */
+    migrations: number;
+    /** 앞의 운영과 견준 권한의 변화(승인 카드의 문장). */
+    changes: string[];
+    rollout: string | null;
+}
+
+/** release 의 이력의 한 줄. `n` 은 인스턴스마다 1 부터의 차례다. */
+export type HistoryEntry = { n: number; at: number } & (
+    | ({ kind: "promoted" } & HistoryPromotion)
+    | ({ kind: "rolled_back"; migrated: boolean } & HistoryPromotion)
+    | { kind: "restored"; release: string; to: number }
+    | { kind: "restore_undone"; release: string }
+);
+
+export interface HistoryPage
+{
+    history: HistoryEntry[];
+    /** 이 쪽의 마지막 줄의 번호(`after` 로 이어 받는다). */
+    next: number;
+    hasMore: boolean;
+}
+
+/** 운영의 로그. 서비스마다 빌드와 서버의 끝이다. 앱이 찍은 글이라 고객의 데이터가 섞일 수 있다. 에이전트에게 넘기지 않는다. */
+export interface ProductionLogs
+{
+    release: string;
+    /** 서버가 찍은 로그(`production-<서비스>`)가 실렸는가. 레이어의 운영자가 켜지 않았으면 `false` 이고 빌드의 로그만 온다. */
+    serverLogs: boolean;
+    /** `clipped` 는 한 줄의 상한(2000자)에서 자른 줄의 수다. */
+    logs: { name: string; text: string; clipped: number }[];
+}
+
+export type ServiceState = "awake" | "asleep" | "building" | "static" | "stopped";
+
+/** 운영의 서비스마다의 상태. 놓인 기계가 답한다. */
+export interface ProductionServices
+{
+    release: string;
+    services: { name: string; kind: "server" | "static"; state: ServiceState }[];
+}
+
+/** 운영의 연결된 MCP 클라이언트(살아 있는 승인 하나). 토큰과 해시는 없다. */
+export interface OauthGrant
+{
+    id: string;
+    clientId: string;
+    clientName: string;
+    clientKind: "registered" | "dynamic" | "document";
+    /** 승인한 사용자의 식별자(`users.list` 의 `id`). */
+    user: string;
+    scope: string;
+    createdAt: number;
+    /** 이 승인으로 마지막으로 토큰을 받은(코드를 바꾸거나 refresh 한) 때. */
+    lastTokenAt: number | null;
+}
+
+/** 조직 자신의 모습. */
+export interface OrganizationView
+{
+    id: string;
+    /** 관리 서버의 설정에만 있는 조직이면 `null` 이다(`recorded: false`). */
+    name: string | null;
+    kind: "live" | "test";
+    createdAt: number | null;
+    recorded: boolean;
+    instances: number;
+    /** 세울 수 있는 인스턴스의 수. 시험용 조직에만 있다. */
+    instanceLimit: number | null;
+}
+
+export interface RolloutPage
+{
+    rollouts: Rollout[];
+    next: string | null;
+    hasMore: boolean;
+}
+
 export interface Conformance
 {
     passed: boolean;
@@ -528,6 +662,16 @@ export interface Orbital
          * 되살린 뒤 승격이 있었거나 이미 물렀으면 409 와 까닭이다.
          */
         undoRestore(instance: string): Promise<RestoreUndone>;
+        /** 함대: 이 조직의 인스턴스를 만든 차례로 한 쪽(기본 100 · 상한 500). 어느 관리 서버든 기록만으로 답한다. */
+        list(input?: { after?: string; limit?: number }): Promise<FleetPage>;
+        /** 인스턴스 하나의 함대의 줄. 다른 조직의 것은 없는 것과 같다(404). */
+        get(instance: string): Promise<FleetInstance>;
+        /** release 의 이력(승격 · 되돌려진 승격 · 되살리기 · 무르기)을 차례대로 한 쪽. 인스턴스마다 최근 500 줄을 둔다. */
+        history(instance: string, input?: { after?: number; limit?: number }): Promise<HistoryPage>;
+    };
+    /** 조직 자신의 모습(이름 · 종류 · 인스턴스의 수와 상한). */
+    organization: {
+        get(): Promise<OrganizationView>;
     };
     backup: {
         /** 레이어의 복구 훈련이 통과했는지와 숫자. */
@@ -582,7 +726,8 @@ export interface Orbital
         /** 에이전트가 승격을 요청해 사람의 승인을 기다리는 release. 없으면 `null` 이다. */
         pending(instance: string): Promise<PendingPromotion | null>;
         /** 사람이 승인했을 때: 그 release 를 운영에 올린다. 승인은 이 release 하나에 묶인다. */
-        promote(input: { instance: string; release: string; change: Change; approvedBy: Approver }): Promise<Production>;
+        /** `approver` 는 승인한 사람의 이름표(80자 안)로 이력에만 남는다. 이메일 대신 팩토리 쪽의 식별자를 권한다. */
+        promote(input: { instance: string; release: string; change: Change; approvedBy: Approver; approver?: string }): Promise<Production>;
     };
     rollouts: {
         /**
@@ -591,6 +736,8 @@ export interface Orbital
          */
         create(app: string, input: { commit?: string; change: Change; waves: readonly (readonly string[])[] }): Promise<Rollout>;
         get(id: string): Promise<Rollout>;
+        /** 이 조직의 rollout 을 만든 차례로 한 쪽. 끝났거나 거둔 것도 있다. */
+        list(input?: { after?: string; limit?: number }): Promise<RolloutPage>;
         /** 포크의 머리에 업데이트를 기계적으로 합친다(`git merge`). 에이전트를 돌리지 않는다. */
         apply(id: string, instance: string): Promise<RolloutApply>;
         /** 멈춘 rollout 을 다시 연다. 실패한 인스턴스는 고친 release 로 프리뷰부터 다시 지난다. */
@@ -601,6 +748,13 @@ export interface Orbital
     production: {
         /** 운영에 올라 있는 것. 아직 오른 것이 없으면 `null` 이다. */
         get(instance: string): Promise<Production | null>;
+        /**
+         * 운영의 로그(서비스마다 끝의 `lines` 줄, 기본 200 · 상한 1000). 레이어의 경로는 가려져 있지만 앱이 찍은 글은 그대로라
+         * 고객의 데이터가 섞일 수 있다. service key 로만 열리고 에이전트의 토큰에는 길이 없다. 놓인 기계가 답한다.
+         */
+        logs(instance: string, input?: { lines?: number }): Promise<ProductionLogs>;
+        /** 서비스마다 깨어 있는지 · 자는지 · 빌드 중인지. 놓인 기계가 답한다. */
+        services(instance: string): Promise<ProductionServices>;
     };
     users: {
         /**
@@ -647,6 +801,8 @@ export interface Orbital
          * 클라이언트는 받은 `clientId` 로 인가를 받는다. 비밀(client_secret)은 없다(공개 클라이언트).
          */
         register(input: { instance: string; name: string; redirectUris: readonly string[] }): Promise<{ clientId: string }>;
+        /** 운영의 연결된 클라이언트(사용자마다의 살아 있는 승인). */
+        grants(instance: string): Promise<OauthGrant[]>;
     };
 }
 
@@ -895,6 +1051,95 @@ function toWebhook(value: Record<string, unknown>): Webhook
         },
     };
 }
+
+function orText(value: unknown): string | null
+{
+    return typeof value === "string" ? value : null;
+}
+
+function query(input: { [key: string]: string | number | undefined }): string
+{
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(input))
+    {
+        if (value !== undefined)
+        {
+            params.set(key, String(value));
+        }
+    }
+    return params.size === 0 ? "" : `?${params.toString()}`;
+}
+
+function toFleetInstance(value: unknown): FleetInstance
+{
+    const record = isRecord(value) ? value : {};
+    const production = isRecord(record.production) ? record.production : null;
+    const last = isRecord(record.last_promotion) ? record.last_promotion : null;
+    return {
+        id: text(record.id),
+        app: text(record.app),
+        version: orText(record.version),
+        machine: text(record.machine),
+        createdAt: orNull(record.created_at),
+        production: production === null ? null : { release: text(production.release), promotedAt: orNull(production.promoted_at) },
+        promotionRequested: orText(record.promotion_requested),
+        preview: record.preview === true,
+        lastPromotion: last === null
+            ? null
+            : { release: text(last.release), at: number(last.at), outcome: last.outcome === "rolled_back" ? "rolled_back" : "promoted" },
+    };
+}
+
+const REHEARSED: readonly HistoryPromotion["rehearsal"][] = ["not_needed", "not_run", "passed", "failed"];
+
+function toHistoryEntry(value: unknown): HistoryEntry
+{
+    const record = isRecord(value) ? value : {};
+    const head = { n: number(record.n), at: number(record.at) };
+    if (record.kind === "restored")
+    {
+        return { ...head, kind: "restored", release: text(record.release), to: number(record.to) };
+    }
+    if (record.kind === "restore_undone")
+    {
+        return { ...head, kind: "restore_undone", release: text(record.release) };
+    }
+    const rehearsed = isRecord(record.rehearsed) ? record.rehearsed : null;
+    const promotion: HistoryPromotion = {
+        release: text(record.release),
+        commit: text(record.commit),
+        previousRelease: orText(record.previous_release),
+        change: oneOf(CHANGES, record.change, "customer_request"),
+        approvedBy: record.approved_by === "factory" ? "factory" : "customer",
+        approver: orText(record.approver),
+        requestedAt: orNull(record.requested_at),
+        requestedBy: orText(record.requested_by),
+        accessFindings: number(record.access_findings),
+        rehearsal: oneOf(REHEARSED, record.rehearsal, "not_run"),
+        rehearsed: rehearsed === null
+            ? null
+            : {
+                millis: number(rehearsed.millis),
+                failedAt: orText(rehearsed.failed_at),
+                sqlstate: orText(rehearsed.sqlstate),
+                tables: (Array.isArray(rehearsed.tables) ? rehearsed.tables.filter(isRecord) : []).map((table) => ({
+                    table: text(table.table),
+                    before: orNull(table.before),
+                    after: orNull(table.after),
+                })),
+            },
+        conformance: oneOf(CONFORMED, record.conformance, "not_run"),
+        migrations: number(record.migrations),
+        changes: texts(record.changes),
+        rollout: orText(record.rollout),
+    };
+    return record.kind === "rolled_back"
+        ? { ...head, kind: "rolled_back", migrated: record.migrated === true, ...promotion }
+        : { ...head, kind: "promoted", ...promotion };
+}
+
+const SERVICE_STATES: readonly ServiceState[] = ["awake", "asleep", "building", "static", "stopped"];
+const CLIENT_KINDS: readonly OauthGrant["clientKind"][] = ["registered", "dynamic", "document"];
 
 /** 웹훅의 본문을 받지 않은 까닭. `malformed` 머리말이나 본문의 모양이 틀림, `stale` 서명의 때가 허용 시간차 밖, `mismatch` 서명이 맞지 않음. */
 export class OrbitalWebhookError extends Error
@@ -1203,6 +1448,46 @@ export function createOrbital(options: OrbitalOptions): Orbital
                 const record = isRecord(reply) ? reply : {};
                 return { instance: text(record.instance), millis: number(record.millis), tables: number(record.tables) };
             },
+            async list(input = {})
+            {
+                const reply = await call("GET", `instances${query({ after: input.after, limit: input.limit })}`);
+                const record = isRecord(reply) ? reply : {};
+                return {
+                    instances: (Array.isArray(record.instances) ? record.instances : []).map(toFleetInstance),
+                    next: orText(record.next),
+                    hasMore: record.has_more === true,
+                };
+            },
+            async get(instance)
+            {
+                return toFleetInstance(await call("GET", at(instance, "")));
+            },
+            async history(instance, input = {})
+            {
+                const reply = await call("GET", at(instance, `/history${query({ after: input.after, limit: input.limit })}`));
+                const record = isRecord(reply) ? reply : {};
+                return {
+                    history: (Array.isArray(record.history) ? record.history : []).map(toHistoryEntry),
+                    next: number(record.next),
+                    hasMore: record.has_more === true,
+                };
+            },
+        },
+        organization: {
+            async get()
+            {
+                const reply = await call("GET", "organization");
+                const record = isRecord(reply) ? reply : {};
+                return {
+                    id: text(record.id),
+                    name: orText(record.name),
+                    kind: record.kind === "test" ? "test" : "live",
+                    createdAt: orNull(record.created_at),
+                    recorded: record.recorded === true,
+                    instances: number(record.instances),
+                    instanceLimit: orNull(record.instance_limit),
+                };
+            },
         },
         backup: {
             async get()
@@ -1311,14 +1596,14 @@ export function createOrbital(options: OrbitalOptions): Orbital
                     rollout: typeof reply.rollout === "string" ? reply.rollout : null,
                 };
             },
-            async promote({ instance, release, change, approvedBy })
+            async promote({ instance, release, change, approvedBy, approver })
             {
-                const reply = await call("POST", at(instance, "/promotions"), {
-                    release,
-                    change,
-                    approved_by: approvedBy,
-                });
-                return toProduction(reply);
+                const body: { [key: string]: Json } = { release, change, approved_by: approvedBy };
+                if (approver !== undefined)
+                {
+                    body.approver = approver;
+                }
+                return toProduction(await call("POST", at(instance, "/promotions"), body));
             },
         },
         rollouts: {
@@ -1334,6 +1619,16 @@ export function createOrbital(options: OrbitalOptions): Orbital
             async get(id)
             {
                 return toRollout(await call("GET", `rollouts/${encodeURIComponent(id)}`));
+            },
+            async list(input = {})
+            {
+                const reply = await call("GET", `rollouts${query({ after: input.after, limit: input.limit })}`);
+                const record = isRecord(reply) ? reply : {};
+                return {
+                    rollouts: (Array.isArray(record.rollouts) ? record.rollouts : []).map(toRollout),
+                    next: orText(record.next),
+                    hasMore: record.has_more === true,
+                };
             },
             async apply(id, instance)
             {
@@ -1359,6 +1654,33 @@ export function createOrbital(options: OrbitalOptions): Orbital
             {
                 const reply = await call("GET", at(instance, "/production"));
                 return isRecord(reply) ? toProduction(reply) : null;
+            },
+            async logs(instance, input = {})
+            {
+                const reply = await call("GET", at(instance, `/production/logs${query({ lines: input.lines })}`));
+                const record = isRecord(reply) ? reply : {};
+                return {
+                    release: text(record.release),
+                    serverLogs: record.server_logs === true,
+                    logs: (Array.isArray(record.logs) ? record.logs.filter(isRecord) : []).map((log) => ({
+                        name: text(log.name),
+                        text: text(log.text),
+                        clipped: number(log.clipped),
+                    })),
+                };
+            },
+            async services(instance)
+            {
+                const reply = await call("GET", at(instance, "/production/services"));
+                const record = isRecord(reply) ? reply : {};
+                return {
+                    release: text(record.release),
+                    services: (Array.isArray(record.services) ? record.services.filter(isRecord) : []).map((service) => ({
+                        name: text(service.name),
+                        kind: service.kind === "static" ? "static" : "server",
+                        state: oneOf(SERVICE_STATES, service.state, "stopped"),
+                    })),
+                };
             },
         },
         users: {
@@ -1435,6 +1757,21 @@ export function createOrbital(options: OrbitalOptions): Orbital
             {
                 const reply = await call("POST", at(instance, "/oauth-clients"), { name, redirect_uris: [...redirectUris] });
                 return { clientId: text(isRecord(reply) ? reply.client_id : undefined) };
+            },
+            async grants(instance)
+            {
+                const reply = await call("GET", at(instance, "/oauth-grants"));
+                const grants = isRecord(reply) && Array.isArray(reply.grants) ? reply.grants.filter(isRecord) : [];
+                return grants.map((grant) => ({
+                    id: text(grant.id),
+                    clientId: text(grant.client_id),
+                    clientName: text(grant.client_name),
+                    clientKind: oneOf(CLIENT_KINDS, grant.client_kind, "registered"),
+                    user: text(grant.user),
+                    scope: text(grant.scope),
+                    createdAt: number(grant.created_at),
+                    lastTokenAt: orNull(grant.last_token_at),
+                }));
             },
         },
     };
