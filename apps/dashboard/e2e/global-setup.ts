@@ -25,7 +25,7 @@ export default async function globalSetup(): Promise<() => Promise<void>>
     });
     const db = new pg.Client({ connectionString: process.env.E2E_DASHBOARD_DATABASE_URL ?? "postgresql://postgres:postgres@127.0.0.1:54422/postgres" });
     await db.connect();
-    await db.query("truncate dashboard.factory, dashboard.member, dashboard.invitation cascade");
+    await db.query("truncate org.factory, org.member, org.invitation cascade");
     await db.end();
     for (let attempt = 0; ; attempt += 1)
     {
