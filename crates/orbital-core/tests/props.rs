@@ -1494,12 +1494,13 @@ mod placement {
     use proptest::prelude::*;
 
     /// 어느 기계나 하는 일. 구현의 `reach` 를 부르지 않고 따로 적는다(기록과 인스턴스의 DB 에만 닿는 일).
-    const ANYWHERE: [Errand; 5] = [
+    const ANYWHERE: [Errand; 6] = [
         Errand::Work,
         Errand::ProductionView,
         Errand::Users,
         Errand::Secrets,
         Errand::Rollout,
+        Errand::Organization,
     ];
 
     fn errand() -> impl Strategy<Value = Errand> {
@@ -1544,6 +1545,138 @@ mod placement {
                 Route::Refuse { machine: placed.to_owned(), why: Unforwarded::NoAddress }
             };
             prop_assert_eq!(route(errand, placed, here, false, known), expected);
+        }
+    }
+}
+
+// ---- 조직과 service key ----
+
+mod organization {
+    use orbital_core::organization::{
+        Caller, KeyFacts, Kind, OrganizationState, Presented, RevokeRefusal, judge_key,
+        judge_new_instance, judge_revoke,
+    };
+    use orbital_core::scope::OrganizationId;
+    use proptest::prelude::*;
+
+    /// 조직은 둘뿐이라 같은 조직과 다른 조직이 자주 나온다. `acme` 와 `acme2` 는 머리가 겹친다.
+    fn organization() -> impl Strategy<Value = OrganizationId> {
+        proptest::sample::select(vec!["acme", "acme2"])
+            .prop_map(|name| OrganizationId(name.to_owned()))
+    }
+
+    fn kind() -> impl Strategy<Value = Kind> {
+        proptest::sample::select(vec![Kind::Live, Kind::Test])
+    }
+
+    fn state() -> impl Strategy<Value = OrganizationState> {
+        (kind(), any::<bool>()).prop_map(|(kind, closed)| OrganizationState { kind, closed })
+    }
+
+    /// (실려 온 열쇠, 그 열쇠가 가리키는 조직, 거둔 것인가, 그 조직의 모습). 어디서 왔든 고르게 나온다.
+    fn presented() -> impl Strategy<Value = Presented> {
+        prop_oneof![
+            (organization(), proptest::option::of(state())).prop_map(|(organization, state)| {
+                Presented::Configured {
+                    organization,
+                    state,
+                }
+            }),
+            (
+                organization(),
+                any::<bool>(),
+                state(),
+                proptest::sample::select(vec!["key_a", "key_b"])
+            )
+                .prop_map(|(organization, revoked, state, key)| Presented::Recorded {
+                    key: key.to_owned(),
+                    organization,
+                    revoked,
+                    state,
+                }),
+            Just(Presented::Unknown),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn 거둔_열쇠는_어떤_조직의_어떤_모습에서도_받지_않는다(organization in organization(), state in state()) {
+            let presented = Presented::Recorded { key: "key_a".to_owned(), organization, revoked: true, state };
+            prop_assert!(judge_key(&presented).is_err());
+        }
+
+        #[test]
+        fn 닫힌_조직의_열쇠는_어디서_왔든_받지_않는다(presented in presented()) {
+            let closed = match &presented {
+                Presented::Configured { state, .. } => state.is_some_and(|state| state.closed),
+                Presented::Recorded { state, .. } => state.closed,
+                Presented::Unknown => false,
+            };
+            if closed {
+                prop_assert!(judge_key(&presented).is_err());
+            }
+        }
+
+        #[test]
+        fn 받아들인_열쇠의_주인은_언제나_그_열쇠가_가리키는_조직이다(presented in presented()) {
+            // 기대값은 생성한 입력에서 바로 읽는다
+            let expected = match &presented {
+                Presented::Configured { organization, state: Some(state) } if !state.closed => {
+                    Some(Caller { organization: organization.clone(), kind: state.kind, key: None })
+                }
+                Presented::Configured { organization, state: None } => {
+                    Some(Caller { organization: organization.clone(), kind: Kind::Live, key: None })
+                }
+                Presented::Recorded { key, organization, revoked: false, state } if !state.closed => {
+                    Some(Caller { organization: organization.clone(), kind: state.kind, key: Some(key.clone()) })
+                }
+                _ => None,
+            };
+            prop_assert_eq!(judge_key(&presented).ok(), expected);
+        }
+
+        #[test]
+        fn 어떤_조직의_열쇠도_다른_조직의_열쇠를_거두지_못하고_없는_것과_같다(
+            caller in organization(), owner in organization(), revoked in any::<bool>(), alive in 0u32..4
+        ) {
+            let target = KeyFacts { organization: owner.clone(), revoked };
+            let judged = judge_revoke(&caller, Some(&target), alive);
+            if caller != owner {
+                prop_assert_eq!(judged, Err(RevokeRefusal::NotFound));
+            }
+        }
+
+        #[test]
+        fn 살아_있는_열쇠가_하나뿐인_조직은_그_열쇠를_거두지_못한다(organization in organization(), alive in 0u32..2) {
+            let target = KeyFacts { organization: organization.clone(), revoked: false };
+            prop_assert_eq!(judge_revoke(&organization, Some(&target), alive), Err(RevokeRefusal::LastKey));
+        }
+
+        #[test]
+        fn 시험용_조직은_어떤_상한에서도_상한보다_많이_세우지_못하고_운영의_조직은_상한을_받지_않는다(
+            state in proptest::option::of(state()), existing in 0u32..14, limit in 0u32..12
+        ) {
+            let open = state.is_none_or(|state| !state.closed);
+            let capped = state.is_some_and(|state| state.kind == Kind::Test);
+            let expected = open && (!capped || existing < limit);
+            prop_assert_eq!(judge_new_instance(state.as_ref(), existing, limit).is_ok(), expected);
+        }
+
+        #[test]
+        fn 상한_밖의_판정은_조직의_종류에_따라_달라지지_않는다(
+            closed in any::<bool>(), existing in 0u32..5, organization in organization(), revoked in any::<bool>()
+        ) {
+            // 상한(10) 아래에서 인스턴스를 세우는 판정과, 열쇠를 받는 판정은 시험용이든 운영이든 같다
+            let of = |kind| OrganizationState { kind, closed };
+            prop_assert_eq!(
+                judge_new_instance(Some(&of(Kind::Test)), existing, 10),
+                judge_new_instance(Some(&of(Kind::Live)), existing, 10)
+            );
+            let key = |kind| Presented::Recorded { key: "key_a".to_owned(), organization: organization.clone(), revoked, state: of(kind) };
+            prop_assert_eq!(
+                judge_key(&key(Kind::Test)).map(|caller| caller.organization),
+                judge_key(&key(Kind::Live)).map(|caller| caller.organization)
+            );
         }
     }
 }

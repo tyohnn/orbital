@@ -46,10 +46,12 @@ pub enum Errand {
     App,
     /// 고객의 요청(인스턴스의 하위 도메인으로 앱에 가는 것). 그 인스턴스의 router 와 앱의 프로세스는 놓인 기계에만 떠 있다.
     Traffic,
+    /// 조직과 그 service key 를 보기 · 내기 · 거두기와, 운영자가 조직을 만들고 닫기. 기록에만 닿는다.
+    Organization,
 }
 
 impl Errand {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::SourceBundle,
         Self::Push,
         Self::Git,
@@ -68,6 +70,7 @@ impl Errand {
         Self::Rollout,
         Self::App,
         Self::Traffic,
+        Self::Organization,
     ];
 }
 
@@ -101,7 +104,8 @@ pub fn reach(errand: Errand) -> Reach {
         | Errand::ProductionView
         | Errand::Users
         | Errand::Secrets
-        | Errand::Rollout => Reach::Anywhere,
+        | Errand::Rollout
+        | Errand::Organization => Reach::Anywhere,
     }
 }
 
@@ -196,6 +200,7 @@ mod tests {
             Errand::Users,
             Errand::Secrets,
             Errand::Rollout,
+            Errand::Organization,
         ];
         // 모든 일이 두 갈래 가운데 하나에 든다
         assert_eq!(placed.len() + anywhere.len(), Errand::ALL.len());

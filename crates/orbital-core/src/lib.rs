@@ -16,6 +16,7 @@ pub mod host;
 pub mod manifest;
 pub mod name;
 pub mod oauth;
+pub mod organization;
 pub mod placement;
 pub mod plan;
 pub mod release;
