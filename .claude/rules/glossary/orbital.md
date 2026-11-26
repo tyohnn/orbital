@@ -22,7 +22,7 @@ paths:
 | 계획 | DB 에 세울 것을 적은 단계의 목록 | `Step`, `provision`, `grants` |
 | 권한 검사 | 실제 DB 가 선언과 권한 표에 정확히 맞는지 보는 일. 승격의 관문 | `Snapshot`, `Finding`, `check::judge` |
 | 토큰 | 작업 한 번 동안의 권한. 인스턴스 하나, 프리뷰까지. 팩토리의 서버 안에만 있고 에이전트에게 가지 않는다. `source_read` 는 받기만 한다 | `Token`, `Capability`, `scope::judge` |
-| 작업(work) | 팩토리의 서버가 service key 로 열어 토큰을 감싼 것. 그 함수(프리뷰 · 로그 · 리허설 · 승격 요청)와 git 이어 주기(받은 git 요청을 작업의 토큰으로 넘기고 밖에서 온 `Authorization` 은 버린다)는 토큰으로만 부른다 | SDK `works.open`, `Work`, `Work.git.relay` |
+| 작업(work) | 팩토리의 서버가 service key 로 열어 토큰을 감싼 것. 그 함수(프리뷰 · 로그 · 리허설 · 승격 요청)와 git 이어 주기(받은 git 요청을 작업의 토큰으로 넘기고 밖에서 온 `Authorization` 은 버린다)는 토큰으로만 부른다. 닫기(`close`)는 service key 로 하고, 닫은 작업의 토큰은 다음 요청부터(관리 서버가 다시 떠도) 거절된다 | SDK `works.open`, `Work`, `Work.git.relay` · `close`, `Revoked`, `session_of` |
 | git 의 길 | 인스턴스마다 레이어가 받는 git 의 smart HTTP 셋(`info/refs` · `git-upload-pack` · `git-receive-pack`). 토큰으로만 열린다. 받는 ref 는 `main` 하나이고 앞으로만 가며, 묶음과 같은 판정과 같은 받는 자리(격리한 폴더에 받아 검사한 뒤 옮긴다)를 지난다 | `git::route`, `git::judge_push`, `SourceStore::ingest` |
 | git 의 자격 | 팩토리가 에이전트에게 내는, 팩토리의 git 원격(`<팩토리>/git/<작업>`)에만 쓰는 자격. 그 작업 하나에서 두 시간 동안 통한다. 레이어는 모른다. 통하지 않으면 403 과 「`workspace_open` 을 다시」의 글 | 본보기의 `Works.forGit` |
 | 리허설 | 운영 DB 의 사본에 마이그레이션을 미리 돌리는 일. 숫자만 돌아온다 | `orbital-pg` |
@@ -30,7 +30,7 @@ paths:
 | 역할 제한 정책 | `[auth]` 를 선언한 인스턴스의 표마다 레이어가 두는 제한하는 정책. 연결의 업무 역할이 신원에 없으면 어떤 행도 내주지 않는다 | `Step::SetRolePolicy`, `orbital.granted()`, `ROLE_POLICY` |
 | router | 프리뷰 · 운영마다 하나가 서서(포트 하나, 또는 레이어의 주소 하나를 하위 도메인으로 나눠) 요청을 서비스로 가르고, 세션을 확인해 신원을 싣는 것. `/_orbital/` 은 직접 답한다. 운영의 포트는 기록해 다시 잡는다 | `orbital-router`, `Router`, `auth::route`, `serve_slot` |
 | 공개 경로 · 되돌림 | 서비스의 `public` 에 적은 경로의 머리. 로그인 없이 들이고 신원을 싣지 않는다. 되돌림은 정적 서비스의 `fallback`: 화면을 원하는 요청의 없는 파일에 그 파일을 내준다 | `Service::public` · `fallback`, `auth::is_public` · `fallback_file` |
-| 일정 | 선언의 `[[schedule]]`. 운영에서 그 시각(UTC cron)에 레이어가 router 를 거쳐 `POST` 로 부르고 `x-orbital-schedule` 을 싣는다. 그 경로는 밖에서 닿지 못한다. 놓친 때는 한 번, 실패는 다시 부르지 않는다 | `Cron`, `Schedule::key`, `auth::schedule_path`, `Layer::call_schedules`, `ScheduleRecord` |
+| 일정 | 선언의 `[[schedule]]`. 운영에서 그 시각(UTC cron)에 레이어가 router 를 거쳐 `POST` 로 부르고 `x-orbital-schedule` 을 싣는다. `role` 을 적으면 사람 없이 그 역할만 실린 신원을 함께 싣는다. 그 경로는 밖에서 닿지 못한다. 놓친 때는 한 번, 실패는 다시 부르지 않는다 | `Cron`, `Schedule::key` · `role`, `auth::schedule_path`, `Layer::call_schedules`, `schedule_changes` |
 | 기준 도메인 · 하위 도메인 | 레이어가 받는 도메인(`ORBITAL_BASE_DOMAIN`)과, 그 바로 아래 인스턴스마다의 한 조각(`<인스턴스>` 는 운영, `<인스턴스>-preview` 는 프리뷰). 그 주소가 인스턴스의 origin 이다 | `BaseDomain`, `HostTarget`, `judge_host`, `Hosts` |
 | 재우기 · 깨우기 | 요청이 없는 서버 서비스의 프로세스를 내리는 일(`ORBITAL_SLEEP_AFTER`, 기본 5분)과, 첫 요청에 다시 띄우는 일. 깨우지 못하면 503 | `AppServer`, `Starter`, `WakeFailure` |
 | 쓰고 남은 줄 | 만료됐거나 거둔 로그인 링크 · Google 의 표 · 인가 요청 · 코드 · 세션 · 토큰. 하루 뒤 새 줄을 적을 때 지운다 | `sweep`, `Leftover` |
@@ -39,11 +39,11 @@ paths:
 | 로그인 링크 | 메일로 가는 한 번 쓰는 주소. 운영에서만 팩토리의 키로 나가고 프리뷰에서는 나가지 않는다. 15분, 요청한 브라우저에서만 열린다. 같은 이메일로는 1분에 하나 | `AuthStore::request_link` · `enter`, `judge_link` |
 | 세션 | 로그인한 브라우저의 쿠키(`__Host-orbital-session`)가 가리키는 것. 거두거나 사용자를 빼면 다음 요청부터 없는 것이다 | `AuthStore::session`, `judge_session` |
 | 팩토리의 설정 | 팩토리마다 한 벌인 로그인의 키(Resend 의 키 · 보내는 주소, Google 클라이언트). 비밀은 어떤 답에도 돌아오지 않는다. 없으면 그 로그인 방법은 운영에 오르지 못한다 | `Settings`, `PUT /v1/settings/auth`, `FactoryKey`, `missing_keys` |
-| 봉인 | 팩토리의 비밀을 기록에 두는 모양. 조직과 칸을 함께 묶어 다른 줄에 옮기면 풀리지 않는다. 열쇠는 기록 밖(`ORBITAL_SEAL_KEY`)에 있다 | `seal`, `SealKey` |
+| 봉인 | 팩토리의 비밀을 기록에 두는 모양. 조직과 칸을 함께 묶어 다른 줄에 옮기면 풀리지 않는다. 열쇠는 기록 밖(`ORBITAL_SEAL_KEY`)에 있고, 옛 열쇠(`ORBITAL_SEAL_KEY_PREVIOUS`)를 함께 주면 뜰 때 새 열쇠로 다시 봉인한다 | `seal`, `SealKey`, `reseal`, `Resealed` |
 | 밖에서 넣는 비밀 | 선언의 `[secrets] external` 에 이름만 적은 바깥 서비스의 키. 사람이 넣고, 앱은 같은 이름의 환경 변수로 받는다. 빌드와 마이그레이션에는 가지 않는다 | `Secrets::external`, `missing_secrets`, `Blocker::SecretMissing` |
 | 단계(stage) | 값이 들어가는 칸. 프리뷰(`preview`)와 운영(`production`) 둘이고 서로 넘어가지 않는다. 프리뷰의 값은 에이전트가 볼 수 있다고 본다 | `secrets::Stage` |
 | 금고(vault) | 밖에서 넣는 비밀을 인스턴스와 단계마다 봉인해 둔 것(`vault.json`, 0600). 조직 · 인스턴스 · 단계 · 이름을 함께 묶는다. 값을 읽는 API 는 없다 | `Vault`, `SecretValue`, `secret_binding` |
-| 입력 표(entry) | 사람의 브라우저가 값을 레이어에 바로 보내는 한 번 쓰는 주소. 인스턴스 · 이름 · 단계 하나에 묶이고 10분. sha256 으로만 둔다 | `Entry`, `judge_entry`, `/v1/secret-entries/{표}` |
+| 입력 표(entry) | 사람의 브라우저가 값을 레이어에 바로 보내는 한 번 쓰는 표. 주소(`POST /v1/secret-entries`)는 고정이고 표는 `Authorization: Bearer` 로만 간다. 인스턴스 · 이름 · 단계 하나에 묶이고 10분. sha256 으로만 둔다 | `Entry`, `judge_entry`, `EntryTicket` |
 | 비밀의 요청 | 에이전트가 이름과 까닭만 적어 사람에게 입력을 부탁하는 것. 선언한 이름만 받는다 | `judge_request`, `Capability::SecretsRequest` |
 | 개발용 메일함 | 메일을 보내지 않고 `outbox.jsonl` 에 쌓는 것. 명시해 켠 레이어(`ORBITAL_DEV_MAIL=outbox`)에서만 메일 키를 대신한다 | `Outbox`, `Options::dev_mailbox` |
 | Google 로그인의 state · 표 | 레이어가 서명해 Google 에 넘기는 것(인스턴스 · `next` · 브라우저 표식과 `nonce` 의 해시, 10분)과, 콜백이 Google 계정을 확인한 뒤 인스턴스에 적는 한 번 쓰는 표(60초, 요청한 브라우저에서만) | `StateClaims`, `judge_state`, `judge_id_token`, `google_ticket`, `AuthStore::enter_google` |
@@ -57,7 +57,7 @@ paths:
 | release | commit 하나와 거기서 읽은 선언 · 권한 표 · 마이그레이션. 식별자가 commit 에 묶인다 | `ReleaseId`, `Assembled`, `release_id` |
 | 프리뷰 | release 를 씨앗 데이터의 DB 와 함께 임시로 세운 것. 인스턴스마다 하나 | `Layer::preview` |
 | 승격 | 사람이 승인한 release 를 운영에 올리는 일. 팩토리의 서버만 부른다 | `release::promote`, `Layer::promote` |
-| 되돌릴 지점 | 승격 직전의 운영 DB 를 떠 둔 것 | `RestorePoint`, `Admin::mark` · `restore` |
+| 되돌릴 지점 | 승격 직전(또는 되살리기 직전)의 운영 DB 를 떠 둔 것. 하나만 둔다. 되살리기가 남긴 것이면 한 번 무를 수 있다 | `RestorePoint`, `Admin::mark` · `restore`, `Layer::undo_restore` |
 | service key | 팩토리의 서버가 쓰는 열쇠. 운영을 바꾸는 길은 이 열쇠에만 있다 | `Layer::organization` |
 | 실행기 | 빌드 명령(저장소에서 한 번 도는 `[build]` 뒤에 서비스마다)을 돌리고 서버를 띄우는 자리. 갈아 끼운다. 빌드에만 운영자가 정한 환경과 인스턴스마다의 홈(캐시의 자리)을 건넨다 | `Runner`, `LocalRunner`, `build_env`(`ORBITAL_BUILD_ENV`), `Job::home` |
 | 업데이트 | 팩토리가 스캐폴드(위쪽)에 올린 commit 하나. 인스턴스의 release 가 이 commit 을 조상으로 담으면 「적용됐다」고 본다 | `Rollout::update`, `SourceStore::fetch_upstream` · `descends` |
