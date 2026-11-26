@@ -192,6 +192,32 @@ export interface SecretEntry
     expiresAt: number;
 }
 
+/**
+ * 조직의 service key 하나. 값은 없다. 값은 낼 때(`keys.create`)의 답 한 번에만 오고, 레이어는 sha256 만 갖는다.
+ * `prefix` 는 조직의 종류(`sk_live_` 운영 · `sk_test_` 시험용)다.
+ */
+export interface ServiceKey
+{
+    id: string;
+    label: string;
+    prefix: "sk_live_" | "sk_test_";
+    /** 만든 때(Unix 초). */
+    createdAt: number;
+    /** 거둔 때(Unix 초). 살아 있으면 `null` 이다. */
+    revokedAt: number | null;
+    /** 마지막으로 쓴 때(Unix 초, 분 단위로 뭉친 것). 쓴 적이 없으면 `null` 이다. */
+    usedAt: number | null;
+}
+
+/** 새로 낸 열쇠. `key`(값)는 이 답에만 있다. 팩토리의 서버의 비밀 저장소에 옮겨 두고, 다시 받을 길은 없다. */
+export interface IssuedServiceKey
+{
+    id: string;
+    label: string;
+    key: string;
+    createdAt: number;
+}
+
 /** 레이어의 마지막 복구 훈련. 숫자와 참 · 거짓만 있다. */
 export interface DrillSummary
 {
@@ -435,6 +461,21 @@ export interface Orbital
         /** 레이어의 복구 훈련이 통과했는지와 숫자. */
         get(): Promise<Backup>;
     };
+    /**
+     * 이 조직의 service key. 바꿀 때는 새 열쇠를 내고(`create`), 팩토리의 서버를 그 열쇠로 옮긴 뒤 옛 열쇠를 거둔다(`revoke`).
+     * 둘은 거두기 전까지 함께 산다. 조직(과 첫 열쇠)은 레이어의 운영자가 만든다. 관리 서버의 설정에만 있는 조직은 열쇠를 내지 못한다(409).
+     */
+    keys: {
+        /** 열쇠를 하나 더 낸다. 값은 이 답에만 있다. */
+        create(input: { label: string }): Promise<IssuedServiceKey>;
+        /** 이 조직의 열쇠 모두(거둔 것도). 값은 없다. */
+        list(): Promise<ServiceKey[]>;
+        /**
+         * 열쇠를 거둔다. 어느 관리 서버에서든 다음 요청부터 받지 않는다. 다른 조직의 열쇠는 없는 것과 같고(404),
+         * 살아 있는 마지막 열쇠는 거두지 않는다(409. 새 열쇠를 먼저 낸다). 이미 거둔 것이면 그대로 돌려준다.
+         */
+        revoke(id: string): Promise<ServiceKey>;
+    };
     sessions: {
         /** 작업의 토큰을 받는다. 보통은 이것을 감싼 `works.open` 을 쓴다. 토큰은 에이전트에게 건네지 않는다. */
         open(input: { instance: string; can: readonly Capability[]; ttlSeconds?: number }): Promise<Session>;
@@ -653,6 +694,19 @@ function toAuthSettings(value: unknown): AuthSettings
             clientId: typeof google.client_id === "string" ? google.client_id : null,
             redirectUri: text(google.redirect_uri),
         },
+    };
+}
+
+function toServiceKey(value: unknown): ServiceKey
+{
+    const record = isRecord(value) ? value : {};
+    return {
+        id: text(record.id),
+        label: text(record.label),
+        prefix: record.prefix === "sk_test_" ? "sk_test_" : "sk_live_",
+        createdAt: number(record.created_at),
+        revokedAt: typeof record.revoked_at === "number" ? record.revoked_at : null,
+        usedAt: typeof record.used_at === "number" ? record.used_at : null,
     };
 }
 
@@ -953,6 +1007,23 @@ export function createOrbital(options: OrbitalOptions): Orbital
                             failedChecks: number(last.failed_checks),
                         },
                 };
+            },
+        },
+        keys: {
+            async create({ label })
+            {
+                const reply = await call("POST", "keys", { label });
+                const record = isRecord(reply) ? reply : {};
+                return { id: text(record.id), label: text(record.label), key: text(record.key), createdAt: number(record.created_at) };
+            },
+            async list()
+            {
+                const reply = await call("GET", "keys");
+                return (isRecord(reply) && Array.isArray(reply.keys) ? reply.keys : []).map(toServiceKey);
+            },
+            async revoke(id)
+            {
+                return toServiceKey(await call("DELETE", `keys/${encodeURIComponent(id)}`));
             },
         },
         sessions: {
