@@ -1055,3 +1055,85 @@ fn 쓰고_남은_표와_만료된_링크는_지워진다() {
     // 살아 있는 세션은 그대로 읽힌다
     assert!(store.session(&live_session, later + 2).unwrap().is_some());
 }
+
+// ---- 연결된 클라이언트 ----
+
+#[test]
+fn 연결된_클라이언트는_살아_있는_승인마다_이름과_사용자와_마지막으로_토큰을_받은_때만_주고_거둔_승인은_빠진다()
+ {
+    use orbital_core::oauth::Accepted;
+    use orbital_pg::oauth::s256;
+
+    let bench = bench!();
+    let mut store = bench.store();
+    let (kim, _) = sign_in(&mut store, "kim@example.com", &["member"]);
+    let (lee, _) = sign_in(&mut store, "lee@example.com", &["member"]);
+    let redirect = "https://client.example/callback".to_owned();
+    let client = store
+        .register_client(
+            "registered",
+            "회계 도우미",
+            std::slice::from_ref(&redirect),
+            None,
+            NOW,
+        )
+        .unwrap();
+    assert!(store.connections().unwrap().is_empty());
+    // 사용자 둘이 같은 클라이언트에 승인하고, 김은 코드를 토큰으로 바꾼다
+    let approve = |store: &mut AuthStore, user: &str, at: u64| {
+        let verifier = format!("{user:-<43}");
+        let accepted = Accepted {
+            client_id: client.clone(),
+            redirect_uri: redirect.clone(),
+            code_challenge: s256(&verifier),
+            resource: "https://app.example/mcp".to_owned(),
+            scope: "mcp".to_owned(),
+            state: None,
+        };
+        let request = store.open_request(user, &accepted, at).unwrap();
+        let location = store
+            .decide(&request, user, true, "https://app.example", at)
+            .unwrap();
+        let code = location
+            .split(['?', '&'])
+            .find_map(|pair| pair.strip_prefix("code="))
+            .and_then(Secret::parse)
+            .unwrap();
+        (code, verifier)
+    };
+    let (code, verifier) = approve(&mut store, &kim, NOW + 10);
+    let tokens = store
+        .exchange_code(&code, &verifier, &client, &redirect, None, NOW + 20)
+        .unwrap();
+    approve(&mut store, &lee, NOW + 30);
+    let connections = store.connections().unwrap();
+    assert_eq!(connections.len(), 2);
+    assert_eq!(connections[0].user_id, kim);
+    assert_eq!(connections[0].client_id, client);
+    assert_eq!(connections[0].client_name, "회계 도우미");
+    assert_eq!(connections[0].client_kind, "registered");
+    assert_eq!(connections[0].scope, "mcp");
+    assert_eq!(connections[0].created_at, NOW + 10);
+    assert_eq!(connections[0].last_token_at, Some(NOW + 20));
+    // 토큰을 받지 않은 승인은 마지막으로 받은 때가 없다
+    assert_eq!(connections[1].user_id, lee);
+    assert_eq!(connections[1].last_token_at, None);
+    // 토큰의 글자는 어디에도 없다
+    let shown = format!("{connections:?}");
+    assert!(!shown.contains(&tokens.access.to_text()));
+    assert!(!shown.contains(&tokens.refresh.to_text()));
+    // refresh 하면 마지막으로 받은 때가 옮겨 간다
+    store
+        .refresh_tokens(&tokens.refresh, &client, None, NOW + 40)
+        .unwrap();
+    assert_eq!(
+        store.connections().unwrap()[0].last_token_at,
+        Some(NOW + 40)
+    );
+    // 김이 승인을 거두면 빠진다
+    let grant = connections[0].id.clone();
+    assert!(store.revoke_grant(&kim, &grant, NOW + 50).unwrap());
+    let left = store.connections().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].user_id, lee);
+}

@@ -65,6 +65,22 @@ pub struct GrantView {
     pub created_at: u64,
 }
 
+/// 운영의 살아 있는 승인 하나. 팩토리가 「연결된 MCP 클라이언트」로 본다. 토큰 · 코드의 값과 해시는 없다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionView {
+    pub id: String,
+    pub client_id: String,
+    pub client_name: String,
+    /// `registered` · `dynamic` · `document`.
+    pub client_kind: String,
+    pub user_id: String,
+    pub scope: String,
+    pub created_at: u64,
+    /// 이 승인으로 마지막으로 토큰을 받은(코드를 바꾸거나 refresh 한) 때. access 토큰을 쓸 때마다 적지는 않는다(요청마다 쓰기가 된다).
+    /// access 토큰이 한 시간이라 쓰는 클라이언트는 한 시간 안에 한 번은 새로 받는다.
+    pub last_token_at: Option<u64>,
+}
+
 /// PKCE 의 S256: `BASE64URL(SHA256(verifier))`(덧붙임 없음). 해시는 검증된 구현(`sha2`)으로 계산한다.
 pub fn s256(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
@@ -579,6 +595,33 @@ impl AuthStore {
                 roles: row.get(9),
             },
         }))
+    }
+
+    /// 모든 사용자의 살아 있는 승인. 만든 차례다. 팩토리가 service key 로 본다.
+    pub fn connections(&mut self) -> Result<Vec<ConnectionView>, AuthError> {
+        let rows = self
+            .client
+            .query(
+                "SELECT g.id, g.client_id, c.name, c.kind, g.user_id, g.scope, extract(epoch FROM g.created_at)::bigint, \
+                 (SELECT extract(epoch FROM max(t.created_at))::bigint FROM orbital_auth.oauth_token t WHERE t.grant_id = g.id) \
+                 FROM orbital_auth.oauth_grant g JOIN orbital_auth.oauth_client c ON c.id = g.client_id \
+                 WHERE g.revoked_at IS NULL ORDER BY g.created_at, g.id",
+                &[],
+            )
+            .map_err(db("연결된 클라이언트를 읽"))?;
+        Ok(rows
+            .iter()
+            .map(|row| ConnectionView {
+                id: row.get(0),
+                client_id: row.get(1),
+                client_name: row.get(2),
+                client_kind: row.get(3),
+                user_id: row.get(4),
+                scope: row.get(5),
+                created_at: unix(Some(row.get(6))).unwrap_or(0),
+                last_token_at: unix(row.get(7)),
+            })
+            .collect())
     }
 
     /// 사용자가 준 승인 가운데 살아 있는 것.
