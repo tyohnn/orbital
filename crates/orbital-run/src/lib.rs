@@ -188,16 +188,27 @@ fn signal(child: &Child, name: &str) {
 /// 묶음에 아직 도는 프로세스가 있는가. 죽었지만 거두어지지 않은 것(좀비)은 세지 않는다.
 /// 좀비는 포트도 파일도 쥐고 있지 않고, 거두는 것은 이 프로세스가 아니라 기다려도 소용이 없다.
 fn group_running(child: &Child) -> bool {
-    let group = child.id().to_string();
-    let Ok(output) = Command::new("ps")
+    let listed = Command::new("ps")
         .args(["-A", "-o", "pgid=,stat="])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-    else {
-        return false;
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    running_in(listed.as_deref(), child.id())
+}
+
+/// `ps` 가 찍은 목록(`pgid stat`)에 그 묶음의 도는 프로세스가 있는가.
+///
+/// 목록을 얻지 못했으면(`ps` 를 띄우지 못했거나 실패했다) 아직 돈다고 본다. 사라졌다고 답하면 포트를 쥔 프로세스를 두고 멈췄다고 하게 된다.
+/// 기다림에는 상한이 있어([`wait_for_group`]) 끝내 알 수 없어도 멈추지 않는다.
+fn running_in(listed: Option<&str>, group: u32) -> bool {
+    let Some(listed) = listed else {
+        return true;
     };
-    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+    let group = group.to_string();
+    listed.lines().any(|line| {
         let mut fields = line.split_whitespace();
         fields.next() == Some(group.as_str())
             && fields.next().is_some_and(|state| !state.starts_with('Z'))
@@ -591,6 +602,18 @@ mod tests {
                 .trim(),
             scratch.0.join(".orbital-home").display().to_string()
         );
+    }
+
+    #[test]
+    fn 묶음의_목록을_얻지_못하면_사라졌다고_답하지_않는다() {
+        // 목록에 그 묶음의 도는 프로세스가 있으면 돈다. 좀비뿐이거나 없으면 사라진 것이다
+        assert!(running_in(Some("  41 S\n  77 R\n"), 77));
+        assert!(!running_in(Some("  41 S\n  77 Z\n"), 77));
+        assert!(!running_in(Some("  41 S\n"), 77));
+        // 묶음의 번호가 다른 번호의 머리말이어도 섞지 않는다
+        assert!(!running_in(Some("  777 S\n"), 77));
+        // 목록을 얻지 못했으면 아직 돈다고 본다
+        assert!(running_in(None, 77));
     }
 
     #[test]
