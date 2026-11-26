@@ -1,0 +1,36 @@
+{
+    "name": "@harmony/orbital-dashboard",
+    "version": "0.0.0",
+    "private": true,
+    "description": "팩토리 제작자의 대시보드. 가입 · 로그인(운영은 Google, 로컬은 이메일과 비밀번호) · 팀원 · API 키. Vercel 에 선다",
+    "type": "module",
+    "scripts": {
+        "dev": "next dev -p 7600",
+        "build": "next build",
+        "start": "next start -p 7600",
+        "typecheck": "tsc --noEmit",
+        "test": "vitest run",
+        "e2e": "playwright test"
+    },
+    "dependencies": {
+        "@harmony/orbital": "*",
+        "@supabase/ssr": "0.12.7",
+        "@supabase/supabase-js": "2.116.0",
+        "next": "16.3.4",
+        "pg": "8.23.0",
+        "react": "19.3.0",
+        "react-dom": "19.3.0",
+        "server-only": "0.0.1"
+    },
+    "devDependencies": {
+        "@playwright/test": "^1.63.0",
+        "@tailwindcss/postcss": "4.3.3",
+        "@types/node": "26.6.9",
+        "@types/pg": "8.23.1",
+        "@types/react": "19.3.0",
+        "@types/react-dom": "19.3.0",
+        "tailwindcss": "4.3.3",
+        "typescript": "5.9.3",
+        "vitest": "4.1.11"
+    }
+}

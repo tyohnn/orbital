@@ -10,6 +10,7 @@ pub mod check;
 pub mod describe;
 pub mod google;
 pub mod host;
+pub mod keys;
 pub mod manifest;
 pub mod name;
 pub mod oauth;

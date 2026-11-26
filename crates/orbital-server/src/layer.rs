@@ -60,7 +60,9 @@ use crate::settings::{Settings, SettingsError};
 use crate::token;
 use crate::vault::{RedeemError, SecretValue, Vault, VaultError};
 
+mod keys;
 mod rollout;
+pub use keys::{IssuedKey, KeyReport};
 use orbital_core::rollout::Event as RolloutEvent;
 use rollout::refusal_text;
 pub use rollout::{
@@ -450,8 +452,10 @@ pub struct Options {
     pub home: PathBuf,
     /// DB 의 관리 주소.
     pub pg_url: String,
-    /// (service key, 조직). 팩토리의 서버가 쓴다.
+    /// (service key, 조직). 팩토리의 서버가 쓴다. 부트스트랩이고, 조직이 API 로 만든 키는 기록에 있다.
     pub service_keys: Vec<(String, String)>,
+    /// 운영자 키(`ORBITAL_ADMIN_KEY`). 조직을 만들고 첫 키를 낸다. 없으면 그 길은 누구에게도 열리지 않는다.
+    pub admin_key: Option<String>,
     pub runner: Box<dyn Runner>,
     /// 팩토리의 키를 봉인하는 열쇠. 기록 밖에서 온다(`ORBITAL_SEAL_KEY`). 없으면 팩토리가 설정을 넣지 못한다.
     pub seal_key: Option<SealKey>,
@@ -497,6 +501,7 @@ impl Options {
             home,
             pg_url,
             service_keys,
+            admin_key: None,
             runner,
             seal_key: None,
             public_url: "http://127.0.0.1:7400".to_owned(),
@@ -538,6 +543,8 @@ pub struct Layer {
     runtime: Runtime,
     token_key: Vec<u8>,
     service_keys: Vec<([u8; 32], String)>,
+    /// 운영자 키의 sha256.
+    admin_key: Option<[u8; 32]>,
     /// 백업을 켠 레이어에만 있다.
     backup: Option<Backup>,
     inner: Mutex<Inner>,
@@ -755,6 +762,7 @@ impl Layer {
                 .iter()
                 .map(|(key, organization)| (digest(key), organization.clone()))
                 .collect(),
+            admin_key: options.admin_key.as_deref().map(digest),
             inner: Mutex::new(Inner {
                 admin,
                 registry: Registry::open(options.home.join("registry.json"))?,
@@ -887,13 +895,14 @@ impl Layer {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// service key 의 조직. 팩토리의 서버만 갖는 열쇠다.
+    /// service key 의 조직. 팩토리의 서버만 갖는 열쇠다. 환경 변수의 키를 먼저 보고, 다음에 조직이 만든 살아 있는 키를 본다.
     pub fn organization(&self, key: &str) -> Outcome<String> {
         let given = digest(key);
         self.service_keys
             .iter()
-            .find(|(known, _)| known == &given)
+            .find(|(known, _)| keys::same(known, &given))
             .map(|(_, organization)| organization.clone())
+            .or_else(|| self.stored_organization(key))
             .ok_or(Failure::Unauthorized)
     }
 

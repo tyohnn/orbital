@@ -1294,3 +1294,49 @@ mod backup {
         }
     }
 }
+
+// ---- 팩토리의 service key ----
+
+/// 키 넷과, 만들기(참) · 폐기(거짓, 몇 번째 키)의 차례.
+fn key_steps() -> impl Strategy<Value = (bool, Vec<(bool, usize)>)> {
+    (
+        any::<bool>(),
+        prop::collection::vec((any::<bool>(), 0usize..4), 0..24),
+    )
+}
+
+proptest! {
+    #[test]
+    fn 어떤_차례로_만들고_폐기하든_환경_변수의_키가_없는_조직에는_살아_있는_키가_언제나_하나는_남는다(
+        (bootstrap, steps) in key_steps()
+    ) {
+        use orbital_core::keys::{KeyState, Revoke, judge_revoke};
+        // 조직은 첫 키 하나로 시작한다
+        let mut keys = vec![KeyState { id: "k0".to_owned(), revoked: false }];
+        for (create, pick) in steps {
+            if create {
+                let id = format!("k{}", keys.len());
+                keys.push(KeyState { id, revoked: false });
+                continue;
+            }
+            let id = format!("k{pick}");
+            let live_before = keys.iter().filter(|key| !key.revoked).count();
+            let target = keys.iter().position(|key| key.id == id);
+            let verdict = judge_revoke(&keys, &id, bootstrap);
+            // 기대값은 판정을 다시 부르지 않고 센 수에서 바로 찾는다
+            let expected = match target {
+                None => Revoke::NotFound,
+                Some(index) if keys[index].revoked => Revoke::AlreadyRevoked,
+                Some(_) if live_before == 1 && !bootstrap => Revoke::LastLiveKey,
+                Some(_) => Revoke::Revoke,
+            };
+            prop_assert_eq!(verdict, expected);
+            if let (Revoke::Revoke, Some(index)) = (verdict, target) {
+                keys[index].revoked = true;
+            }
+            if !bootstrap {
+                prop_assert!(keys.iter().any(|key| !key.revoked));
+            }
+        }
+    }
+}

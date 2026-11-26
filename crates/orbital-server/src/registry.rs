@@ -62,8 +62,35 @@ pub struct RolloutRecord {
     pub rollout: Rollout,
 }
 
+/// service key 한 줄. 비밀은 두지 않고 sha256 만 둔다.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyRecord {
+    pub id: String,
+    /// 사람이 붙인 이름(「배포 서버」 같은).
+    pub label: String,
+    /// 비밀의 sha256(hex).
+    pub digest: String,
+    pub created_at: u64,
+    /// 폐기한 시각. 폐기한 키는 다음 요청부터 거절된다.
+    #[serde(default)]
+    pub revoked_at: Option<u64>,
+}
+
+/// 팩토리 하나. 운영자 키로 만들고, 그 뒤로는 제 service key 로 키를 다룬다.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OrganizationRecord {
+    pub label: String,
+    pub created_at: u64,
+    /// 만든 차례대로. 폐기한 키도 남긴다.
+    #[serde(default)]
+    pub keys: Vec<KeyRecord>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
+    /// API 로 만든 팩토리. 환경 변수(`ORBITAL_SERVICE_KEYS`)의 조직은 여기에 없다.
+    #[serde(default)]
+    pub organizations: BTreeMap<String, OrganizationRecord>,
     #[serde(default)]
     pub instances: BTreeMap<String, InstanceRecord>,
     /// rollout 의 식별자마다. 끝났거나 거둔 것도 남긴다.

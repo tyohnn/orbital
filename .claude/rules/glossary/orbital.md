@@ -55,7 +55,9 @@ paths:
 | 프리뷰 | release 를 씨앗 데이터의 DB 와 함께 임시로 세운 것. 인스턴스마다 하나 | `Layer::preview` |
 | 승격 | 사람이 승인한 release 를 운영에 올리는 일. 팩토리의 서버만 부른다 | `release::promote`, `Layer::promote` |
 | 되돌릴 지점 | 승격 직전의 운영 DB 를 떠 둔 것 | `RestorePoint`, `Admin::mark` · `restore` |
-| service key | 팩토리의 서버가 쓰는 열쇠. 운영을 바꾸는 길은 이 열쇠에만 있다 | `Layer::organization` |
+| service key | 팩토리의 서버가 쓰는 열쇠(`orb_sk_…`). 운영을 바꾸는 길은 이 열쇠에만 있다. 팩토리가 `/v1/keys` 로 만들고 폐기하며, 마지막 살아 있는 키는 폐기하지 못한다. sha256 으로만 기록에 있다. `ORBITAL_SERVICE_KEYS` 는 부트스트랩이다 | `Layer::organization`, `KeyRecord`, `judge_revoke` |
+| 운영자 키 | Orbital 의 대시보드 서버만 갖는 열쇠(`ORBITAL_ADMIN_KEY`). 조직을 만들고 첫 키를 내며, 살아 있는 키가 없는 조직만 되살린다. 살아 있는 팩토리의 인스턴스에는 닿지 못한다 | `Layer::operator`, `judge_operator_issue`, `createOrbitalAdmin` |
+| 대시보드 | 팩토리 제작자가 가입 · 로그인하고 키와 팀원을 다루는 웹 화면(`apps/dashboard`). 계정은 Orbital 의 것이다 | — |
 | 실행기 | 빌드 명령을 돌리고 서버를 띄우는 자리. 갈아 끼운다 | `Runner`, `LocalRunner` |
 | 업데이트 | 팩토리가 스캐폴드(위쪽)에 올린 commit 하나. 인스턴스의 release 가 이 commit 을 조상으로 담으면 「적용됐다」고 본다 | `Rollout::update`, `SourceStore::fetch_upstream` · `descends` |
 | 밀기 · 당기기 | 업데이트를 인스턴스에 들이는 두 길. 법 · 보안 · 핵심 패키지는 팩토리가 밀고 팩토리가 승인한다. 기능 업데이트는 고객이 당기고 고객이 승인한다. 같은 기계다 | `Change`, `Change::approver` |
