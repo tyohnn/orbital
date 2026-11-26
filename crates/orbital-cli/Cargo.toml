@@ -15,7 +15,8 @@ path = "src/main.rs"
 orbital-core = { path = "../orbital-core" }
 serde_json.workspace = true
 toml.workspace = true
-ureq.workspace = true
+# 운영의 레이어는 `https` 로 듣는다. 다른 crate 가 켜 준 feature 에 기대지 않고 여기서 켠다(혼자 빌드해도 TLS 가 든다)
+ureq = { workspace = true, features = ["tls"] }
 
 [dev-dependencies]
 orbital-run = { path = "../orbital-run" }
