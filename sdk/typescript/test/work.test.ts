@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { createOrbital } from "../src/server.ts";
+import { OrbitalError, createOrbital } from "../src/server.ts";
 import type { Work } from "../src/server.ts";
 
 const SERVICE_KEY = "sk_test_factory_w8Zr2Qp";
@@ -220,4 +220,28 @@ test("운영의 답에는 일정마다 도는 업무 역할과 다음 때와 마
         { service: "api", path: "/api/jobs/payroll", cron: "0 9 25 * *", role: "payroll_admin", nextAt: 1_798_189_200, lastRun: { dueAt: 1_795_597_200, startedAt: 1_795_597_210, outcome: "timed_out", status: null, millis: 600_000 } },
         { service: "api", path: "/api/jobs/close", cron: "0 0 1 * *", role: null, nextAt: 1_798_761_600, lastRun: null },
     ]);
+});
+
+test("다른 기계에 놓인 인스턴스라 관리 서버가 하지 않은 일은 421 과 놓인 기계의 이름으로 알린다", async () =>
+{
+    const misplaced = async (): Promise<Response> => new Response(
+        JSON.stringify({ error: "misplaced", message: "이 인스턴스는 다른 기계(`a`)에 놓여 있습니다", details: [], machine: "a" }),
+        { status: 421, headers: { "content-type": "application/json" } },
+    );
+    const orbital = createOrbital({ url: "http://layer.invalid/", serviceKey: SERVICE_KEY, fetch: misplaced as typeof fetch });
+    await assert.rejects(orbital.instances.destroy("i1234567890"), (error: unknown) =>
+    {
+        assert.ok(error instanceof OrbitalError);
+        assert.equal(error.status, 421);
+        assert.equal(error.code, "misplaced");
+        assert.equal(error.machine, "a");
+        return true;
+    });
+    // 다른 거절에는 기계가 없다
+    const missing = async (): Promise<Response> => new Response(
+        JSON.stringify({ error: "not_found", message: "없습니다", details: [] }),
+        { status: 404, headers: { "content-type": "application/json" } },
+    );
+    const other = createOrbital({ url: "http://layer.invalid/", serviceKey: SERVICE_KEY, fetch: missing as typeof fetch });
+    await assert.rejects(other.instances.destroy("i1234567890"), (error: unknown) => error instanceof OrbitalError && error.machine === null);
 });

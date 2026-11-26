@@ -348,20 +348,25 @@ export interface Work
     };
 }
 
-/** 관리 서버가 받지 않은 요청. `code` 로 갈라 다루고 `message` 와 `details` 는 사람과 에이전트에게 보여 준다. */
+/**
+ * 관리 서버가 받지 않은 요청. `code` 로 갈라 다루고 `message` 와 `details` 는 사람과 에이전트에게 보여 준다.
+ * 인스턴스(또는 앱)가 다른 기계에 놓여 있어 이 관리 서버가 하지 않았으면 `status` 421 · `code` `misplaced` 이고 `machine` 에 놓인 기계의 이름이 있다.
+ */
 export class OrbitalError extends Error
 {
     readonly status: number;
     readonly code: string;
     readonly details: readonly string[];
+    readonly machine: string | null;
 
-    constructor(status: number, code: string, message: string, details: readonly string[])
+    constructor(status: number, code: string, message: string, details: readonly string[], machine: string | null = null)
     {
         super(message);
         this.name = "OrbitalError";
         this.status = status;
         this.code = code;
         this.details = details;
+        this.machine = machine;
     }
 }
 
@@ -756,6 +761,7 @@ export function createOrbital(options: OrbitalOptions): Orbital
             text(problem.error) || "unknown",
             text(problem.message) || `관리 서버가 ${response.status} 로 답했습니다`,
             texts(problem.details),
+            text(problem.machine) || null,
         );
     }
 
