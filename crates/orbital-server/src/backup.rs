@@ -1,15 +1,16 @@
 //! 백업과 복구 훈련. 기반 백업을 뜨고 지난 것을 지우는 일, 사람 손 없이 끝까지 도는 복구 훈련 한 번, 훈련의 기록.
 //!
-//! 훈련은 관리 서버(`Layer`) 없이도 돈다(`orbitald drill`). 레이어의 기록(`registry.json`)은 읽기만 하고, 운영 클러스터에는
+//! 훈련은 관리 서버(`Layer`) 없이도 돈다(`orbitald drill`). 레이어의 기록(control database)은 읽고 훈련의 기록 한 줄만 더하며, 운영 클러스터에는
 //! 훈련 전용 database(`orbital_drill`)와 잠깐 쓰는 임시 database 만 만든다. 인스턴스의 database 와 역할은 건드리지 않는다.
 //!
+//! 기록은 운영 클러스터 안(control database)에 있으므로 기반 백업과 WAL 에 함께 든다. 그래서 되살린 시점의 DB 와 그 시점의 기록이 같은 때의 것이다.
+//! 기반 백업에 따로 묶는 것(`records.tar`)은 DB 에 없는 코드 저장소뿐이다. 열쇠(봉인 · service key · 토큰)는 어디에도 들지 않는다.
+//!
 //! 판정은 core 의 `backup` 이 한다(되살릴 수 있는 시점인지, 훈련이 통과했는지, 낡았는지, 무엇을 지울지).
-//! 훈련의 기록(`drills.jsonl`)에는 이름과 숫자만 남는다. 행의 값 · 표식의 난수 · 경로 · Postgres 가 찍은 글은 남지 않는다.
+//! 훈련의 기록(control database 의 `drill` 표)에는 이름과 숫자만 남는다. 행의 값 · 표식의 난수 · 경로 · Postgres 가 찍은 글은 남지 않는다.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -31,10 +32,7 @@ use orbital_source::assemble::assemble;
 use orbital_source::{Commit, SourceStore};
 use postgres::{Client, Config, NoTls};
 
-use crate::registry::State;
-
-/// 훈련의 기록. `ORBITAL_HOME` 아래에 한 줄에 한 번씩 쌓는다.
-pub const DRILLS: &str = "drills.jsonl";
+use crate::records::Records;
 
 /// 운영 클러스터에 두는 훈련 전용 database. 훈련의 표식만 담는다.
 pub const DRILL_DATABASE: &str = "orbital_drill";
@@ -93,42 +91,27 @@ pub fn take_base_backup(
     Ok(backup)
 }
 
-/// 훈련의 기록을 모두 읽는다. 읽지 못한 줄은 건너뛴다.
-pub fn history(home: &Path) -> Vec<DrillRecord> {
-    fs::read_to_string(home.join(DRILLS))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+/// 훈련의 기록을 모두 읽는다. 읽지 못하면 비어 있다(낡은 것으로 본다).
+pub fn history(records: &Records) -> Vec<DrillRecord> {
+    records.drills().unwrap_or_default()
 }
 
-/// 훈련 한 번의 기록을 쌓는다. 주인만 읽는 파일이다.
-pub fn append(home: &Path, record: &DrillRecord) -> Result<(), String> {
-    let failed = || "훈련의 기록을 적지 못했습니다".to_owned();
-    let mut line = serde_json::to_string(record).map_err(|_| failed())?;
-    line.push('\n');
-    fs::create_dir_all(home).map_err(|_| failed())?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(home.join(DRILLS))
-        .map_err(|_| failed())?;
-    file.write_all(line.as_bytes()).map_err(|_| failed())
+/// 훈련 한 번의 기록을 쌓는다.
+pub fn append(records: &Records, record: &DrillRecord) -> Result<(), String> {
+    records
+        .append_drill(record)
+        .map_err(|_| "훈련의 기록을 적지 못했습니다".to_owned())
 }
 
 /// 레이어의 기록에서 운영 중인 인스턴스. 훈련은 이것들의 database 를 견준다.
-fn production_instances(home: &Path) -> Vec<InstanceId> {
-    let state: State = fs::read(home.join("registry.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    state
-        .instances
+fn production_instances(records: &Records) -> Result<Vec<InstanceId>, String> {
+    Ok(records
+        .instances()
+        .map_err(|error| error.0)?
         .iter()
         .filter(|(_, record)| record.production.is_some())
         .filter_map(|(id, _)| InstanceId::parse(id).ok())
-        .collect()
+        .collect())
 }
 
 /// 난수 hex. 훈련의 표식에 쓴다. 기록에는 남지 않는다.
@@ -271,7 +254,8 @@ fn millis(started: Instant) -> u64 {
 /// ② WAL 을 넘겨 보관을 확인한다 ③ 옆에 T 로 클러스터 전체를 되살린다
 /// ④ 클러스터가 뜨는지, T 앞의 표식이 있고 뒤의 것이 없는지, 인스턴스마다 database · 지문 · 역할이 T 의 것과 같은지, 기록이 풀리는지 본다
 /// ⑤ database 하나를 운영 클러스터의 임시 database 로 옮겨 지문을 견준다(인스턴스 하나를 되살리는 절차) ⑥ 옆의 클러스터와 파일을 지운다.
-pub fn drill(store: &dyn Store, home: &Path, pg_url: &str, now: u64) -> DrillRecord {
+pub fn drill(store: &dyn Store, records: &Records, home: &Path, now: u64) -> DrillRecord {
+    let pg_url = records.pg_url();
     let mut run = Run {
         started: Instant::now(),
         record: DrillRecord {
@@ -299,7 +283,9 @@ pub fn drill(store: &dyn Store, home: &Path, pg_url: &str, now: u64) -> DrillRec
     }
 
     // ① 표식과 지문, 시점 T
-    let instances = production_instances(home);
+    let Ok(instances) = production_instances(records) else {
+        return run.fail(step(DrillStep::Mark));
+    };
     run.record.instances = instances.len();
     let Ok((before, after, at, taken)) = mark(pg_url, &instances) else {
         return run.fail(step(DrillStep::Mark));
@@ -334,7 +320,7 @@ pub fn drill(store: &dyn Store, home: &Path, pg_url: &str, now: u64) -> DrillRec
         &Scene {
             store,
             home,
-            pg_url,
+            records,
         },
         &side,
         &backup,
@@ -387,11 +373,11 @@ fn checked(check: Check, passed: bool) -> Checked {
 }
 
 /// 옆의 클러스터에서 확인하고, database 하나를 옮겨 견준다.
-/// 훈련이 도는 자리. 백업을 두는 곳, 레이어의 기록, 운영 클러스터의 관리 주소.
+/// 훈련이 도는 자리. 백업을 두는 곳, 코드 저장소가 있는 폴더, 레이어의 기록(과 운영 클러스터의 관리 주소).
 struct Scene<'a> {
     store: &'a dyn Store,
     home: &'a Path,
-    pg_url: &'a str,
+    records: &'a Records,
 }
 
 fn inspect(
@@ -405,8 +391,9 @@ fn inspect(
     let Scene {
         store,
         home,
-        pg_url,
+        records,
     } = *scene;
+    let pg_url = records.pg_url();
     let mut checks = Vec::new();
     let started = side.connect("postgres");
     checks.push(checked(Check::ClusterStarted, started.is_ok()));
@@ -463,26 +450,55 @@ fn inspect(
         ));
     }
 
-    // 기록이 풀리고 읽힌다
+    // 기록이 읽힌다. 옆의 클러스터의 control database 에서 그 시점의 운영 인스턴스가 T 의 것과 같고, 코드 저장소의 묶음이 풀린다
     let unpacked = side.root().join("records");
-    let records = store.records(backup, &unpacked).is_ok()
-        && match fs::read(unpacked.join("registry.json")) {
-            Ok(bytes) => serde_json::from_slice::<State>(&bytes).is_ok(),
-            // 인스턴스를 하나도 세우지 않은 레이어에는 레지스트리가 없다
-            Err(_) => instances.is_empty(),
-        };
-    checks.push(checked(Check::Records, records));
+    let side_instances = side
+        .connect(records.database().as_str())
+        .ok()
+        .and_then(|mut client| {
+            client
+                .query(
+                    "SELECT id FROM orbital.instance WHERE body -> 'production' IS NOT NULL AND body ->> 'production' <> 'null'",
+                    &[],
+                )
+                .ok()
+        })
+        .map(|rows| {
+            rows.iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<BTreeSet<String>>()
+        });
+    let expected: BTreeSet<String> = instances
+        .iter()
+        .map(|instance| instance.as_str().to_owned())
+        .collect();
+    // 훈련은 다른 일을 막지 않는다. 목록을 읽은 뒤 표식까지의 사이에 운영에 오른 인스턴스가 있으면 옆의 것이 더 많다. 빠진 것만 틀린 것이다
+    let readable = side_instances.is_some_and(|found| expected.is_subset(&found))
+        && store.records(backup, &unpacked).is_ok();
+    checks.push(checked(Check::Records, readable));
 
-    // ⑤ 인스턴스 하나를 되살리기와 같은 절차로 운영 클러스터의 임시 database 에 세워 견준다. 인스턴스가 없으면 훈련 전용 database 를 옮긴다
+    // ⑤ 인스턴스 하나를 되살리기와 같은 절차로 운영 클러스터의 임시 database 에 세워 견준다. 코드 저장소가 이 기계에 있는 것(이 기계에 놓인 것)만
+    // 고른다. 그런 인스턴스가 없으면 훈련 전용 database 를 옮긴다
+    let here: BTreeSet<String> = records
+        .instances()
+        .map(|all| {
+            all.into_iter()
+                .filter(|(_, record)| record.machine == records.machine())
+                .map(|(id, _)| id)
+                .collect()
+        })
+        .unwrap_or_default();
     let sample = instances.iter().find(|instance| {
-        taken
-            .prints
-            .contains_key(&Names::new((*instance).clone()).database())
+        here.contains(instance.as_str())
+            && taken
+                .prints
+                .contains_key(&Names::new((*instance).clone()).database())
     });
     match sample {
         Some(instance) => {
             let database = Names::new(instance.clone()).database();
-            let passed = rebuilt_matches(side, pg_url, home, instance, taken.prints.get(&database));
+            let passed =
+                rebuilt_matches(side, records, home, instance, taken.prints.get(&database));
             checks.push(checked(Check::Moved { database }, passed));
         }
         None => checks.push(checked(
@@ -580,13 +596,11 @@ fn build(
 
 /// 운영 중인 인스턴스의 지금 release 의 선언 · 권한 표와 서명 열쇠. 레이어의 기록과 코드 저장소에서 읽는다.
 pub fn production_plan(
+    records: &Records,
     home: &Path,
     instance: &InstanceId,
 ) -> Option<(orbital_source::assemble::Assembled, Vec<u8>)> {
-    let state: State = fs::read(home.join("registry.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
-    let record = state.instances.get(instance.as_str())?;
+    let record = records.instance(instance.as_str()).ok()??;
     let production = record.production.as_ref()?;
     let commit = Commit::parse(&record.releases.get(&production.release)?.commit)?;
     let assembled = assemble(&SourceStore::new(home.join("sources")), instance, &commit).ok()?;
@@ -597,12 +611,14 @@ pub fn production_plan(
 /// 인스턴스 하나를 되살리기와 같은 절차로 운영 클러스터의 임시 database 에 세우고, 지문을 그 시점의 것과 견준 뒤 지운다.
 fn rebuilt_matches(
     side: &Cluster,
-    pg_url: &str,
+    records: &Records,
     home: &Path,
     instance: &InstanceId,
     expected: Option<&Fingerprint>,
 ) -> bool {
-    let (Some((assembled, key)), Ok(nonce)) = (production_plan(home, instance), nonce()) else {
+    let pg_url = records.pg_url();
+    let (Some((assembled, key)), Ok(nonce)) = (production_plan(records, home, instance), nonce())
+    else {
         return false;
     };
     let names = Names::new(instance.clone());

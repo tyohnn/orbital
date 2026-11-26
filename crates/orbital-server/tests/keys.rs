@@ -19,11 +19,51 @@ use orbital_core::google::{Stage, StateClaims};
 use orbital_router::Outbox;
 use orbital_run::LocalRunner;
 use orbital_server::http::handle;
-use orbital_server::layer::{Layer, OUTBOX, Options, SETTINGS};
+use orbital_server::layer::{Layer, OUTBOX, Options};
 use orbital_server::login::Endpoints;
 use orbital_server::seal::SealKey;
 use orbital_server::token::{hex, sign_state};
 use serde_json::{Value, json};
+
+/// 레이어마다 다른 control database 의 이름. 같은 `home` 으로 다시 열면 같은 이름이라 다시 뜬 레이어가 같은 기록을 본다.
+fn control_of(home: &std::path::Path) -> orbital_core::name::Ident {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    home.hash(&mut hasher);
+    orbital_core::name::Ident::parse(&format!("ctl_{:016x}", hasher.finish())).unwrap()
+}
+
+/// 테스트의 control database 에 관리 역할로 붙는다. 기록의 줄을 들여다보고 고친다.
+fn control_client(pg_url: &str, home: &std::path::Path) -> postgres::Client {
+    let mut config: postgres::Config = pg_url.parse().unwrap();
+    config.dbname(control_of(home).as_str());
+    config.connect(postgres::NoTls).unwrap()
+}
+
+/// 팩토리의 설정의 줄(조직 → 몸).
+fn settings_rows(pg_url: &str, home: &std::path::Path) -> Value {
+    let mut rows = serde_json::Map::new();
+    for row in control_client(pg_url, home)
+        .query(
+            "SELECT organization, body::text FROM orbital.factory_settings",
+            &[],
+        )
+        .unwrap()
+    {
+        rows.insert(
+            row.get(0),
+            serde_json::from_str(&row.get::<_, String>(1)).unwrap(),
+        );
+    }
+    Value::Object(rows)
+}
+
+/// 테스트가 세운 control database 를 걷는다.
+fn forget_control(home: &std::path::Path) {
+    if let Ok(pg_url) = std::env::var("ORBITAL_PG") {
+        let _ = orbital_server::records::drop_database(&pg_url, &control_of(home));
+    }
+}
 
 const FACTORY: &str = "sk_test_factory";
 const OTHER_FACTORY: &str = "sk_test_other";
@@ -406,7 +446,7 @@ impl Bench {
             google_token: serve_google(Arc::clone(&google)),
         };
         let layer = Self::open(
-            &home,
+            (home.as_path(), "local"),
             &pg_url,
             Some(SealKey::from_bytes(SEAL)),
             dev_mailbox,
@@ -444,8 +484,10 @@ impl Bench {
         Some(bench)
     }
 
+    /// 같은 기록을 보는 관리 서버를 연다. 기계의 이름 하나에는 관리 서버가 하나만 뜨므로, 벤치의 것(`local`)이 떠 있는 채로
+    /// 하나 더 열 때는 다른 이름(`machine`)을 준다.
     fn open(
-        home: &Path,
+        (home, machine): (&Path, &str),
         pg_url: &str,
         seal_key: Option<SealKey>,
         dev_mailbox: bool,
@@ -453,6 +495,8 @@ impl Bench {
     ) -> Layer {
         Layer::open(Options {
             seal_key,
+            control_database: control_of(home),
+            machine: orbital_core::name::Ident::parse(machine).unwrap(),
             public_url: PUBLIC_URL.to_owned(),
             dev_mailbox,
             endpoints: endpoints.clone(),
@@ -783,6 +827,7 @@ impl Drop for Bench {
         for (instance, key) in &self.instances {
             let _ = self.call("DELETE", &format!("/v1/instances/{instance}"), key, &[]);
         }
+        forget_control(&self.home);
         let _ = fs::remove_dir_all(&self.scratch);
     }
 }
@@ -1047,26 +1092,18 @@ fn 키는_봉인된_글로만_기록에_있고_레이어의_열쇠_없이는_풀
     let bench = bench!(false);
     bench.put_mail(FACTORY, MAIL_KEY, "login@factory.example");
     bench.put_google(FACTORY);
-    let record = fs::read_to_string(bench.home.join(SETTINGS)).unwrap();
+    // 기록은 control database 의 줄이다. 봉인한 글만 있고 값은 어디에도 없다
+    let record = settings_rows(&bench.pg_url, &bench.home).to_string();
     assert!(record.contains("seal1."), "{record}");
-    let everything = everything_under(&bench.home);
+    let everything = format!("{record}\n{}", everything_under(&bench.home));
     for secret in [MAIL_KEY, CLIENT_SECRET] {
         assert!(!everything.contains(secret));
         assert!(!everything.contains(&hex(secret.as_bytes())));
     }
-    use std::os::unix::fs::PermissionsExt as _;
-    assert_eq!(
-        fs::metadata(bench.home.join(SETTINGS))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
 
     // 다른 열쇠로 연 레이어에서는 풀리지 않는다. 넣은 것으로 보이지 않고 운영에 쓰이지 않는다
     let other = Bench::open(
-        &bench.home,
+        (bench.home.as_path(), "other_key"),
         &bench.pg_url,
         Some(SealKey::from_bytes([8; 32])),
         false,
@@ -1078,7 +1115,13 @@ fn 키는_봉인된_글로만_기록에_있고_레이어의_열쇠_없이는_풀
     assert_eq!(shown["google"]["configured"], false, "{shown}");
 
     // 열쇠가 없는 레이어도 풀지 못하고, 키를 넣는 길은 409 로 까닭을 알린다
-    let keyless = Bench::open(&bench.home, &bench.pg_url, None, false, &bench.endpoints);
+    let keyless = Bench::open(
+        (bench.home.as_path(), "keyless"),
+        &bench.pg_url,
+        None,
+        false,
+        &bench.endpoints,
+    );
     let shown: Value = serde_json::from_slice(
         &handle(&keyless, "GET", "/v1/settings/auth", Some(FACTORY), &[]).body,
     )
@@ -1108,15 +1151,19 @@ fn 다른_팩토리의_줄에_옮겨_붙인_봉인은_풀리지_않는다() {
     bench.put_mail(FACTORY, MAIL_KEY, "login@factory.example");
     bench.put_mail(OTHER_FACTORY, OTHER_MAIL_KEY, "login@other.example");
     bench.put_google(FACTORY);
-    let path = bench.home.join(SETTINGS);
-    let mut record: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    let organizations = &mut record["organizations"];
+    // 기록의 줄에서 팩토리의 봉인을 다른 팩토리의 줄에 옮겨 붙인다
+    let mut organizations = settings_rows(&bench.pg_url, &bench.home);
     organizations["other"]["mail"]["api_key"] = organizations["factory"]["mail"]["api_key"].clone();
     organizations["other"]["google"] = organizations["factory"]["google"].clone();
-    fs::write(&path, record.to_string()).unwrap();
+    control_client(&bench.pg_url, &bench.home)
+        .execute(
+            "UPDATE orbital.factory_settings SET body = $1::text::jsonb WHERE organization = 'other'",
+            &[&organizations["other"].to_string()],
+        )
+        .unwrap();
 
     let reopened = Bench::open(
-        &bench.home,
+        (bench.home.as_path(), "second"),
         &bench.pg_url,
         Some(SealKey::from_bytes(SEAL)),
         false,

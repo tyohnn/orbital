@@ -20,6 +20,21 @@ use orbital_server::layer::{Layer, OUTBOX, Options};
 use orbital_server::seal::SealKey;
 use serde_json::{Value, json};
 
+/// 레이어마다 다른 control database 의 이름. 같은 `home` 으로 다시 열면 같은 이름이라 다시 뜬 레이어가 같은 기록을 본다.
+fn control_of(home: &std::path::Path) -> orbital_core::name::Ident {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    home.hash(&mut hasher);
+    orbital_core::name::Ident::parse(&format!("ctl_{:016x}", hasher.finish())).unwrap()
+}
+
+/// 테스트가 세운 control database 를 걷는다.
+fn forget_control(home: &std::path::Path) {
+    if let Ok(pg_url) = std::env::var("ORBITAL_PG") {
+        let _ = orbital_server::records::drop_database(&pg_url, &control_of(home));
+    }
+}
+
 const FACTORY: &str = "sk_test_factory";
 
 /// 운영자가 빌드에 건네는 환경의 이름. 레지스트리에 닿는 데 필요한 것만 적는다.
@@ -47,6 +62,7 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        forget_control(&self.0.join("home"));
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -125,6 +141,7 @@ fn open_layer(home: &Path, pg_url: &str, sleep_after: Duration, clock: &Arc<Atom
                 .map_or(0, |elapsed| elapsed.as_secs()),
             at => at,
         }),
+        control_database: control_of(home),
         ..Options::new(
             home.to_path_buf(),
             pg_url.to_owned(),

@@ -17,7 +17,7 @@ use orbital_core::name::{Ident, InstanceId};
 use orbital_pg::auth::Secret;
 use orbital_router::SESSION_COOKIE;
 use orbital_run::LocalRunner;
-use orbital_server::backup::{BackupOptions, DRILLS};
+use orbital_server::backup::BackupOptions;
 use orbital_server::http::handle;
 use orbital_server::layer::{Layer, Options};
 use postgres::{Client, NoTls};
@@ -28,6 +28,12 @@ const OTHER_FACTORY: &str = "sk_test_other";
 const ALL: [&str; 4] = ["source", "preview", "rehearse", "secrets_request"];
 /// 어디에 새어도 찾을 수 있게 드문 글자로 지은 행의 값.
 const SECRET_NOTE: &str = "note_value_Wb52kQx9";
+/// 이 테스트의 봉인의 열쇠.
+const SEAL: [u8; 32] = [5; 32];
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -168,6 +174,8 @@ impl Bench {
         backup.require_drill = require_drill;
         Options {
             dev_mailbox: true,
+            // 운영의 신원 열쇠가 기록에 봉인한 글로 있다. 훈련과 되살리기가 그것을 풀어 쓴다
+            seal_key: Some(orbital_server::seal::SealKey::from_bytes(SEAL)),
             clock: Arc::new(move || now() + ahead.load(Ordering::SeqCst)),
             backup: Some(backup),
             ..Options::new(
@@ -363,8 +371,14 @@ impl Bench {
         self.layer().drill().expect("훈련을 돌리지 못했습니다")
     }
 
+    /// 훈련의 기록(control database 의 `orbital.drill` 표)을 한 줄에 하나씩 JSON 으로.
     fn drills_text(&self) -> String {
-        fs::read_to_string(self.home.join(DRILLS)).unwrap_or_default()
+        self.client("orbital_control")
+            .query("SELECT body::text FROM orbital.drill ORDER BY id", &[])
+            .unwrap()
+            .iter()
+            .map(|row| format!("{}\n", row.get::<_, String>(0)))
+            .collect()
     }
 
     /// 보관한 WAL 에서 기반 백업이 시작한 뒤의 조각 하나를 지운다. 백업이 깨진 것이다.
@@ -645,6 +659,7 @@ fn orbitald_drill_은_훈련이_실패하면_0_이_아닌_코드로_끝난다() 
             .env("ORBITAL_HOME", &bench.home)
             .env("ORBITAL_PG", bench.pg_url())
             .env("ORBITAL_BACKUP_DIR", &bench.backup_root)
+            .env("ORBITAL_SEAL_KEY", hex(&SEAL))
             .output()
             .unwrap()
     };
@@ -862,11 +877,15 @@ fn 되살리기_전의_상태가_되돌릴_지점으로_남는다() {
         ))
         .unwrap();
     // 레이어의 기록도 그 지점을 가리킨다
-    let registry: Value =
-        serde_json::from_slice(&fs::read(bench.home.join("registry.json")).unwrap()).unwrap();
+    let record = bench
+        .layer()
+        .records()
+        .instance(&instance)
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        registry["instances"][&instance]["production"]["restore_point"],
-        json!(point)
+        record.production.unwrap().restore_point.as_deref(),
+        Some(point.as_str())
     );
 }
 
@@ -1285,4 +1304,159 @@ fn 되살린_뒤에도_표의_주인과_권한이_되살리기_전과_같다() {
         .unwrap()
         .schema;
     assert_eq!(schema_after, schema_before);
+}
+
+// ---- 기록과 여러 관리 서버 ----
+
+impl Bench {
+    /// 같은 클러스터 · 같은 control database 를 보는 다른 기계의 관리 서버. 폴더는 따로 갖는다.
+    fn other_server(&self, machine: &str) -> Layer {
+        Layer::open(Options {
+            home: self.scratch.join(format!("home-{machine}")),
+            machine: Ident::parse(machine).unwrap(),
+            ..self.options(false)
+        })
+        .expect("다른 관리 서버를 열지 못했습니다")
+    }
+
+    fn backup_count(&self) -> usize {
+        let tools = Tools::find().unwrap();
+        LocalStore::open(tools, self.backup_root.clone())
+            .unwrap()
+            .backups()
+            .unwrap()
+            .len()
+    }
+}
+
+#[test]
+fn 복구_훈련과_기반_백업은_여러_관리_서버_가운데_하나만_돌린다() {
+    let mut bench = bench!();
+    bench.shipped();
+    bench.base_backup();
+    let other = bench.other_server("b");
+
+    // 두 관리 서버가 동시에 훈련을 돌린다. 하나만 돌고 다른 하나는 409 로 답한다
+    let outcomes: Vec<bool> = std::thread::scope(|scope| {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let spawned: Vec<_> = [bench.layer(), &other]
+            .into_iter()
+            .map(|layer| {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    match layer.drill() {
+                        Ok(record) => {
+                            assert!(record.passed, "{record:#?}");
+                            true
+                        }
+                        Err(orbital_server::layer::Failure::Conflict(message)) => {
+                            assert!(message.contains("다른 관리 서버"), "{message}");
+                            false
+                        }
+                        Err(failure) => panic!("{failure:?}"),
+                    }
+                })
+            })
+            .collect();
+        spawned
+            .into_iter()
+            .map(|done| done.join().unwrap())
+            .collect()
+    });
+    assert_eq!(
+        outcomes.iter().filter(|ran| **ran).count(),
+        1,
+        "{outcomes:?}"
+    );
+    assert_eq!(bench.drills_text().lines().count(), 1);
+
+    // 한 관리 서버가 차례를 쥔 동안 다른 관리 서버는 백업도 훈련도 돌리지 않는다. 정한 주기가 지났어도 건너뛴다
+    let turn = bench
+        .layer()
+        .records()
+        .take_backup_turn()
+        .unwrap()
+        .expect("차례를 잡지 못했습니다");
+    let backups = bench.backup_count();
+    assert!(matches!(
+        other.base_backup(),
+        Err(orbital_server::layer::Failure::Conflict(_))
+    ));
+    other.tend(Duration::from_millis(1), Duration::from_secs(1));
+    assert_eq!(bench.backup_count(), backups);
+    assert_eq!(bench.drills_text().lines().count(), 1);
+    // 따로 도는 `orbitald drill` 도 돌지 않는다
+    let refused = Command::new(env!("CARGO_BIN_EXE_orbitald"))
+        .arg("drill")
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("ORBITAL_HOME", &bench.home)
+        .env("ORBITAL_PG", bench.pg_url())
+        .env("ORBITAL_BACKUP_DIR", &bench.backup_root)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("다른 관리 서버"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(bench.drills_text().lines().count(), 1);
+
+    // 놓으면 다른 관리 서버가 돌린다
+    drop(turn);
+    other.base_backup().expect("기반 백업을 뜨지 못했습니다");
+    assert_eq!(bench.backup_count(), backups + 1);
+}
+
+#[test]
+fn 기반_백업에_기록이_함께_들어_옆에_되살린_클러스터에서_그_시점의_기록이_읽힌다() {
+    let mut bench = bench!();
+    let (first, _) = bench.shipped();
+    bench.base_backup();
+    let at = moment();
+    let second = bench.instance(FACTORY);
+
+    let tools = Tools::find().unwrap();
+    let store = LocalStore::open(tools, bench.backup_root.clone()).unwrap();
+    store.seal(&bench.pg_url()).unwrap();
+    let backups = store.backups().unwrap();
+    let archive = store.archive().unwrap();
+    let chosen = orbital_core::backup::judge_restore(&backups, &archive, at * 1000)
+        .unwrap()
+        .clone();
+    let side = store.recover(&chosen, at * 1000).unwrap();
+    {
+        let mut client = side.connect("orbital_control").unwrap();
+        let ids: Vec<String> = client
+            .query("SELECT id FROM orbital.instance ORDER BY id", &[])
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        // 그 시점의 기록이다. 그 뒤에 세운 인스턴스는 없다
+        assert!(ids.contains(&first), "{ids:?}");
+        assert!(!ids.contains(&second), "{ids:?}");
+        // 운영의 기록도 그 시점의 것이다
+        let production: String = client
+            .query_one(
+                "SELECT body -> 'production' ->> 'release' FROM orbital.instance WHERE id = $1",
+                &[&first],
+            )
+            .unwrap()
+            .get(0);
+        assert!(!production.is_empty());
+    }
+    // 묶음에는 DB 에 없는 것(코드 저장소)만 든다
+    let unpacked = bench.scratch.join("unpacked");
+    store.records(&chosen, &unpacked).unwrap();
+    let mut names: Vec<String> = fs::read_dir(&unpacked)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["apps".to_owned(), "sources".to_owned()]);
+    drop(side);
 }

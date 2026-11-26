@@ -14,11 +14,71 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orbital_run::LocalRunner;
 use orbital_server::http::{answer, handle};
-use orbital_server::layer::{Layer, Options, VAULT};
+use orbital_server::layer::{Layer, Options};
 use orbital_server::seal::SealKey;
 use orbital_server::token::hex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+/// 레이어마다 다른 control database 의 이름. 같은 `home` 으로 다시 열면 같은 이름이라 다시 뜬 레이어가 같은 기록을 본다.
+fn control_of(home: &std::path::Path) -> orbital_core::name::Ident {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    home.hash(&mut hasher);
+    orbital_core::name::Ident::parse(&format!("ctl_{:016x}", hasher.finish())).unwrap()
+}
+
+/// 테스트의 control database 에 관리 역할로 붙는다. 기록의 줄을 들여다보고 고친다.
+fn control_client(pg_url: &str, home: &std::path::Path) -> postgres::Client {
+    let mut config: postgres::Config = pg_url.parse().unwrap();
+    config.dbname(control_of(home).as_str());
+    config.connect(postgres::NoTls).unwrap()
+}
+
+/// 금고의 줄을 옛 파일과 같은 모양(`values` → 인스턴스 → 이름 → 단계 → `sealed`)으로 읽는다.
+fn vault_rows(pg_url: &str, home: &std::path::Path) -> Value {
+    let mut values = json!({});
+    for row in control_client(pg_url, home)
+        .query(
+            "SELECT instance, name, stage, sealed FROM orbital.vault_value",
+            &[],
+        )
+        .unwrap()
+    {
+        let (instance, name, stage, sealed): (String, String, String, String) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
+        values[&instance][&name][&stage] = json!({ "sealed": sealed });
+    }
+    json!({ "values": values })
+}
+
+/// 금고 · 요청 · 입력 표의 줄을 모두 글로 읽는다.
+fn vault_text(pg_url: &str, home: &std::path::Path) -> String {
+    let mut client = control_client(pg_url, home);
+    [
+        "SELECT row_to_json(v)::text FROM orbital.vault_value v",
+        "SELECT row_to_json(r)::text FROM orbital.secret_request r",
+        "SELECT row_to_json(e)::text FROM orbital.secret_entry e",
+    ]
+    .iter()
+    .flat_map(|query| {
+        client
+            .query(*query, &[])
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+    })
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+/// 테스트가 세운 control database 를 걷는다.
+fn forget_control(home: &std::path::Path) {
+    if let Ok(pg_url) = std::env::var("ORBITAL_PG") {
+        let _ = orbital_server::records::drop_database(&pg_url, &control_of(home));
+    }
+}
 
 const FACTORY: &str = "sk_test_factory";
 const OTHER_FACTORY: &str = "sk_test_other";
@@ -226,6 +286,7 @@ impl Bench {
                 public_url: self.public.clone(),
                 dev_mailbox: true,
                 clock: Arc::new(move || now() + ahead.load(Ordering::SeqCst)),
+                control_database: control_of(&self.home),
                 ..Options::new(
                     self.home.clone(),
                     self.pg_url.clone(),
@@ -485,6 +546,7 @@ impl Drop for Bench {
             }
             let _ = self.shut();
         }
+        forget_control(&self.home);
         let _ = fs::remove_dir_all(&self.scratch);
     }
 }
@@ -1182,9 +1244,7 @@ fn 옛_열쇠를_함께_주면_옛_열쇠로만_풀리는_금고의_값과_팩�
     assert_eq!(status, 200, "{body}");
     let stranger_sealed =
         |vault: &Value| vault["values"][&stranger]["BANK_API_KEY"]["preview"]["sealed"].clone();
-    let read_vault = |bench: &Bench| -> Value {
-        serde_json::from_slice(&fs::read(bench.home.join(VAULT)).unwrap()).unwrap()
-    };
+    let read_vault = |bench: &Bench| -> Value { vault_rows(&bench.pg_url, &bench.home) };
     let before = read_vault(&bench);
 
     // 새 열쇠와 옛 열쇠로 뜬다. 옛 열쇠로만 풀리는 줄을 새 열쇠로 다시 적고, 몇 줄인지와 풀리지 않는 줄의 이름만 알린다
@@ -1209,9 +1269,9 @@ fn 옛_열쇠를_함께_주면_옛_열쇠로만_풀리는_금고의_값과_팩�
         after["values"][&instance]["BANK_API_KEY"]["production"]["sealed"],
         before["values"][&instance]["BANK_API_KEY"]["production"]["sealed"]
     );
-    // 다시 봉인은 임시 파일에 쓰고 옮긴다. 남은 임시 파일이 없다
-    assert!(!bench.home.join("vault.json.writing").exists());
-    assert!(!bench.home.join("settings.json.writing").exists());
+    // 기록은 파일이 아니라 control database 의 줄이다
+    assert!(!bench.home.join("vault.json").exists());
+    assert!(!bench.home.join("settings.json").exists());
 
     // 마친 뒤에는 옛 열쇠 없이 뜬다. 운영의 앱이 값을 받고, 팩토리의 메일 키가 풀린다
     bench.previous_seal = None;
@@ -1275,7 +1335,7 @@ fn 봉인_열쇠가_없으면_값을_넣지_못하고_무엇을_고칠지_알려
 }
 
 #[test]
-fn 금고의_파일에는_값이_평문으로_남지_않고_주인만_읽는다() {
+fn 금고의_줄에는_값이_평문으로_남지_않는다() {
     let mut bench = bench!();
     let instance = bench.instance(FACTORY);
     let token = bench.token(FACTORY, &instance, &ALL);
@@ -1284,15 +1344,9 @@ fn 금고의_파일에는_값이_평문으로_남지_않고_주인만_읽는다(
     bench.put_ok(&instance, "production", BANK);
     bench.ship_ok(&instance, &token);
 
-    let vault = bench.home.join(VAULT);
-    let record = fs::read_to_string(&vault).unwrap();
+    let record = vault_text(&bench.pg_url, &bench.home);
     assert!(record.contains("seal1."), "{record}");
-    use std::os::unix::fs::PermissionsExt as _;
-    assert_eq!(
-        fs::metadata(&vault).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    let everything = everything_under(&bench.home);
+    let everything = format!("{record}\n{}", everything_under(&bench.home));
     for value in [BANK, BANK_PREVIEW] {
         assert!(!everything.contains(value));
         assert!(!everything.contains(&hex(value.as_bytes())));
@@ -1313,14 +1367,26 @@ fn 봉인된_값을_다른_인스턴스의_자리에_옮겨_심으면_열리지_
 
     // 기록을 가져간 쪽이 봉인된 글을 다른 인스턴스와 다른 단계의 자리에 옮겨 심는다
     let server = bench.shut();
-    let vault = bench.home.join(VAULT);
-    let mut record: Value = serde_json::from_str(&fs::read_to_string(&vault).unwrap()).unwrap();
-    let sealed = record["values"][&mine]["BANK_API_KEY"]["production"].clone();
-    assert!(sealed["sealed"].as_str().unwrap().starts_with("seal1."));
-    record["values"][&theirs] =
-        json!({ "BANK_API_KEY": { "production": sealed, "preview": sealed } });
-    record["values"][&mine]["BANK_API_KEY"]["preview"] = sealed;
-    fs::write(&vault, record.to_string()).unwrap();
+    let record = vault_rows(&bench.pg_url, &bench.home);
+    let sealed = record["values"][&mine]["BANK_API_KEY"]["production"]["sealed"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(sealed.starts_with("seal1."));
+    let mut client = control_client(&bench.pg_url, &bench.home);
+    for (instance, stage) in [
+        (&theirs, "production"),
+        (&theirs, "preview"),
+        (&mine, "preview"),
+    ] {
+        client
+            .execute(
+                "INSERT INTO orbital.vault_value (instance, stage, name, sealed, set_at) VALUES ($1, $2, 'BANK_API_KEY', $3, 1)
+                 ON CONFLICT (instance, stage, name) DO UPDATE SET sealed = excluded.sealed",
+                &[instance, &stage, &sealed],
+            )
+            .unwrap();
+    }
     bench.open(Some(SealKey::from_bytes(SEAL)), server);
 
     let moved = bank(&bench.list(FACTORY, &theirs));
@@ -1350,20 +1416,12 @@ fn 인스턴스를_지우면_그_비밀도_지워진다() {
     );
     assert_eq!(status, 200);
     let url = bench.entry(&instance, "preview");
-    assert!(
-        fs::read_to_string(bench.home.join(VAULT))
-            .unwrap()
-            .contains(&instance)
-    );
+    assert!(vault_text(&bench.pg_url, &bench.home).contains(&instance));
 
     let (status, body) = bench.call("DELETE", &format!("/v1/instances/{instance}"), FACTORY, &[]);
     assert_eq!(status, 200, "{body}");
     bench.instances.clear();
-    assert!(
-        !fs::read_to_string(bench.home.join(VAULT))
-            .unwrap()
-            .contains(&instance)
-    );
+    assert!(!vault_text(&bench.pg_url, &bench.home).contains(&instance));
     // 남은 입력 표로도 넣지 못한다
     assert_eq!(send_entry(&url, &json!({ "value": BANK })).status, 404);
 }
@@ -1588,9 +1646,15 @@ fn 되돌릴_release_의_비밀이_빠져_있으면_되돌리지_못한다() {
     assert_eq!(status, 200, "{body}");
     bench.ship_ok(&instance, &token);
 
-    // 레이어의 운영자가 봉인의 열쇠를 바꿨고 팩토리는 새 release 가 쓰는 값만 다시 넣었다. 앞의 release 의 `LEGACY_KEY` 는 풀리지 않는다
-    bench.restart(Some(SealKey::from_bytes([9; 32])));
-    bench.put_ok(&instance, "production", BANK);
+    // 앞의 release 의 `LEGACY_KEY` 의 봉인이 풀리지 않게 됐다(다른 자리의 봉인으로 바뀌었다). 새 release 가 쓰는 값은 그대로다.
+    // 봉인의 열쇠를 옛 열쇠 없이 바꾸는 것으로는 이 모습을 만들지 못한다: 운영의 신원 열쇠도 풀리지 않아 승격 전에 멈춘다
+    control_client(&bench.pg_url, &bench.home)
+        .execute(
+            "UPDATE orbital.vault_value SET sealed = (SELECT sealed FROM orbital.vault_value WHERE name = 'BANK_API_KEY' AND stage = 'production' AND instance = $1)
+             WHERE name = 'LEGACY_KEY' AND stage = 'production' AND instance = $1",
+            &[&instance],
+        )
+        .unwrap();
     // 새 release 는 `LEGACY_KEY` 를 쓰지 않고, 운영에서만 뜨지 않는다
     bench.change(&instance, &token, &|work: &Path| {
         let manifest = fs::read_to_string(work.join("orbital.toml")).unwrap();

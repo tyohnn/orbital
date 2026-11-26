@@ -159,6 +159,21 @@ fn failure(failure: Failure) -> Reply {
         Failure::UnsupportedMediaType(message) => {
             problem(415, "unsupported_media_type", &message, Vec::new())
         }
+        // 인스턴스(또는 앱)가 다른 기계에 놓여 있다. 이 관리 서버는 아무것도 하지 않았고, 놓인 기계의 이름을 함께 싣는다
+        Failure::Misplaced { machine } => {
+            let mut reply = problem(421, "misplaced", "", Vec::new());
+            reply.body = json!({
+                "error": "misplaced",
+                "message": format!(
+                    "이 인스턴스는 다른 기계(`{machine}`)에 놓여 있어 이 관리 서버는 아무것도 하지 않았습니다. 그 기계의 관리 서버로 보내 주세요"
+                ),
+                "details": [],
+                "machine": machine,
+            })
+            .to_string()
+            .into_bytes();
+            reply
+        }
         Failure::Internal(message) => problem(500, "internal", &message, Vec::new()),
     }
 }

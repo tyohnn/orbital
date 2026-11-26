@@ -1,0 +1,28 @@
+# control database 의 테스트가 쓰는 스캐폴드. 로그인을 레이어에 맡기고, 밖에서 넣는 비밀 하나 · 레이어가 만드는 비밀 하나 · 매분 도는 일정 하나가 있다.
+# 의존성 없이 뜨는 Node 서버 하나다
+
+[[service]]
+name = "web"
+kind = "server"
+build = "node --check server.js"
+start = "node server.js"
+path = "/"
+roles = ["member"]
+
+[[schedule]]                  # 매분. 신원 없이 부른다
+service = "web"
+cron = "* * * * *"
+path = "/jobs/tick"
+
+[database]
+schemas = ["ledger"]
+migrations = "db/migrations"
+roles = ["member"]
+
+[secrets]
+generated = ["SESSION_KEY"]
+external = ["BANK_API_KEY"]
+
+[auth]
+methods = ["email_link"]
+login_path = "/login"

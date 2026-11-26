@@ -21,6 +21,21 @@ use orbital_server::layer::{Hosting, Layer, OUTBOX, Options};
 use orbital_server::seal::SealKey;
 use serde_json::{Value, json};
 
+/// 레이어마다 다른 control database 의 이름. 같은 `home` 으로 다시 열면 같은 이름이라 다시 뜬 레이어가 같은 기록을 본다.
+fn control_of(home: &std::path::Path) -> orbital_core::name::Ident {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    home.hash(&mut hasher);
+    orbital_core::name::Ident::parse(&format!("ctl_{:016x}", hasher.finish())).unwrap()
+}
+
+/// 테스트가 세운 control database 를 걷는다.
+fn forget_control(home: &std::path::Path) {
+    if let Ok(pg_url) = std::env::var("ORBITAL_PG") {
+        let _ = orbital_server::records::drop_database(&pg_url, &control_of(home));
+    }
+}
+
 const FACTORY: &str = "sk_test_factory";
 const ORGANIZATION: &str = "factory";
 const BASE: &str = "orbital.test";
@@ -436,6 +451,7 @@ impl Bench {
             wake_timeout: Duration::from_secs(5),
             schedule_timeout: Duration::from_secs(1),
             hosting,
+            control_database: control_of(&self.home),
             ..defaults
         })
         .expect("레이어를 열지 못했습니다");
@@ -737,6 +753,7 @@ impl Drop for Bench {
             }
         }
         drop(self.layer.take());
+        forget_control(&self.home);
         let _ = fs::remove_dir_all(&self.scratch);
     }
 }
@@ -983,20 +1000,38 @@ fn 관리_서버가_다시_떠도_운영은_첫_요청에_깬다() {
     assert_eq!(made.status, 201, "{}", made.everything());
 
     let preview_database = {
-        let registry: Value =
-            serde_json::from_slice(&fs::read(bench.home.join("registry.json")).unwrap()).unwrap();
-        format!(
-            "i_{}",
-            registry["instances"][&instance]["preview"]
-                .as_str()
-                .unwrap()
-        )
+        let record = bench
+            .layer
+            .as_ref()
+            .unwrap()
+            .records()
+            .instance(&instance)
+            .unwrap()
+            .unwrap();
+        format!("i_{}", record.preview.unwrap())
     };
     assert!(bench.database_exists(&preview_database));
 
     bench.restart();
-    // 프리뷰는 되살리지 않고, 앞의 레이어가 세운 프리뷰의 database 는 걷는다
-    assert!(!bench.database_exists(&preview_database));
+    // 프리뷰는 되살리지 않고, 앞의 레이어가 세운 프리뷰의 database 는 걷는다. 운영을 세운 뒤에 뒤에서 걷으므로 곧 사라진다
+    assert!(
+        eventually(Duration::from_secs(20), || !bench
+            .database_exists(&preview_database)),
+        "앞의 프리뷰의 database 가 남았습니다"
+    );
+    assert!(
+        eventually(Duration::from_secs(5), || bench
+            .layer
+            .as_ref()
+            .unwrap()
+            .records()
+            .instance(&instance)
+            .unwrap()
+            .unwrap()
+            .preview
+            .is_none()),
+        "기록에 앞의 프리뷰의 이름이 남았습니다"
+    );
     // 다시 뜬 레이어는 운영의 router 를 자는 채로 세운다. 앱의 프로세스는 아직 없다
     assert_eq!(bench.probe.starts(), 0);
     let again = bench.production_url(&instance);

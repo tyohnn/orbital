@@ -17,6 +17,21 @@ use orbital_server::http::serve;
 use orbital_server::layer::{Layer, Options};
 use serde_json::{Value, json};
 
+/// 레이어마다 다른 control database 의 이름. 같은 `home` 으로 다시 열면 같은 이름이라 다시 뜬 레이어가 같은 기록을 본다.
+fn control_of(home: &std::path::Path) -> orbital_core::name::Ident {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    home.hash(&mut hasher);
+    orbital_core::name::Ident::parse(&format!("ctl_{:016x}", hasher.finish())).unwrap()
+}
+
+/// 테스트가 세운 control database 를 걷는다.
+fn forget_control(home: &std::path::Path) {
+    if let Ok(pg_url) = std::env::var("ORBITAL_PG") {
+        let _ = orbital_server::records::drop_database(&pg_url, &control_of(home));
+    }
+}
+
 const FACTORY: &str = "sk_test_factory";
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -201,6 +216,7 @@ impl Bench {
         );
         let layer = Layer::open(Options {
             dev_mailbox: true,
+            control_database: control_of(&scratch.join("home")),
             token_clock: Arc::new(move || now() + clock.load(Ordering::SeqCst)),
             upload_limit: upload_limit.unwrap_or(defaults.upload_limit),
             ..defaults
@@ -401,6 +417,7 @@ impl Drop for Bench {
                 &[],
             );
         }
+        forget_control(&self.scratch.join("home"));
         let _ = fs::remove_dir_all(&self.scratch);
     }
 }

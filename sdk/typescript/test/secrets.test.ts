@@ -15,10 +15,13 @@ import { after, before, test } from "node:test";
 
 import { OrbitalError, createOrbital } from "../src/server.ts";
 import type { Orbital, Work } from "../src/server.ts";
+import { controlDatabase, dropControlDatabase } from "./control.ts";
 
 const root = resolve(import.meta.dirname, "../../..");
 const bin = (name: string): string => join(process.env.CARGO_TARGET_DIR ?? join(root, "target"), "debug", name);
 const pg = process.env.ORBITAL_PG;
+/** 이 테스트의 `orbitald` 가 기록을 두는 control database. */
+const control = controlDatabase();
 const skip = pg === undefined ? "ORBITAL_PG 가 없어 건너뜁니다. scripts/pg-local.sh 로 띄워 주세요" : false;
 
 const FACTORY = "sk_test_factory";
@@ -79,6 +82,7 @@ before(async () =>
             PATH: process.env.PATH ?? "",
             ORBITAL_HOME: join(scratch, "home"),
             ORBITAL_PG: pg,
+            ORBITAL_CONTROL_DB: control,
             ORBITAL_SERVICE_KEYS: `factory=${FACTORY}`,
             // 비밀을 봉인하는 열쇠. 테스트에만 쓰는 값이다
             ORBITAL_SEAL_KEY: "07".repeat(32),
@@ -131,6 +135,10 @@ after(async () =>
         await orbital.instances.destroy(instance).catch(() => undefined);
     }
     server?.kill();
+    if (pg !== undefined)
+    {
+        dropControlDatabase(pg, control);
+    }
     if (scratch !== "")
     {
         rmSync(scratch, { recursive: true, force: true });

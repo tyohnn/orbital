@@ -6,7 +6,7 @@
 //! <root>/wal/                  archive_command 가 WAL 조각을 복사해 두는 곳
 //! <root>/seal.json             마지막으로 보관을 확인한 표시(core 의 `Seal`)
 //! <root>/base/<id>/data/       pg_basebackup 이 뜬 클러스터(plain, WAL 포함)
-//! <root>/base/<id>/records.tar 레이어의 기록(`RECORDS`)
+//! <root>/base/<id>/records.tar DB 에 없는 레이어의 것(`RECORDS`, 코드 저장소)
 //! <root>/base/<id>/backup.json 기반 백업의 시각과 시작 조각. 다 뜬 뒤에 적으므로 이것이 없는 폴더는 덜 뜬 것이다
 //! <root>/restore/<n>/          시점 복구로 옆에 세운 클러스터. 내리면 지운다
 //! ```
@@ -24,7 +24,7 @@ use crate::{Cluster, Error, Tools, io, pg, records, timestamp};
 
 /// 백업을 두는 곳과 도구. 지금은 이 기계의 폴더(`LocalStore`) 하나다. 다른 기계나 저장소에 두려면 이것을 갈아 끼운다.
 pub trait Store: Send + Sync {
-    /// 운영 클러스터의 기반 백업을 하나 뜨고, 레이어의 기록(`home`)을 함께 묶는다.
+    /// 운영 클러스터의 기반 백업을 하나 뜨고, DB 에 없는 레이어의 것(`home` 의 코드 저장소)을 함께 묶는다.
     fn base_backup(&self, admin_url: &str, home: &Path) -> Result<BaseBackup, Error>;
     /// 다 뜬 기반 백업.
     fn backups(&self) -> Result<Vec<BaseBackup>, Error>;
@@ -34,7 +34,7 @@ pub trait Store: Send + Sync {
     fn seal(&self, admin_url: &str) -> Result<Seal, Error>;
     /// 기반 백업과 보관한 WAL 로 그 시점(유닉스 밀리초)의 클러스터를 옆에 세운다. 운영 클러스터는 건드리지 않는다.
     fn recover(&self, backup: &BaseBackup, at: u64) -> Result<Cluster, Error>;
-    /// 기반 백업에 묶은 레이어의 기록을 `into` 에 푼다.
+    /// 기반 백업에 묶은 코드 저장소를 `into` 에 푼다.
     fn records(&self, backup: &BaseBackup, into: &Path) -> Result<(), Error>;
     /// 지울 것으로 판정된 기반 백업과 WAL 을 지운다.
     fn prune(&self, pruning: &Pruning) -> Result<(), Error>;

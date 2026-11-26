@@ -1,0 +1,3 @@
+[ledger.transfer]
+rls = "off: 로그인이 없는 시험용 앱의 표"
+member = "read write"

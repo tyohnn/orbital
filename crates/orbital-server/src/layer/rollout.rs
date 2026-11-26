@@ -15,8 +15,9 @@ use orbital_source::assemble::Assembled;
 use orbital_source::{Commit, Merged, app_commit};
 use serde::{Deserialize, Serialize};
 
-use super::{Failure, Inner, Layer, Outcome, fresh_id, internal};
+use super::{Failure, Layer, Outcome, fresh_id, internal};
 use crate::registry::RolloutRecord;
+use orbital_core::placement::Errand;
 
 /// rollout 을 만드는 요청. `commit` 이 없으면 앱의 `main` 의 끝이다.
 #[derive(Debug, Clone, Deserialize)]
@@ -291,17 +292,17 @@ impl Layer {
     }
 
     /// 이 인스턴스가 든 열린 rollout 가운데, 그 업데이트를 `commit` 이 조상으로 담는 것.
+    ///
+    /// 기록을 읽지 못하면 「없다」고 답하지 않고 실패한다. 없다고 답하면 rollout 의 관문(멈춤 · 물결)을 지나지 않고 승격된다.
     pub(super) fn governing(
         &self,
-        inner: &Inner,
         instance: &InstanceId,
         commit: &Commit,
-    ) -> Option<String> {
-        inner
-            .registry
-            .state
-            .rollouts
-            .iter()
+    ) -> Outcome<Option<String>> {
+        Ok(self
+            .records
+            .rollouts()?
+            .into_iter()
             .filter(|(_, record)| record.rollout.status.open() && record.rollout.contains(instance))
             .find(|(_, record)| {
                 Commit::parse(&record.rollout.update).is_some_and(|update| {
@@ -310,45 +311,38 @@ impl Layer {
                         .unwrap_or(false)
                 })
             })
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| id))
     }
 
-    /// 사건을 차례로 넘긴다. 받지 않은 사건은 버린다(그 까닭은 승격할 때 다시 판정한다).
-    pub(super) fn record(inner: &mut Inner, id: &str, events: &[Event]) -> Outcome<()> {
-        if let Some(record) = inner.registry.state.rollouts.get_mut(id) {
+    /// 사건을 차례로 넘긴다. 받지 않은 사건은 버린다(그 까닭은 승격할 때 다시 판정한다). rollout 의 줄을 잠그고 고친다.
+    pub(super) fn record(&self, id: &str, events: &[Event]) -> Outcome<()> {
+        self.records.update_rollout(id, |record| {
             for event in events {
                 if let Ok(next) = record.rollout.step(event) {
                     record.rollout = next;
                 }
             }
-        }
-        inner.registry.save().map_err(Failure::Internal)
+            Ok::<(), Failure>(())
+        })?;
+        Ok(())
     }
 
     /// `commit` 이 업데이트를 담았으면 그 rollout 에 사건을 넘긴다.
     pub(super) fn track(
         &self,
-        inner: &mut Inner,
         instance: &InstanceId,
         commit: &Commit,
         events: &[Event],
     ) -> Outcome<()> {
-        match self.governing(inner, instance, commit) {
-            Some(id) => Self::record(inner, &id, events),
+        match self.governing(instance, commit)? {
+            Some(id) => self.record(&id, events),
             None => Ok(()),
         }
     }
 
-    fn owned_rollout<'a>(
-        inner: &'a mut Inner,
-        organization: &str,
-        id: &str,
-    ) -> Outcome<&'a mut RolloutRecord> {
-        inner
-            .registry
-            .state
-            .rollouts
-            .get_mut(id)
+    fn owned_rollout(&self, organization: &str, id: &str) -> Outcome<RolloutRecord> {
+        self.records
+            .rollout(id)?
             .filter(|record| record.organization == organization)
             .ok_or(Failure::NotFound)
     }
@@ -361,6 +355,7 @@ impl Layer {
         request: NewRollout,
     ) -> Outcome<RolloutReport> {
         let app_name = Ident::parse(app).map_err(|_| Failure::NotFound)?;
+        self.app_here(organization, &app_name)?;
         let repository = self.app_path(organization, &app_name)?;
         if !repository.join("HEAD").is_file() {
             return Err(Failure::NotFound);
@@ -385,10 +380,17 @@ impl Layer {
             }
             waves.push(members);
         }
-        let mut inner = self.lock();
+        let _inner = self.lock();
+        let mut misplaced = None;
         for instance in waves.iter().flatten() {
-            match inner.registry.state.instances.get(instance.as_str()) {
+            match self.records.instance(instance.as_str())? {
                 Some(record) if record.organization == organization => {
+                    // 업데이트를 인스턴스의 저장소에 가져다 두므로 모든 인스턴스가 이 기계에 놓여 있어야 한다
+                    if let Err(Failure::Misplaced { machine }) =
+                        self.placed(&record, Errand::CreateRollout)
+                    {
+                        misplaced.get_or_insert(machine);
+                    }
                     if record.app != app {
                         problems.push(format!(
                             "인스턴스 `{}` 는 앱 `{}` 의 포크라 앱 `{app}` 의 rollout 에 넣지 못합니다. 앱 `{app}` 에서 갈라진 인스턴스만 적어 주세요",
@@ -410,8 +412,11 @@ impl Layer {
                 return Err(Failure::Problems(problems));
             }
         };
+        if let Some(machine) = misplaced {
+            return Err(Failure::Misplaced { machine });
+        }
         // 한 인스턴스는 같은 앱의 열린 rollout 하나에만 든다
-        for (id, record) in &inner.registry.state.rollouts {
+        for (id, record) in &self.records.rollouts()? {
             if record.organization != organization
                 || record.rollout.app != app
                 || !record.rollout.status.open()
@@ -436,21 +441,19 @@ impl Layer {
         }
         let id = fresh_id('r')?.as_str().to_owned();
         let made = report(&id, &rollout);
-        inner.registry.state.rollouts.insert(
-            id,
-            RolloutRecord {
+        self.records.insert_rollout(
+            &id,
+            &RolloutRecord {
                 organization: organization.to_owned(),
                 rollout,
             },
-        );
-        inner.registry.save().map_err(Failure::Internal)?;
+        )?;
         Ok(made)
     }
 
     /// rollout 하나(service key). 다른 팩토리의 것은 없는 것으로 답한다.
     pub fn rollout(&self, organization: &str, id: &str) -> Outcome<RolloutReport> {
-        let mut inner = self.lock();
-        let record = Self::owned_rollout(&mut inner, organization, id)?;
+        let record = self.owned_rollout(organization, id)?;
         Ok(report(id, &record.rollout))
     }
 
@@ -461,10 +464,7 @@ impl Layer {
         id: &str,
         instance: &InstanceId,
     ) -> Outcome<ApplyReport> {
-        let mut inner = self.lock();
-        let rollout = Self::owned_rollout(&mut inner, organization, id)?
-            .rollout
-            .clone();
+        let rollout = self.owned_rollout(organization, id)?.rollout;
         if !rollout.status.open() {
             return Err(Failure::Conflict(refusal_text(&Refusal::Closed {
                 status: rollout.status,
@@ -473,6 +473,9 @@ impl Layer {
         if !rollout.contains(instance) {
             return Err(Failure::NotFound);
         }
+        let record = self.record_of(instance)?;
+        self.placed(&record, Errand::ApplyUpdate)?;
+        let _inner = self.lock();
         let update = Commit::parse(&rollout.update)
             .ok_or_else(|| internal("업데이트 commit 을 읽지 못했습니다"))?;
         let merged = self.sources.merge(instance, &update).map_err(internal)?;
@@ -481,7 +484,7 @@ impl Layer {
         };
         Ok(match merged {
             Merged::Merged(commit) => {
-                Self::record(&mut inner, id, &[applied])?;
+                self.record(id, &[applied])?;
                 ApplyReport {
                     applied: true,
                     commit: Some(commit.to_string()),
@@ -491,7 +494,7 @@ impl Layer {
             Merged::Already(commit) => {
                 // 이미 담고 있다. 아직 적히지 않았을 때만 적는다(앞의 프리뷰와 검사를 지우지 않는다)
                 if rollout.progress.get(instance) == Some(&Progress::Waiting) {
-                    Self::record(&mut inner, id, &[applied])?;
+                    self.record(id, &[applied])?;
                 }
                 ApplyReport {
                     applied: true,
@@ -517,6 +520,16 @@ impl Layer {
         let made = self.decide(organization, id, &Event::Cancel)?;
         for instance in made.instances.iter() {
             if let Ok(instance) = InstanceId::parse(&instance.instance) {
+                // 다른 기계에 놓인 인스턴스의 묶음은 그 기계에 있다. 여기서는 이 기계의 것만 뺀다(남은 것은 다음 rollout 이 덮는다)
+                let here = self
+                    .records
+                    .instance(instance.as_str())
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.machine == self.machine());
+                if !here {
+                    continue;
+                }
                 // 묶음에 담던 업데이트를 뺀다. 합친 코드는 그대로다
                 let _ = self.sources.clear_update(&instance);
             }
@@ -525,25 +538,24 @@ impl Layer {
     }
 
     fn decide(&self, organization: &str, id: &str, event: &Event) -> Outcome<RolloutReport> {
-        let mut inner = self.lock();
-        let record = Self::owned_rollout(&mut inner, organization, id)?;
-        let next = record
-            .rollout
-            .step(event)
-            .map_err(|refusal| Failure::Conflict(refusal_text(&refusal)))?;
-        record.rollout = next;
-        let made = report(id, &record.rollout);
-        inner.registry.save().map_err(Failure::Internal)?;
-        Ok(made)
+        self.owned_rollout(organization, id)?;
+        self.records
+            .update_rollout(id, |record| -> Outcome<RolloutReport> {
+                let next = record
+                    .rollout
+                    .step(event)
+                    .map_err(|refusal| Failure::Conflict(refusal_text(&refusal)))?;
+                record.rollout = next;
+                Ok(report(id, &record.rollout))
+            })?
+            .ok_or(Failure::NotFound)
     }
 
     /// 이 인스턴스가 든 열린 rollout 의 진행(토큰). 없으면 `None` 이다. 다른 인스턴스는 싣지 않는다.
     pub fn instance_rollout(&self, instance: &InstanceId) -> Outcome<Option<AgentRollout>> {
-        let inner = self.lock();
-        Ok(inner
-            .registry
-            .state
-            .rollouts
+        Ok(self
+            .records
+            .rollouts()?
             .iter()
             .find(|(_, record)| record.rollout.status.open() && record.rollout.contains(instance))
             .map(|(id, record)| AgentRollout {

@@ -38,12 +38,15 @@ import { CARD_META, ENTRY_META } from "../src/card.ts";
 import { packageFiles, zip } from "../src/pack.ts";
 import { CARD_URI, TOOLS } from "../src/tools.ts";
 import { AGENT_CAN, createWorks } from "../src/works.ts";
+import { controlDatabase, dropControlDatabase } from "./control.ts";
 
 const here = resolve(import.meta.dirname, "..");
 const root = resolve(here, "../..");
 const bin = (name: string): string => join(process.env.CARGO_TARGET_DIR ?? join(root, "target"), "debug", name);
 const execFileAsync = promisify(execFile);
 const pg = process.env.ORBITAL_PG;
+/** 이 테스트의 `orbitald` 가 기록을 두는 control database. */
+const control = controlDatabase();
 const skip = pg === undefined ? "ORBITAL_PG 가 없어 건너뜁니다. scripts/pg-local.sh 로 띄워 주세요" : false;
 
 /** 팩토리의 service key. 어디에 새어도 찾을 수 있게 드문 글자로 짓는다 */
@@ -306,6 +309,7 @@ before(async () =>
             PATH: process.env.PATH ?? "",
             ORBITAL_HOME: join(scratch, "layer"),
             ORBITAL_PG: pg,
+            ORBITAL_CONTROL_DB: control,
             ORBITAL_SERVICE_KEYS: `factory=${SERVICE_KEY}`,
             // 팩토리의 메일 키 없이 운영에 올린다. 개발용 메일함을 명시해 켠다
             ORBITAL_DEV_MAIL: "outbox",
@@ -400,6 +404,10 @@ after(async () =>
     finally
     {
         orbitald?.kill();
+        if (pg !== undefined)
+        {
+            dropControlDatabase(pg, control);
+        }
         relay?.close();
         relay?.closeAllConnections();
         if (scratch !== "")

@@ -1,4 +1,5 @@
-//! 봉인. 팩토리가 넣은 키(Resend 의 API 키, Google 클라이언트의 비밀)는 레이어의 기록에 봉인한 글로만 둔다.
+//! 봉인. 팩토리가 넣은 키(Resend 의 API 키, Google 클라이언트의 비밀), 밖에서 넣는 비밀(금고), 운영의 신원 열쇠와 레이어가 만든 비밀은
+//! 레이어의 기록(control database)에 봉인한 글로만 둔다.
 //!
 //! XChaCha20-Poly1305(AEAD, `chacha20poly1305` crate)로 봉인한다. 일회값은 봉인할 때마다 무작위 24바이트라 겹칠 걱정이 없다.
 //! 봉인에는 무엇의 봉인인지(조직의 이름과 칸)를 함께 묶어(associated data), 다른 조직의 줄이나 다른 칸에 옮겨 붙이면 풀리지 않는다.
@@ -53,6 +54,12 @@ pub fn secret_binding(organization: &str, instance: &str, stage: &str, name: &st
     format!("orbital/secrets/v1\n{organization}\n{instance}\n{stage}\n{name}")
 }
 
+/// 운영의 신원 열쇠와 레이어가 만든 비밀의 봉인이 무엇의 것인지. 조직 · 인스턴스 · 칸(`identity_key`, `generated.<이름>`) 가운데
+/// 하나라도 다르면 같은 열쇠로도 풀리지 않는다. 머리말이 달라 금고 · 설정의 봉인과도 섞이지 않는다.
+pub fn production_binding(organization: &str, instance: &str, field: &str) -> String {
+    format!("orbital/production/v1\n{organization}\n{instance}\n{field}")
+}
+
 /// 봉인한다. 운영체제의 무작위 값을 얻지 못하면 `None` 이다.
 pub fn seal(key: &SealKey, bound_to: &str, plain: &str) -> Option<String> {
     let mut nonce = [0u8; NONCE];
@@ -101,7 +108,9 @@ pub struct Resealed {
     pub settings: usize,
     /// 금고에서 바꾼 줄.
     pub vault: usize,
-    /// 어느 열쇠로도 풀리지 않아 그대로 둔 줄의 이름(`settings <조직> <칸>`, `vault <인스턴스> <단계> <이름>`).
+    /// 운영의 신원 열쇠와 레이어가 만든 비밀에서 바꾼 칸.
+    pub production: usize,
+    /// 어느 열쇠로도 풀리지 않아 그대로 둔 줄의 이름(`settings <조직> <칸>`, `vault <인스턴스> <단계> <이름>`, `production <인스턴스> <칸>`).
     pub unopened: Vec<String>,
 }
 

@@ -1,21 +1,17 @@
-//! 레이어의 기록을 기반 백업에 묶는다. DB 만 되살리면 기록(인스턴스의 목록 · release · rollout)과 어긋나기 때문이다.
+//! DB 에 없는 레이어의 것을 기반 백업에 묶는다. 코드 저장소(인스턴스의 것과 스캐폴드)다.
 //!
+//! 레이어의 기록(인스턴스의 목록 · release · rollout · 금고 · 팩토리의 설정 · 훈련)은 운영 클러스터의 control database 에 있어
+//! 기반 백업과 WAL 에 함께 든다. 그래서 여기서 묶지 않는다(옛 기록 파일이 남아 있어도 묶지 않는다).
 //! 묶는 것은 이름을 적은 것([`RECORDS`])뿐이다. 그 밖의 파일(토큰의 열쇠, 개발용 메일함, 빌드 결과)은 묶지 않는다.
-//! 봉인의 열쇠와 service key 는 처음부터 기록 밖(환경 변수)에 있어 묶일 수 없다. 금고와 팩토리의 설정은 봉인한 글 그대로 묶인다.
+//! 봉인의 열쇠와 service key 는 처음부터 기록 밖(환경 변수)에 있어 묶일 수 없다.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::{Error, Tools};
 
-/// `ORBITAL_HOME` 에서 묶는 것. 레지스트리, 팩토리의 설정, 금고(봉인한 글), 인스턴스와 스캐폴드의 코드 저장소.
-pub const RECORDS: [&str; 5] = [
-    "registry.json",
-    "settings.json",
-    "vault.json",
-    "sources",
-    "apps",
-];
+/// `ORBITAL_HOME` 에서 묶는 것. 인스턴스와 스캐폴드의 코드 저장소.
+pub const RECORDS: [&str; 2] = ["sources", "apps"];
 
 fn tar() -> Command {
     let mut command = Command::new("tar");
@@ -47,7 +43,7 @@ pub fn pack(home: &Path, into: &Path) -> Result<(), Error> {
         command.arg("--").args(&present);
     }
     Tools::run(command, "레이어의 기록을 묶")?;
-    // 금고와 설정의 봉인한 글이 들어 있다. 주인만 읽는다
+    // 고객의 코드가 들어 있다. 주인만 읽는다
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(into, std::fs::Permissions::from_mode(0o600))
         .map_err(crate::io("기록의 묶음을 좁히"))

@@ -499,12 +499,13 @@ fn 지문에는_이름과_숫자만_있고_행의_값이_없다() {
 }
 
 #[test]
-fn 백업의_묶음에는_봉인의_열쇠와_service_key_가_들어가지_않는다() {
+fn 백업의_묶음에는_봉인의_열쇠와_service_key_가_들어가지_않고_코드_저장소만_든다() {
     let bench = bench!();
     let home = bench.home();
     let seal_key = "not-a-real-seal-key";
     let service_key = "not-a-real-service-key";
     let token_key = "not-a-real-token-key";
+    // 옮기기 전의 옛 기록 파일
     fs::write(home.join("registry.json"), r#"{"instances":{}}"#).unwrap();
     fs::write(home.join("settings.json"), r#"{"sealed":"AAAA"}"#).unwrap();
     fs::write(home.join("vault.json"), r#"{"sealed":"BBBB"}"#).unwrap();
@@ -538,16 +539,9 @@ fn 백업의_묶음에는_봉인의_열쇠와_service_key_가_들어가지_않�
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(
-        names,
-        vec!["registry.json", "settings.json", "sources", "vault.json"]
-    );
+    // 기록은 control database 에 있어 기반 백업에 함께 든다. 남은 옛 기록 파일은 묶지 않는다
+    assert_eq!(names, vec!["sources"]);
     assert!(RECORDS.iter().all(|record| !record.contains("key")));
-    assert_eq!(
-        fs::read_to_string(into.join("vault.json")).unwrap(),
-        r#"{"sealed":"BBBB"}"#,
-        "금고는 봉인한 글 그대로 묶입니다"
-    );
 }
 
 #[test]
