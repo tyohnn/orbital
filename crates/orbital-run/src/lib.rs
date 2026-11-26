@@ -486,8 +486,9 @@ mod tests {
     #[test]
     fn 방금_내준_포트는_비어_보여도_다시_내주지_않는다() {
         let port = free_port().unwrap();
-        // 받은 쪽이 아직 듣지 않아 포트는 비어 있다. 그래도 장부가 내준 것으로 안다
-        assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+        // 받은 쪽이 아직 듣지 않아 포트는 비어 보인다. 그래도 장부가 내준 것으로 안다.
+        // 비어 있는지는 재지 않는다: 같은 바이너리의 다른 테스트가 나가는 연결(`wait_for_port`)에 운영체제가 이 포트를 잠깐 줄 수 있어
+        // 「지금 비어 있다」는 이 기계 전체에서는 참이라고 장담할 수 없다(그것이 이 장부가 있는 까닭이다)
         assert!(handed(port));
         let others: Vec<u16> = (0..200).map(|_| free_port().unwrap()).collect();
         assert!(!others.contains(&port));
