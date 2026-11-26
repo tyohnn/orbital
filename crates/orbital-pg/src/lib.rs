@@ -21,6 +21,7 @@ pub mod identity;
 pub mod migrations;
 pub mod oauth;
 pub mod rehearsal;
+pub mod retire;
 
 #[derive(Debug)]
 pub enum Error {
@@ -35,6 +36,10 @@ pub enum Error {
     Busy,
     /// 되돌릴 지점이 없다.
     NoSuchPoint,
+    /// 선언에서 뺀 역할이 아직 무엇의 주인이다. 걷지 않았다.
+    RoleOwnsObjects { role: String },
+    /// 선언에서 뺀 역할이 이 인스턴스 밖의 database 에서 권한을 갖고 있다. 걷지 않았다.
+    RoleUsedElsewhere { role: String },
 }
 
 impl fmt::Display for Error {
@@ -55,6 +60,14 @@ impl fmt::Display for Error {
                 "원본 database 에 다른 연결이 있어 복제하지 못했습니다. 잠시 뒤에 다시 해 주세요"
             ),
             Self::NoSuchPoint => write!(f, "되돌릴 지점이 없습니다"),
+            Self::RoleOwnsObjects { role } => write!(
+                f,
+                "선언에서 뺀 역할 `{role}` 이 아직 무엇(표 · 시퀀스 · 함수 같은)의 주인이라 걷지 않았습니다. 승격을 멈췄습니다. 그 주인을 소유자로 옮기는 마이그레이션을 더하거나 역할을 선언에 남겨 주세요"
+            ),
+            Self::RoleUsedElsewhere { role } => write!(
+                f,
+                "선언에서 뺀 역할 `{role}` 이 이 인스턴스 밖의 database 에서 권한을 갖고 있어 걷지 않았습니다. 승격을 멈췄습니다. 사람이 확인해야 합니다"
+            ),
         }
     }
 }

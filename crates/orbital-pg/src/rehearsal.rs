@@ -110,7 +110,7 @@ impl Admin {
             .map_err(pg("사본의 권한을 걷"))
     }
 
-    fn open(&mut self, database: &str, open: bool) -> Result<(), Error> {
+    pub(crate) fn open(&mut self, database: &str, open: bool) -> Result<(), Error> {
         self.cluster
             .batch_execute(&format!(
                 "ALTER DATABASE {} ALLOW_CONNECTIONS {open}",
