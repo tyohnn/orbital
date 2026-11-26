@@ -222,7 +222,7 @@ test("운영의 답에는 일정마다 도는 업무 역할과 다음 때와 마
     ]);
 });
 
-test("다른 기계에 놓인 인스턴스라 관리 서버가 하지 않은 일은 421 과 놓인 기계의 이름으로 알린다", async () =>
+test("다른 기계에 놓인 인스턴스라 관리 서버가 하지 않은 일은 421 이나 502 와 놓인 기계의 이름으로 알린다", async () =>
 {
     const misplaced = async (): Promise<Response> => new Response(
         JSON.stringify({ error: "misplaced", message: "이 인스턴스는 다른 기계(`a`)에 놓여 있습니다", details: [], machine: "a" }),
@@ -237,6 +237,14 @@ test("다른 기계에 놓인 인스턴스라 관리 서버가 하지 않은 일
         assert.equal(error.machine, "a");
         return true;
     });
+    // 놓인 기계의 주소는 아는데 닿지 못했으면 502 와 그 기계의 이름이다
+    const unreachable = async (): Promise<Response> => new Response(
+        JSON.stringify({ error: "machine_unreachable", message: "놓인 기계(`a`)의 관리 서버에 닿지 못했습니다", details: [], machine: "a" }),
+        { status: 502, headers: { "content-type": "application/json" } },
+    );
+    const far = createOrbital({ url: "http://layer.invalid/", serviceKey: SERVICE_KEY, fetch: unreachable as typeof fetch });
+    await assert.rejects(far.instances.destroy("i1234567890"), (error: unknown) =>
+        error instanceof OrbitalError && error.status === 502 && error.code === "machine_unreachable" && error.machine === "a");
     // 다른 거절에는 기계가 없다
     const missing = async (): Promise<Response> => new Response(
         JSON.stringify({ error: "not_found", message: "없습니다", details: [] }),

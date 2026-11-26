@@ -350,7 +350,10 @@ export interface Work
 
 /**
  * 관리 서버가 받지 않은 요청. `code` 로 갈라 다루고 `message` 와 `details` 는 사람과 에이전트에게 보여 준다.
- * 인스턴스(또는 앱)가 다른 기계에 놓여 있어 이 관리 서버가 하지 않았으면 `status` 421 · `code` `misplaced` 이고 `machine` 에 놓인 기계의 이름이 있다.
+ * 인스턴스(또는 앱)가 다른 기계에 놓여 있으면 관리 서버는 놓인 기계의 주소를 알 때 요청을 그 기계로 넘기고 그 답을 그대로 돌려준다.
+ * 넘기지 못했으면 `machine` 에 놓인 기계의 이름이 있고, 받은 관리 서버는 아무것도 하지 않았다. 주소를 모르거나 넘겨받은 요청이면
+ * `status` 421 · `code` `misplaced`, 주소는 아는데 닿지 못했으면 502 · `machine_unreachable`, 넘긴 뒤 답을 받기 전에 끊겼으면
+ * 502 · `machine_interrupted`(놓인 기계에서 일이 되었는지는 모른다)다.
  */
 export class OrbitalError extends Error
 {
