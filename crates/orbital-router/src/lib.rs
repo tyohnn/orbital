@@ -9,6 +9,10 @@
 //! 쿠키를 심지도 못하게 한다.
 //!
 //! 판정(가르기 · 들여보내기 · 돌아갈 곳 · Origin · 정적 파일의 경로)은 core 의 `orbital_core::auth` 가 한다. 여기서는 그 답대로 움직인다.
+//!
+//! 하위 도메인으로 가르는 레이어에서 그 인스턴스가 다른 기계에 놓여 있으면, 요청을 놓인 기계의 공용 listener 로 날것 그대로 넘긴다([`Hosts::relay`]).
+//! 넘기는 쪽은 세션을 확인하지도 신원을 붙이지도 않는다. 신원이 앱에 닿는 길은 놓인 기계의 router 하나다. 넘기는 쪽도 밖에서 온
+//! `x-orbital-` 머리말을 지우고, 다시 넘기지 말라는 [`FORWARDED_BY`] 하나만 붙인다. 받는 쪽의 router 는 그것까지 지운 뒤 앱에 넘긴다.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -54,6 +58,11 @@ pub const BROWSER_COOKIE: &str = "__Host-orbital-browser";
 pub const IDENTITY_HEADER: &str = "x-orbital-identity";
 /// 레이어가 일정으로 부른 요청에 싣는 머리말. 값은 그 일정을 가리킨다(`Schedule::key`). 밖에서 온 것은 언제나 지우므로 router 만 붙인다.
 pub const SCHEDULE_HEADER: &str = "x-orbital-schedule";
+/// 다른 기계에서 넘겨받은 요청에 붙는 머리말. 값은 넘긴 기계의 이름이다. 권한을 주지 않고 「다시 넘기지 말라」는 뜻만 있다.
+/// `x-orbital-` 로 시작하므로 router 가 앱에 넘기기 전에 지운다.
+pub const FORWARDED_BY: &str = "x-orbital-forwarded-by";
+/// 놓인 기계의 공용 listener 에 연결을 맺기를 기다리는 시간.
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LAYER_COOKIE_PREFIX: &str = "__Host-orbital-";
 const LAYER_HEADER_PREFIX: &str = "x-orbital-";
 /// 앱에 싣는 신원이 읽히는 시간. 요청 하나를 처리하는 동안만 쓰면 된다.
@@ -735,31 +744,45 @@ impl Router {
     }
 }
 
-/// 받은 연결마다 요청을 듣는다. 요청마다 어느 router 가 답할지 `pick` 이 고른다. 이 future 를 내리면(abort) 붙어 있던 연결도 모두 내린다.
-async fn accept<F>(listener: TcpListener, pick: Arc<F>) -> std::io::Result<()>
-where
-    F: Fn(&Request<Incoming>) -> Option<Router> + Send + Sync + 'static,
-{
+/// 요청 하나에 답하는 것. [`accept`] 가 연결마다 부른다.
+type Answer = Arc<
+    dyn Fn(Request<Incoming>) -> Pin<Box<dyn std::future::Future<Output = Response<Body>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// 받은 연결마다 요청을 듣는다. 요청마다 `answer` 가 답한다. 이 future 를 내리면(abort) 붙어 있던 연결도 모두 내린다.
+async fn accept(listener: TcpListener, answer: Answer) -> std::io::Result<()> {
     let mut connections = JoinSet::new();
     loop {
         let (stream, _) = listener.accept().await?;
         while connections.try_join_next().is_some() {}
-        let pick = Arc::clone(&pick);
+        let answer = Arc::clone(&answer);
         connections.spawn(async move {
             let service = service_fn(move |request: Request<Incoming>| {
-                let router = pick(&request);
-                async move {
-                    Ok::<_, Infallible>(match router {
-                        Some(router) => router.state.handle(request).await,
-                        None => error(StatusCode::NOT_FOUND, "not_found"),
-                    })
-                }
+                let answered = answer(request);
+                async move { Ok::<_, Infallible>(answered.await) }
             });
             let _ = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
                 .await;
         });
     }
+}
+
+/// `pick` 이 고른 router 가 답한다. 고르지 못하면 404 다.
+fn answer_with(
+    pick: impl Fn(&Request<Incoming>) -> Option<Router> + Send + Sync + 'static,
+) -> Answer {
+    Arc::new(move |request: Request<Incoming>| {
+        let router = pick(&request);
+        Box::pin(async move {
+            match router {
+                Some(router) => router.state.handle(request).await,
+                None => error(StatusCode::NOT_FOUND, "not_found"),
+            }
+        })
+    })
 }
 
 /// 인스턴스 하나의 router 가 포트 하나를 듣는다(기준 도메인을 주지 않은 레이어).
@@ -772,22 +795,46 @@ pub async fn serve(listener: TcpListener, config: Config) -> std::io::Result<()>
 pub async fn serve_slot(listener: TcpListener, slot: Arc<RwLock<Router>>) -> std::io::Result<()> {
     accept(
         listener,
-        Arc::new(move |_: &Request<Incoming>| slot.read().ok().map(|router| router.clone())),
+        answer_with(move |_: &Request<Incoming>| slot.read().ok().map(|router| router.clone())),
     )
     .await
 }
 
-/// 인스턴스마다의 하위 도메인. 주소 하나에서 `Host` 로 router 를 고른다.
+/// 이 기계에 router 가 없는 곳의 요청을 넘길 곳을 찾는 것. (그 곳, 넘겨받은 요청인가)를 받아 놓인 기계의 공용 listener 의 주소
+/// (`http://호스트:포트`)를 돌려준다. 넘기지 않을 것이면 `None` 이다. 기록을 읽느라 막힐 수 있어 런타임 밖의 스레드에서 부른다.
+pub type Elsewhere = Arc<dyn Fn(&HostTarget, bool) -> Option<String> + Send + Sync>;
+
+/// 인스턴스마다의 하위 도메인. 주소 하나에서 `Host` 로 router 를 고른다. 이 기계에 없는 곳은 놓인 기계로 넘긴다.
 pub struct Hosts {
     base: BaseDomain,
     routers: RwLock<BTreeMap<HostTarget, Router>>,
+    /// 이 기계의 이름. 넘기는 요청의 [`FORWARDED_BY`] 에 싣는다.
+    machine: String,
+    elsewhere: Option<Elsewhere>,
+    client: hyper_util::client::legacy::Client<
+        hyper_util::client::legacy::connect::HttpConnector,
+        Body,
+    >,
 }
 
 impl Hosts {
     pub fn new(base: BaseDomain) -> Arc<Self> {
+        Self::relaying(base, String::new(), None)
+    }
+
+    /// 이 기계(`machine`)에 없는 곳의 요청을 `elsewhere` 가 찾은 기계로 넘기는 하위 도메인의 표.
+    pub fn relaying(base: BaseDomain, machine: String, elsewhere: Option<Elsewhere>) -> Arc<Self> {
+        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        connector.set_connect_timeout(Some(RELAY_CONNECT_TIMEOUT));
         Arc::new(Self {
             base,
             routers: RwLock::new(BTreeMap::new()),
+            machine,
+            elsewhere,
+            client: hyper_util::client::legacy::Client::builder(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .build(connector),
         })
     }
 
@@ -807,25 +854,100 @@ impl Hosts {
         }
     }
 
-    /// 요청이 가는 router. `Host` 머리말만 보고(`X-Forwarded-Host` 같은 것은 믿지 않는다), 판정(대소문자와 끝의 점을 접는 것까지)은 core 가 한다.
+    /// 요청이 가리키는 곳. `Host` 머리말만 보고(`X-Forwarded-Host` 같은 것은 믿지 않는다), 판정(대소문자와 끝의 점을 접는 것까지)은 core 가 한다.
     /// 요청 줄에 주소를 적었으면(absolute-form) 그 주소가 `Host` 와 대소문자만 빼고 같아야 한다.
-    fn pick(&self, request: &Request<Incoming>) -> Option<Router> {
+    fn target(&self, request: &Request<Incoming>) -> Option<HostTarget> {
         let host = request.headers().get(header::HOST)?.to_str().ok()?;
         if let Some(authority) = request.uri().authority()
             && !authority.as_str().eq_ignore_ascii_case(host)
         {
             return None;
         }
-        let target = judge_host(host, &self.base)?;
-        self.routers.read().ok()?.get(&target).cloned()
+        judge_host(host, &self.base)
+    }
+
+    /// 요청 하나에 답한다. 이 기계에 그 곳의 router 가 있으면 그것이 답하고, 없으면 놓인 기계로 넘기거나 404 다.
+    async fn answer(self: Arc<Self>, request: Request<Incoming>) -> Response<Body> {
+        let Some(target) = self.target(&request) else {
+            return error(StatusCode::NOT_FOUND, "not_found");
+        };
+        let router = self
+            .routers
+            .read()
+            .ok()
+            .and_then(|routers| routers.get(&target).cloned());
+        match router {
+            Some(router) => router.state.handle(request).await,
+            None => self.relay(target, request).await,
+        }
+    }
+
+    /// 이 기계에 router 가 없는 곳의 요청을 놓인 기계의 공용 listener 로 날것 그대로 넘긴다.
+    ///
+    /// 세션을 확인하지도 신원을 붙이지도 않는다. 쿠키와 `Host` 는 그대로 간다(로그인이 풀리지 않게). 밖에서 온 `x-orbital-` 머리말은
+    /// 지우고 [`FORWARDED_BY`] 만 붙인다. 넘겨받은 요청은 다시 넘기지 않는다(`elsewhere` 가 core 의 판정으로 `None` 을 준다).
+    /// 본문은 버퍼에 담지 않고 흘려 보내고, 답(깨우기를 기다리는 503 과 `Retry-After` 까지)도 그대로 흘려 돌려준다.
+    async fn relay(&self, target: HostTarget, request: Request<Incoming>) -> Response<Body> {
+        let Some(elsewhere) = self.elsewhere.clone() else {
+            return error(StatusCode::NOT_FOUND, "not_found");
+        };
+        let forwarded = request.headers().contains_key(FORWARDED_BY);
+        let found = tokio::task::spawn_blocking(move || elsewhere(&target, forwarded)).await;
+        let Ok(Some(base)) = found else {
+            return error(StatusCode::NOT_FOUND, "not_found");
+        };
+        let (mut parts, body) = request.into_parts();
+        relay_request_headers(&mut parts.headers);
+        let Ok(machine) = HeaderValue::from_str(&self.machine) else {
+            return error(StatusCode::NOT_FOUND, "not_found");
+        };
+        parts.headers.insert(FORWARDED_BY, machine);
+        let path_and_query = parts
+            .uri
+            .path_and_query()
+            .map_or("/", |whole| whole.as_str());
+        let Ok(uri) = format!("{base}{path_and_query}").parse() else {
+            return error(StatusCode::NOT_FOUND, "not_found");
+        };
+        parts.uri = uri;
+        match self
+            .client
+            .request(Request::from_parts(parts, body.boxed()))
+            .await
+        {
+            Ok(answer) => {
+                let (mut parts, body) = answer.into_parts();
+                drop_hop_by_hop(&mut parts.headers);
+                Response::from_parts(parts, body.boxed())
+            }
+            Err(_) => error(StatusCode::BAD_GATEWAY, "machine_unreachable"),
+        }
+    }
+}
+
+/// 놓인 기계로 넘기기 전에 요청의 머리말을 고른다. 연결 하나에만 걸리는 것과 밖에서 온 `x-orbital-` 머리말을 지운다.
+/// 쿠키는 그대로 둔다. 세션은 놓인 기계의 router 가 확인한다.
+fn relay_request_headers(headers: &mut HeaderMap) {
+    drop_hop_by_hop(headers);
+    let layer: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with(LAYER_HEADER_PREFIX))
+        .cloned()
+        .collect();
+    for name in layer {
+        headers.remove(name);
     }
 }
 
 /// 주소 하나에서 모든 인스턴스의 요청을 받고 `Host` 로 가른다. 모르는 호스트와 기준 도메인 자체는 404 다.
+/// 다른 기계에 놓인 인스턴스의 요청은 놓인 기계로 넘긴다([`Hosts::relaying`]).
 pub async fn serve_hosts(listener: TcpListener, hosts: Arc<Hosts>) -> std::io::Result<()> {
     accept(
         listener,
-        Arc::new(move |request: &Request<Incoming>| hosts.pick(request)),
+        Arc::new(move |request: Request<Incoming>| {
+            let hosts = Arc::clone(&hosts);
+            Box::pin(hosts.answer(request))
+        }),
     )
     .await
 }
@@ -1610,5 +1732,127 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let _ = fs::remove_file(&path);
+    }
+
+    /// 받은 요청의 머리를 본문으로 되돌려 주는 가짜 공용 listener. 넘겨받은 요청을 하나씩 센다.
+    fn upstream() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = Arc::clone(&count);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut head = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    head.len()
+                );
+                let _ = stream.write_all(&head);
+            }
+        });
+        (address, count)
+    }
+
+    /// `address` 에 `Host: host` 로 요청 하나를 보내고 (상태, 본문)을 받는다.
+    fn ask(address: std::net::SocketAddr, host: &str, headers: &[(&str, &str)]) -> (u16, String) {
+        use std::io::{Read as _, Write as _};
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        let mut request =
+            format!("GET /echo?q=1 HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        let status = raw
+            .split(' ')
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0);
+        let body = raw
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_owned())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    #[test]
+    fn 넘기는_쪽은_세션을_보지_않고_밖에서_온_x_orbital_머리말을_지우고_고리_막기_머리말_하나만_붙여_넘긴다()
+     {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (target, count) = upstream();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let asking = Arc::clone(&asked);
+        // 넘겨받은 요청에는 주소를 주지 않는다(레이어에서는 core 의 판정이 이렇게 답한다)
+        let elsewhere: Elsewhere = Arc::new(move |place: &HostTarget, forwarded: bool| {
+            asking.lock().unwrap().push((place.clone(), forwarded));
+            (!forwarded).then(|| target.clone())
+        });
+        let hosts = Hosts::relaying(
+            BaseDomain::parse("orbital.test").unwrap(),
+            "b".to_owned(),
+            Some(elsewhere),
+        );
+        let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let address = listener.local_addr().unwrap();
+        runtime.spawn(serve_hosts(listener, Arc::clone(&hosts)));
+        let host = "k3f9x2ab-preview.orbital.test";
+
+        let (status, seen) = ask(
+            address,
+            host,
+            &[
+                ("Cookie", "__Host-orbital-session=abc; theme=dark"),
+                ("x-orbital-identity", "v2.forged"),
+                ("X-Orbital-Schedule", "web:/tick"),
+                ("Proxy-Authorization", "Basic eA=="),
+            ],
+        );
+        assert_eq!(status, 200, "{seen}");
+        let seen = seen.to_ascii_lowercase();
+        // 쿠키와 Host 와 경로는 그대로, 밖에서 온 x-orbital- 와 연결의 머리말은 지우고, 고리 막기 머리말 하나만 붙인다
+        assert!(seen.starts_with("get /echo?q=1 http/1.1"), "{seen}");
+        assert!(seen.contains(&format!("host: {host}")), "{seen}");
+        assert!(
+            seen.contains("__host-orbital-session=abc; theme=dark"),
+            "{seen}"
+        );
+        assert!(seen.contains("x-orbital-forwarded-by: b"), "{seen}");
+        assert_eq!(seen.matches("x-orbital-").count(), 1, "{seen}");
+        assert!(!seen.contains("proxy-authorization"), "{seen}");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 밖에서 고리 막기 머리말을 붙여 오면 넘기지 않는다
+        let (status, _) = ask(address, host, &[(FORWARDED_BY, "a")]);
+        assert_eq!(status, 404);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(
+            asked,
+            vec![
+                (
+                    HostTarget::Preview(orbital_core::name::InstanceId::parse("k3f9x2ab").unwrap()),
+                    false
+                ),
+                (
+                    HostTarget::Preview(orbital_core::name::InstanceId::parse("k3f9x2ab").unwrap()),
+                    true
+                ),
+            ]
+        );
+        // 기준 도메인 밖의 호스트는 찾지도 않는다
+        let (status, _) = ask(address, "elsewhere.example", &[]);
+        assert_eq!(status, 404);
+        drop(runtime);
     }
 }
