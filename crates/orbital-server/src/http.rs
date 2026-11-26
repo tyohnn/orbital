@@ -961,6 +961,14 @@ pub fn answer(layer: &Layer, mut request: tiny_http::Request) {
         .as_reader()
         .take(limit as u64 + 1)
         .read_to_end(&mut body);
+    if body.len() > limit {
+        // 한도를 넘었다. 남은 본문을 한도만큼 더 읽어 버린 뒤에 거절한다. 읽지 않은 본문을 두고 닫으면 보내던 쪽(git)은
+        // 연결이 끊긴 것만 보고 413 을 받지 못할 수 있다. 버리는 양에 상한을 둬, 끝없이 보내는 쪽에 붙들리지 않는다
+        let _ = std::io::copy(
+            &mut request.as_reader().take(limit as u64),
+            &mut std::io::sink(),
+        );
+    }
     let reply = if read.is_err() || body.len() > limit {
         problem(
             413,
