@@ -12,8 +12,17 @@
 //!   같은 이름을 보는 관리 서버들은 같은 기록을 본다. 인스턴스의 어떤 역할도 이 database 에 접속하지 못한다(`PUBLIC` 의 접속을 걷는다)
 //! - `ORBITAL_MACHINE`: 이 관리 서버의 기계 이름(기본 `local`, 소문자 · 숫자 · 밑줄 24자까지). 이 서버가 세운 인스턴스가 이 기계에 놓이고,
 //!   그 인스턴스의 코드 저장소 · 빌드 · 프로세스에 닿는 일(git · 프리뷰 · 승격 · 되살리기 · 지우기)은 이 기계의 관리 서버만 한다.
-//!   다른 기계의 관리 서버는 421 과 놓인 기계의 이름으로 답한다. 다시 뜰 때는 이 기계에 놓인 운영만 되살린다.
+//!   다른 기계의 관리 서버는 그 기계의 주소(`ORBITAL_MACHINE_URL`)를 알면 요청을 그대로 넘기고, 모르면 421 과 놓인 기계의 이름으로 답한다.
+//!   다시 뜰 때는 이 기계에 놓인 운영만 되살린다.
 //!   같은 이름으로는 관리 서버가 하나만 뜬다. 살아 있는 것이 있으면 5초 기다려 본 뒤 뜨지 않는다(다른 기계에는 다른 이름을 준다)
+//! - `ORBITAL_MACHINE_URL`: 다른 관리 서버에서 닿는 이 관리 서버의 주소(`http://10.0.0.5:7400` 처럼 스킴 · 호스트 · 포트만). 뜰 때 기록에 적고,
+//!   다른 기계가 받은 이 기계에 놓인 인스턴스의 요청(git · 프리뷰 · 승격 · 앱 올리기 · 인스턴스 만들기 같은)을 이리로 넘긴다. 넘긴 요청에는
+//!   `x-orbital-forwarded-by` 가 붙고, 그런 요청은 다시 넘기지 않는다(그 머리말은 권한을 주지 않는다. 토큰과 service key 는 여기서 다시 판정한다).
+//!   주지 않으면 기록의 주소를 비우고, 다른 기계는 421 로 답한다. 연결을 맺는 데 5초를 넘기면 502(`machine_unreachable`)다.
+//!   이 주소는 관리 서버끼리만 닿는 망에 둔다. 관리 서버들은 같은 service key 와 `ORBITAL_TOKEN_KEY` 를 받아야 넘겨진 요청이 통한다
+//! - `ORBITAL_MACHINE_ROUTER_URL`: 다른 관리 서버에서 닿는 이 기계의 공용 listener(`ORBITAL_ROUTER_LISTEN`)의 주소(`http://` 만).
+//!   하위 도메인을 쓰는 레이어에서, 다른 기계가 받은 이 기계에 놓인 인스턴스의 고객 요청을 이리로 날것 그대로 넘긴다(세션과 신원은 이 기계의 router 가 본다).
+//!   주지 않으면 다른 기계는 그 하위 도메인에 404 로 답한다
 //! - `ORBITAL_TOKEN_KEY`: 작업의 토큰과 Google 의 `state` 에 서명하는 열쇠(32바이트 이상을 hex 로). 관리 서버가 여럿이면 모두 같은 값을 준다.
 //!   없으면 `ORBITAL_HOME/token.key` 를 쓴다(없으면 만든다). 기록(control database)과 백업에는 두지 않는다
 //! - `ORBITAL_SEAL_KEY`: 팩토리가 넣은 키(Resend · Google), 밖에서 넣는 비밀(금고), 운영의 신원 열쇠와 레이어가 만든 비밀을 기록에 봉인하는 열쇠.
@@ -285,6 +294,12 @@ fn start() -> Result<(), String> {
         )?,
         machine: name("ORBITAL_MACHINE", orbital_server::records::DEFAULT_MACHINE)?,
         token_key,
+        machine_url: std::env::var("ORBITAL_MACHINE_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty()),
+        machine_router_url: std::env::var("ORBITAL_MACHINE_ROUTER_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty()),
         ..Options::new(
             setting("ORBITAL_HOME")?.into(),
             setting("ORBITAL_PG")?,

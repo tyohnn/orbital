@@ -386,7 +386,7 @@ impl Layer {
             match self.records.instance(instance.as_str())? {
                 Some(record) if record.organization == organization => {
                     // 업데이트를 인스턴스의 저장소에 가져다 두므로 모든 인스턴스가 이 기계에 놓여 있어야 한다
-                    if let Err(Failure::Misplaced { machine }) =
+                    if let Err(Failure::Misplaced { machine, .. }) =
                         self.placed(&record, Errand::CreateRollout)
                     {
                         misplaced.get_or_insert(machine);
@@ -413,7 +413,10 @@ impl Layer {
             }
         };
         if let Some(machine) = misplaced {
-            return Err(Failure::Misplaced { machine });
+            return Err(Failure::Misplaced {
+                machine,
+                errand: Errand::CreateRollout,
+            });
         }
         // 한 인스턴스는 같은 앱의 열린 rollout 하나에만 든다
         for (id, record) in &self.records.rollouts()? {

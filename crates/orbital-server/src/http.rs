@@ -9,7 +9,12 @@
 //! 밖에서 넣는 비밀(`/v1/instances/{id}/secrets`)의 값은 service key 와 입력 표(`POST /v1/secret-entries`, 표는 `Authorization: Bearer`)로만 들어오고 어떤 열쇠로도 나가지 않는다.
 //! 입력 표의 길은 쿠키도 키도 보지 않고 표만 보며, 사람의 브라우저(팩토리의 카드)가 다른 출처에서 부르므로 CORS 를 연다.
 //! 무엇이 허락되는지는 여기서 정하지 않는다. 토큰은 core 의 `scope::judge` 가, 승격은 core 의 `release::promote` 가 판정한다.
+//!
+//! 인스턴스(또는 앱)가 다른 기계에 놓여 있어 레이어가 아무것도 하지 않고 거절하면(`Failure::Misplaced`), 놓인 기계의 주소를 알 때 요청을
+//! 그 기계로 그대로 넘기고 답을 그대로 돌려준다([`crate::forward`]). 넘길지는 core 의 `placement::route` 가 판정한다. 넘겨받은 요청
+//! (`x-orbital-forwarded-by`)은 다시 넘기지 않는다. 넘기기 전에 이 서버가 토큰과 service key 를 판정하고, 놓인 기계도 다시 판정한다.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::sync::Arc;
@@ -17,6 +22,7 @@ use std::sync::Arc;
 use orbital_core::auth::query_value;
 use orbital_core::git::{Route as GitRoute, route as git_route};
 use orbital_core::name::InstanceId;
+use orbital_core::placement::{Route, Unforwarded, route as place_route};
 use orbital_core::release::{Approver, Change, PromoteDenied};
 use orbital_core::scope::{Action, Capability};
 use orbital_core::secrets::Stage as SecretStage;
@@ -24,12 +30,13 @@ use orbital_source::Commit;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::forward::{Outgoing, Relayed, relay};
 use crate::layer::{Exchanged, Failure, Layer, NewRollout};
 use crate::vault::SecretValue;
 
 pub struct Reply {
     pub status: u16,
-    pub content_type: &'static str,
+    pub content_type: Cow<'static, str>,
     pub body: Vec<u8>,
     /// 302 로 보낼 곳. Google 의 콜백만 쓴다.
     pub location: Option<String>,
@@ -39,6 +46,8 @@ pub struct Reply {
     pub challenge: bool,
     /// 흘려 보낼 본문. 있으면 `body` 대신 이것을 조각(chunked)으로 보낸다. git 의 받기(pack)만 쓴다.
     pub stream: Option<Box<dyn std::io::Read + Send>>,
+    /// 그대로 싣는 머리말. 놓인 기계에서 받은 답을 돌려줄 때만 쓴다.
+    pub headers: Vec<(String, String)>,
 }
 
 impl Reply {
@@ -59,24 +68,26 @@ impl Reply {
 fn ok(value: Value) -> Reply {
     Reply {
         status: 200,
-        content_type: "application/json",
+        content_type: Cow::Borrowed("application/json"),
         body: value.to_string().into_bytes(),
         location: None,
         cors: false,
         challenge: false,
         stream: None,
+        headers: Vec::new(),
     }
 }
 
 fn found(location: String) -> Reply {
     Reply {
         status: 302,
-        content_type: "application/json",
+        content_type: Cow::Borrowed("application/json"),
         body: b"{}".to_vec(),
         location: Some(location),
         cors: false,
         challenge: false,
         stream: None,
+        headers: Vec::new(),
     }
 }
 
@@ -84,12 +95,13 @@ fn problem(status: u16, code: &str, message: &str, details: Vec<String>) -> Repl
     let body = json!({ "error": code, "message": message, "details": details });
     Reply {
         status,
-        content_type: "application/json",
+        content_type: Cow::Borrowed("application/json"),
         body: body.to_string().into_bytes(),
         location: None,
         cors: false,
         challenge: false,
         stream: None,
+        headers: Vec::new(),
     }
 }
 
@@ -159,22 +171,125 @@ fn failure(failure: Failure) -> Reply {
         Failure::UnsupportedMediaType(message) => {
             problem(415, "unsupported_media_type", &message, Vec::new())
         }
-        // 인스턴스(또는 앱)가 다른 기계에 놓여 있다. 이 관리 서버는 아무것도 하지 않았고, 놓인 기계의 이름을 함께 싣는다
-        Failure::Misplaced { machine } => {
-            let mut reply = problem(421, "misplaced", "", Vec::new());
-            reply.body = json!({
-                "error": "misplaced",
-                "message": format!(
-                    "이 인스턴스는 다른 기계(`{machine}`)에 놓여 있어 이 관리 서버는 아무것도 하지 않았습니다. 그 기계의 관리 서버로 보내 주세요"
-                ),
-                "details": [],
-                "machine": machine,
-            })
-            .to_string()
-            .into_bytes();
-            reply
-        }
+        // 넘기지 않기로 한 것만 여기 온다([`settle`]). 주소를 모른다고 본다
+        Failure::Misplaced { machine, .. } => misplaced(&machine, Unforwarded::NoAddress),
         Failure::Internal(message) => problem(500, "internal", &message, Vec::new()),
+    }
+}
+
+/// 놓인 기계의 이름을 실은 답. 이 관리 서버는 아무것도 하지 않았다.
+fn on_machine(status: u16, code: &str, message: &str, machine: &str) -> Reply {
+    let mut reply = problem(status, code, message, Vec::new());
+    reply.body = json!({
+        "error": code,
+        "message": message,
+        "details": [],
+        "machine": machine,
+    })
+    .to_string()
+    .into_bytes();
+    reply
+}
+
+/// 다른 기계에 놓여 있어 넘기지도 하지도 않았다(421).
+fn misplaced(machine: &str, why: Unforwarded) -> Reply {
+    let message = match why {
+        Unforwarded::NoAddress => format!(
+            "이 인스턴스는 다른 기계(`{machine}`)에 놓여 있고 그 기계의 주소가 기록에 없어 넘기지 못했습니다. 이 관리 서버는 아무것도 하지 않았습니다. 그 기계의 관리 서버로 보내거나, 그 기계의 관리 서버에 `ORBITAL_MACHINE_URL` 을 주고 다시 띄워 주세요"
+        ),
+        Unforwarded::AlreadyForwarded => format!(
+            "다른 관리 서버가 넘겨 준 요청인데 이 인스턴스는 이 기계가 아니라 `{machine}` 에 놓여 있습니다. 넘겨받은 요청은 다시 넘기지 않으므로 이 관리 서버는 아무것도 하지 않았습니다. 기록에 적힌 기계의 주소(`ORBITAL_MACHINE_URL`)가 다른 기계를 가리키지 않는지 확인해 주세요"
+        ),
+    };
+    on_machine(421, "misplaced", &message, machine)
+}
+
+/// 받은 요청 하나. 놓인 기계로 넘길 때 받은 그대로 넘긴다.
+#[derive(Clone, Copy)]
+pub struct Call<'a> {
+    pub method: &'a str,
+    /// 경로와 질의.
+    pub path: &'a str,
+    /// `Authorization` 머리말 그대로.
+    pub authorization: Option<&'a str>,
+    pub content_type: Option<&'a str>,
+    pub content_encoding: Option<&'a str>,
+    /// `x-orbital-forwarded-by` 머리말. 있으면 다른 기계에서 넘겨받은 요청이라 다시 넘기지 않는다. 권한은 주지 않는다.
+    pub forwarded_by: Option<&'a str>,
+    pub body: &'a [u8],
+}
+
+/// 거절을 답으로 옮긴다. 다른 기계에 놓여 있어 아무것도 하지 않은 것이면 core 의 판정대로 놓인 기계로 넘기거나 421 로 답한다.
+fn settle(layer: &Layer, call: &Call<'_>, failed: Failure) -> Reply {
+    let Failure::Misplaced { machine, errand } = failed else {
+        return failure(failed);
+    };
+    let forwarded = call.forwarded_by.is_some();
+    // 넘겨받은 요청이면 주소를 읽을 까닭이 없다
+    let address = if forwarded {
+        None
+    } else {
+        match layer.addresses_of(&machine) {
+            Ok(addresses) => addresses.api,
+            Err(error) => return failure(error),
+        }
+    };
+    match (
+        place_route(
+            errand,
+            &machine,
+            layer.machine(),
+            forwarded,
+            address.is_some(),
+        ),
+        address,
+    ) {
+        (Route::Forward { machine }, Some(base)) => forward(layer, call, &machine, &base),
+        (Route::Refuse { machine, why }, _) => misplaced(&machine, why),
+        // 레이어가 이 기계의 일이 아니라고 했는데 core 가 여기서 하라고 하거나, 주소 없이 넘기라고 할 수는 없다
+        _ => failure(Failure::Internal(
+            "놓인 자리의 판정이 엇갈렸습니다".to_owned(),
+        )),
+    }
+}
+
+/// 놓인 기계로 요청을 넘기고 그 답을 그대로 돌려준다.
+fn forward(layer: &Layer, call: &Call<'_>, machine: &str, base: &str) -> Reply {
+    let outgoing = Outgoing {
+        method: call.method,
+        path: call.path,
+        authorization: call.authorization,
+        content_type: call.content_type,
+        content_encoding: call.content_encoding,
+        body: call.body,
+    };
+    match relay(base, layer.machine(), &outgoing) {
+        Relayed::Answered(answered) => Reply {
+            status: answered.status,
+            content_type: Cow::Owned(answered.content_type),
+            body: Vec::new(),
+            location: None,
+            cors: false,
+            challenge: false,
+            stream: Some(answered.body),
+            headers: answered.headers,
+        },
+        Relayed::Unreachable => on_machine(
+            502,
+            "machine_unreachable",
+            &format!(
+                "이 인스턴스가 놓인 기계(`{machine}`)의 관리 서버에 닿지 못해 요청을 넘기지 못했습니다. 이 관리 서버도 그 기계도 아무것도 하지 않았습니다. 그 기계의 관리 서버가 떠 있는지 확인한 뒤 다시 보내 주세요"
+            ),
+            machine,
+        ),
+        Relayed::Interrupted => on_machine(
+            502,
+            "machine_interrupted",
+            &format!(
+                "이 인스턴스가 놓인 기계(`{machine}`)로 요청을 넘겼지만 답을 받기 전에 끊겼습니다. 이 관리 서버는 아무것도 하지 않았지만 그 기계에서 일이 되었는지는 모릅니다. 상태를 확인한 뒤 다시 보내 주세요"
+            ),
+            machine,
+        ),
     }
 }
 
@@ -239,12 +354,13 @@ fn entry(layer: &Layer, method: &str, ticket: Option<&str>, body: &[u8]) -> Repl
         // 브라우저의 사전 요청. 무엇이든 표가 맞는지는 본 요청에서 본다
         "OPTIONS" => Reply {
             status: 204,
-            content_type: "application/json",
+            content_type: Cow::Borrowed("application/json"),
             body: Vec::new(),
             location: None,
             cors: true,
             challenge: false,
             stream: None,
+            headers: Vec::new(),
         },
         "POST" => ticket
             .ok_or(Failure::NotFound)
@@ -348,12 +464,13 @@ fn with_token(
             allow(Action::SourceRead)?;
             Ok(Reply {
                 status: 200,
-                content_type: "application/octet-stream",
+                content_type: Cow::Borrowed("application/octet-stream"),
                 body: layer.source_bundle(&instance)?,
                 location: None,
                 cors: false,
                 challenge: false,
                 stream: None,
+                headers: Vec::new(),
             })
         }
         ("POST", ["source"]) => {
@@ -629,7 +746,7 @@ struct Incoming<'a> {
 /// git 의 길(`/v1/instances/{id}/git/…`). 작업의 토큰으로만 열린다.
 ///
 /// 판정은 다른 토큰의 길과 같다(`Layer::authorize`): 받기는 `SourceRead`, 올리기는 `SourceWrite` 이고, 토큰의 인스턴스 밖은 없는 것과 같다.
-fn git(layer: &Layer, id: &str, tail: &[&str], incoming: &Incoming<'_>) -> Reply {
+fn git(layer: &Layer, id: &str, tail: &[&str], incoming: &Incoming<'_>, call: &Call<'_>) -> Reply {
     let Incoming {
         method,
         query,
@@ -695,16 +812,17 @@ fn git(layer: &Layer, id: &str, tail: &[&str], incoming: &Incoming<'_>) -> Reply
             };
             Reply {
                 status: 200,
-                content_type: route.content_type(),
+                content_type: Cow::Borrowed(route.content_type()),
                 body,
                 location: None,
                 cors: false,
                 challenge: false,
                 stream,
+                headers: Vec::new(),
             }
         }
         Err(Failure::Unauthorized) => challenged(failure(Failure::Unauthorized)),
-        Err(other) => failure(other),
+        Err(other) => settle(layer, call, other),
     }
 }
 
@@ -712,21 +830,34 @@ fn git(layer: &Layer, id: &str, tail: &[&str], incoming: &Incoming<'_>) -> Reply
 ///
 /// 흘려 보낼 본문은 모두 읽어 `body` 에 담아 돌려준다(테스트가 부른다). `Content-Type` 은 싣지 않은 것으로 본다.
 pub fn handle(layer: &Layer, method: &str, path: &str, bearer: Option<&str>, body: &[u8]) -> Reply {
-    handle_request(layer, method, path, bearer, None, false, body).drained()
+    let authorization = bearer.map(|bearer| format!("Bearer {bearer}"));
+    handle_call(
+        layer,
+        &Call {
+            method,
+            path,
+            authorization: authorization.as_deref(),
+            content_type: None,
+            content_encoding: None,
+            forwarded_by: None,
+            body,
+        },
+    )
 }
 
-/// 요청 하나를 처리한다. `gzipped` 는 본문이 `Content-Encoding: gzip` 으로 왔는지다(git 이 받는 요청을 줄여 보낸다).
-pub fn handle_request(
-    layer: &Layer,
-    method: &str,
-    path: &str,
-    bearer: Option<&str>,
-    content_type: Option<&str>,
-    gzipped: bool,
-    body: &[u8],
-) -> Reply {
-    let whole = path;
-    let path: Vec<&str> = path
+/// 요청 하나를 처리한다. 흘려 보낼 본문은 모두 읽어 `body` 에 담아 돌려준다(테스트가 머리말까지 정해 부른다).
+pub fn handle_call(layer: &Layer, call: &Call<'_>) -> Reply {
+    handle_request(layer, call).drained()
+}
+
+/// 요청 하나를 처리한다. `Content-Encoding: gzip` 인 본문은 git 의 길만 푼다(git 이 받는 요청을 줄여 보낸다).
+pub fn handle_request(layer: &Layer, call: &Call<'_>) -> Reply {
+    let method = call.method;
+    let body = call.body;
+    let bearer = call.authorization.and_then(credential);
+    let bearer = bearer.as_deref();
+    let whole = call.path;
+    let path: Vec<&str> = whole
         .split('?')
         .next()
         .unwrap_or_default()
@@ -743,11 +874,13 @@ pub fn handle_request(
             method,
             query,
             credential: bearer,
-            content_type,
-            gzipped,
+            content_type: call.content_type,
+            gzipped: call
+                .content_encoding
+                .is_some_and(|value| value.trim() == "gzip"),
             body,
         };
-        return git(layer, id, tail, &incoming);
+        return git(layer, id, tail, &incoming, call);
     }
     // 사람의 브라우저가 입력 표로 값을 보내는 곳. 주소는 고정이고 표는 `Authorization: Bearer` 로만 온다.
     // 레이어 앞의 프록시가 남기는 접근 기록에 표가 실리지 않게 경로에는 싣지 않는다. 쿠키는 보지 않는다
@@ -781,7 +914,7 @@ pub fn handle_request(
     } else {
         with_service_key(layer, method, rest, query, bearer, body)
     };
-    result.unwrap_or_else(failure)
+    result.unwrap_or_else(|failed| settle(layer, call, failed))
 }
 
 /// `Authorization` 머리말의 자격. `Bearer` 는 그대로, `Basic` 은 비밀번호 자리만 꺼낸다(git 의 자격 도우미가 이렇게 보낸다).
@@ -816,9 +949,10 @@ pub fn answer(layer: &Layer, mut request: tiny_http::Request) {
             .find(|header| header.field.equiv(name))
             .map(|header| header.value.as_str().to_owned())
     };
-    let bearer = header("authorization").and_then(|value| credential(&value));
-    let gzipped = header("content-encoding").is_some_and(|value| value.trim() == "gzip");
+    let authorization = header("authorization");
+    let content_encoding = header("content-encoding");
     let content_type = header("content-type");
+    let forwarded_by = header(crate::forward::FORWARDED_BY);
     let method = request.method().as_str().to_owned();
     let path = request.url().to_owned();
     let limit = layer.upload_limit();
@@ -840,16 +974,22 @@ pub fn answer(layer: &Layer, mut request: tiny_http::Request) {
     } else {
         handle_request(
             layer,
-            &method,
-            &path,
-            bearer.as_deref(),
-            content_type.as_deref(),
-            gzipped,
-            &body,
+            &Call {
+                method: &method,
+                path: &path,
+                authorization: authorization.as_deref(),
+                content_type: content_type.as_deref(),
+                content_encoding: content_encoding.as_deref(),
+                forwarded_by: forwarded_by.as_deref(),
+                body: &body,
+            },
         )
     };
-    let header = tiny_http::Header::from_bytes("Content-Type", reply.content_type)
-        .expect("고정된 머리말이다");
+    let header = tiny_http::Header::from_bytes("Content-Type", reply.content_type.as_bytes())
+        .unwrap_or_else(|()| {
+            tiny_http::Header::from_bytes("Content-Type", "application/octet-stream")
+                .expect("고정된 머리말이다")
+        });
     // 흘려 보낼 본문은 길이를 적지 않고 조각(chunked)으로 보낸다. 나머지는 길이를 적어 한 번에 보낸다
     let (reader, length): (Box<dyn Read + Send>, Option<usize>) = match reply.stream {
         Some(stream) => (stream, None),
@@ -865,6 +1005,12 @@ pub fn answer(layer: &Layer, mut request: tiny_http::Request) {
         length,
         None,
     );
+    // 놓인 기계의 답에서 옮긴 머리말
+    for (name, value) in &reply.headers {
+        if let Ok(header) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            response.add_header(header);
+        }
+    }
     if reply.cors {
         for (name, value) in [
             ("Access-Control-Allow-Origin", "*"),

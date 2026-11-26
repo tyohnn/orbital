@@ -26,7 +26,9 @@ use orbital_core::host::{BaseDomain, HostTarget, Scheme, origin as host_origin};
 use orbital_core::manifest::{ServiceKind, ValidManifest};
 use orbital_core::name::{Ident, InstanceId, SecretName};
 use orbital_core::oauth::registrable_redirect;
-use orbital_core::placement::{Errand, judge as judge_place};
+use orbital_core::placement::{
+    Errand, Route as PlaceRoute, judge as judge_place, route as place_route,
+};
 use orbital_core::plan::Names;
 use orbital_core::release::{
     Aftermath, Approval, Approver, BuiltBy, Change, Conformed, FactoryKey, Migrations,
@@ -45,8 +47,8 @@ use orbital_pg::auth::AuthStore;
 use orbital_pg::rehearsal::RestorePoint;
 use orbital_proxy::{Route, serve};
 use orbital_router::{
-    AppServer, Called, Config as RouterConfig, Connect, DocumentFetcher, GoogleDoor, Hosts,
-    HttpsFetcher, Outbox, Resend, Router, SESSION_COOKIE, Stage as RouterStage, Starter,
+    AppServer, Called, Config as RouterConfig, Connect, DocumentFetcher, Elsewhere, GoogleDoor,
+    Hosts, HttpsFetcher, Outbox, Resend, Router, SESSION_COOKIE, Stage as RouterStage, Starter,
     Target as RouterTarget, WakeFailure, serve_hosts, serve_slot, start_on_free_port,
 };
 use orbital_run::{Job, Runner, Running, wait_for_port};
@@ -59,9 +61,11 @@ use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
 use crate::backup::BackupOptions;
+use crate::forward::Remembered;
 use crate::login::{Endpoints, FactoryGoogleDoor, FactoryMailer, exchange, sha256_hex};
 use crate::records::{
-    CONTROL_DATABASE, DEFAULT_MACHINE, MachineHold, REFRESH_CHANNEL, RecordError, Records,
+    CONTROL_DATABASE, DEFAULT_MACHINE, MachineAddresses, MachineHold, REFRESH_CHANNEL, RecordError,
+    Records,
 };
 use crate::registry::{
     InstanceRecord, ProductionRecord, ReleaseRecord, ScheduleRecord, ScheduleRun,
@@ -105,9 +109,11 @@ pub enum Failure {
     Gone(String),
     /// 요청의 `Content-Type` 을 받지 않는다(git 의 길).
     UnsupportedMediaType(String),
-    /// 인스턴스(또는 앱)가 다른 기계에 놓여 있어 이 관리 서버는 하지 않는다. 놓인 기계의 이름을 싣는다.
+    /// 인스턴스(또는 앱)가 다른 기계에 놓여 있어 이 관리 서버는 하지 않는다. 놓인 기계의 이름과 무슨 일이었는지를 싣는다.
+    /// 이 관리 서버는 아무것도 하지 않았으므로 HTTP 층이 이 답을 보고 요청을 놓인 기계로 넘길 수 있다.
     Misplaced {
         machine: String,
+        errand: Errand,
     },
     Internal(String),
 }
@@ -606,6 +612,12 @@ pub struct Options {
     /// 작업의 토큰과 Google 의 `state` 에 서명하는 열쇠(`ORBITAL_TOKEN_KEY`, hex). 관리 서버가 여럿이면 모두 같은 열쇠를 줘야 한쪽이 낸 토큰을
     /// 다른 쪽이 받는다. 주지 않으면 `ORBITAL_HOME/token.key` 를 쓴다(없으면 만든다). 기록(control database)에는 두지 않는다.
     pub token_key: Option<Vec<u8>>,
+    /// 다른 관리 서버에서 닿는 이 관리 서버의 주소(`ORBITAL_MACHINE_URL`, 예: `http://10.0.0.5:7400`). 기록에 적어 두면 다른 기계가 받은
+    /// 이 기계에 놓인 인스턴스의 요청을 이리로 넘긴다. 없으면 다른 기계는 넘기지 않고 421 로 답한다.
+    pub machine_url: Option<String>,
+    /// 다른 관리 서버에서 닿는 이 기계의 공용 listener(`ORBITAL_MACHINE_ROUTER_URL`, `http://` 만). 하위 도메인을 쓰는 레이어에서
+    /// 다른 기계가 받은 이 기계에 놓인 인스턴스의 고객 요청을 이리로 넘긴다. 없으면 다른 기계는 그 요청에 404 로 답한다.
+    pub machine_router_url: Option<String>,
 }
 
 /// 하위 도메인으로 인스턴스를 가르는 레이어의 설정.
@@ -649,7 +661,35 @@ impl Options {
             control_database: Ident::parse(CONTROL_DATABASE).expect("기본 이름은 맞는 이름이다"),
             machine: Ident::parse(DEFAULT_MACHINE).expect("기본 이름은 맞는 이름이다"),
             token_key: None,
+            machine_url: None,
+            machine_router_url: None,
         }
+    }
+}
+
+/// 기계의 주소를 읽는다. 스킴과 호스트(와 포트)만 있어야 하고 끝의 `/` 는 뗀다. `secure` 가 아니면 `http://` 만 받는다.
+pub fn machine_address(text: &str, name: &str, secure: bool) -> Result<String, String> {
+    let trimmed = text.trim().trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://").filter(|_| secure));
+    let schemes = if secure {
+        "`http://` 나 `https://`"
+    } else {
+        "`http://`"
+    };
+    match rest {
+        Some(authority)
+            if !authority.is_empty()
+                && authority.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')
+                }) =>
+        {
+            Ok(trimmed.to_owned())
+        }
+        _ => Err(format!(
+            "`{name}` 는 {schemes} 로 시작하고 호스트와 포트만 적은 주소여야 합니다(예: `http://10.0.0.5:7400`). 경로 · 질의 · 사용자 이름은 적지 않습니다"
+        )),
     }
 }
 
@@ -751,6 +791,44 @@ fn auth_failure(error: orbital_pg::auth::AuthError) -> Failure {
         other => internal(other),
     }
 }
+
+/// 이 기계에 router 가 없는 하위 도메인의 요청을 넘길 곳(놓인 기계의 공용 listener). 판정은 core 의 `placement::route` 가 한다.
+/// 기록을 읽지 못하거나 인스턴스가 없거나 주소를 모르거나 넘겨받은 요청이면 넘기지 않는다(router 가 404 로 답한다).
+///
+/// 찾은 것은 잠깐 기억한다([`Remembered`]). 고객의 요청마다 기록을 읽지 않고, 모르는 하위 도메인으로 요청을 쏟아부어도 기록에 붙는
+/// 연결이 늘지 않는다. 넘겨받은 요청은 기록을 읽지 않고 바로 거절한다(core 의 판정이 주소와 상관없이 그렇게 답한다).
+fn elsewhere(records: Arc<Records>) -> Elsewhere {
+    let remembered = Remembered::new(RELAY_REMEMBER, RELAY_REMEMBER_LIMIT);
+    Arc::new(move |target: &HostTarget, forwarded: bool| {
+        // 넘겨받은 요청은 어디에 놓였든 다시 넘기지 않는다(core 의 속성 테스트가 지키는 규칙). 기록을 읽을 까닭이 없다
+        if forwarded {
+            return None;
+        }
+        let find = || -> Option<String> {
+            let record = records.instance(target.instance().as_str()).ok()??;
+            let address = if record.machine == records.machine() {
+                None
+            } else {
+                records.addresses_of(&record.machine).ok()?.router
+            };
+            match place_route(
+                Errand::Traffic,
+                &record.machine,
+                records.machine(),
+                forwarded,
+                address.is_some(),
+            ) {
+                PlaceRoute::Forward { .. } => address,
+                PlaceRoute::Here | PlaceRoute::Refuse { .. } => None,
+            }
+        };
+        remembered.address(target.instance().as_str(), Instant::now(), find)
+    })
+}
+
+/// 하위 도메인의 요청을 넘길 곳을 기억하는 시간과, 기억하는 곳의 상한.
+const RELAY_REMEMBER: Duration = Duration::from_secs(5);
+const RELAY_REMEMBER_LIMIT: usize = 4096;
 
 /// 같은 기계 이름으로 뜬 앞의 관리 서버가 내려가기를 기다려 주는 시간. 넘으면 뜨지 않는다.
 const MACHINE_WAIT: Duration = Duration::from_secs(5);
@@ -868,6 +946,19 @@ impl Layer {
                     .to_owned(),
             );
         }
+        // 기계의 주소는 기록에 닿기 전에 읽는다. 틀린 주소로는 뜨지 않는다
+        let addresses = MachineAddresses {
+            api: options
+                .machine_url
+                .as_deref()
+                .map(|url| machine_address(url, "ORBITAL_MACHINE_URL", true))
+                .transpose()?,
+            router: options
+                .machine_router_url
+                .as_deref()
+                .map(|url| machine_address(url, "ORBITAL_MACHINE_ROUTER_URL", false))
+                .transpose()?,
+        };
         // 기록은 control database 에 있다. 처음 뜨면 세우고 마이그레이션을 적용한 뒤, 옛 기록 파일이 있으면 한 번 옮긴다
         let records = Arc::new(Records::open(
             &options.pg_url,
@@ -886,6 +977,8 @@ impl Layer {
                     options.machine.as_str()
                 )
             })?;
+        // 이름을 쥔 뒤에 주소를 적는다. 같은 이름으로 뜨려다 막힌 관리 서버는 앞의 서버의 주소를 덮지 못한다
+        records.set_addresses(&addresses).map_err(|error| error.0)?;
         if let Some(count) = records.import(&options.home, (options.clock)())? {
             eprintln!(
                 "orbitald: 옛 기록 파일을 control database 로 옮겼습니다(인스턴스 {count}개). 옮긴 파일은 `*.imported` 로 이름을 바꿨습니다"
@@ -923,7 +1016,11 @@ impl Layer {
                 let address = listener
                     .local_addr()
                     .map_err(|_| "router 의 주소를 읽지 못했습니다".to_owned())?;
-                let hosts = Hosts::new(hosting.base.clone());
+                let hosts = Hosts::relaying(
+                    hosting.base.clone(),
+                    options.machine.as_str().to_owned(),
+                    Some(elsewhere(Arc::clone(&records))),
+                );
                 let task = runtime.spawn(serve_hosts(listener, Arc::clone(&hosts)));
                 Some(Hosted {
                     hosts,
@@ -1018,6 +1115,11 @@ impl Layer {
     /// 이 관리 서버의 기계.
     pub fn machine(&self) -> &str {
         self.records.machine()
+    }
+
+    /// 그 기계의 주소(기록에 적힌 것). 다른 기계에 놓인 것의 요청을 넘길 때 HTTP 층이 읽는다.
+    pub fn addresses_of(&self, machine: &str) -> Outcome<MachineAddresses> {
+        Ok(self.records.addresses_of(machine)?)
     }
 
     /// 알림을 듣는 연결. 붙지 못하면 `None` 이다.
@@ -1479,6 +1581,7 @@ impl Layer {
         judge_place(errand, &record.machine, self.machine()).map_err(|misplaced| {
             Failure::Misplaced {
                 machine: misplaced.machine,
+                errand,
             }
         })
     }
@@ -1525,7 +1628,10 @@ impl Layer {
             .records
             .claim_app(organization, app.as_str(), (self.clock)())?;
         if machine != self.machine() {
-            return Err(Failure::Misplaced { machine });
+            return Err(Failure::Misplaced {
+                machine,
+                errand: Errand::App,
+            });
         }
         receive_scaffold(&self.app_path(organization, &app)?, bundle).map_err(|error| match error {
             SourceError::BadBundle => Failure::Problems(vec![error.to_string()]),
@@ -1536,7 +1642,10 @@ impl Layer {
     /// 앱의 코드 저장소가 이 기계에 있는지 본다. 다른 기계에 있으면 그 기계의 이름으로 답한다.
     fn app_here(&self, organization: &str, app: &Ident) -> Outcome<()> {
         match self.records.app_machine(organization, app.as_str())? {
-            Some(machine) if machine != self.machine() => Err(Failure::Misplaced { machine }),
+            Some(machine) if machine != self.machine() => Err(Failure::Misplaced {
+                machine,
+                errand: Errand::App,
+            }),
             _ => Ok(()),
         }
     }

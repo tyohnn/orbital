@@ -36,10 +36,16 @@ pub const DEFAULT_MACHINE: &str = "local";
 pub const REFRESH_CHANNEL: &str = "orbital_refresh";
 
 /// 저장소에 둔 control database 의 마이그레이션(파일 이름, 내용). 번호는 이름의 앞 네 자리다.
-pub const MIGRATIONS: [(&str, &str); 1] = [(
-    "0001_records.sql",
-    include_str!("../migrations/0001_records.sql"),
-)];
+pub const MIGRATIONS: [(&str, &str); 2] = [
+    (
+        "0001_records.sql",
+        include_str!("../migrations/0001_records.sql"),
+    ),
+    (
+        "0002_machine_address.sql",
+        include_str!("../migrations/0002_machine_address.sql"),
+    ),
+];
 
 /// 옛 기록 파일. 처음 뜰 때 한 번 옮기고 `<이름>.imported` 로 바꾼다.
 pub const OLD_FILES: [&str; 5] = [
@@ -384,6 +390,15 @@ pub struct Records {
     pg_url: String,
 }
 
+/// 기계의 주소. 다른 관리 서버에서 닿는 것이다. 끝의 `/` 는 없다.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MachineAddresses {
+    /// 관리 API(`ORBITAL_MACHINE_URL`).
+    pub api: Option<String>,
+    /// 하위 도메인으로 고객의 요청을 받는 공용 listener(`ORBITAL_MACHINE_ROUTER_URL`).
+    pub router: Option<String>,
+}
+
 /// 봉인을 다시 한 결과(운영의 신원 열쇠와 레이어가 만든 비밀).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProductionSealed {
@@ -474,6 +489,35 @@ impl Records {
     /// 이 관리 서버의 기계.
     pub fn machine(&self) -> &str {
         self.machine.as_str()
+    }
+
+    /// 이 기계의 주소를 적는다. 주지 않은 주소는 비운다(앞에 띄운 관리 서버가 적은 낡은 주소로 넘기지 않게).
+    /// 기계의 이름을 쥔 뒤에 부른다. 같은 이름으로 뜨려다 막힌 관리 서버가 주소를 덮지 않는다.
+    pub fn set_addresses(&self, addresses: &MachineAddresses) -> Result<(), RecordError> {
+        self.client()?
+            .execute(
+                "UPDATE orbital.machine SET api_url = $2, router_url = $3 WHERE name = $1",
+                &[&self.machine.as_str(), &addresses.api, &addresses.router],
+            )
+            .map(drop)
+            .map_err(pg("기계의 주소를 적"))
+    }
+
+    /// 그 기계의 주소. 기계가 기록에 없으면 주소가 없는 것과 같다.
+    pub fn addresses_of(&self, machine: &str) -> Result<MachineAddresses, RecordError> {
+        let row = self
+            .client()?
+            .query_opt(
+                "SELECT api_url, router_url FROM orbital.machine WHERE name = $1",
+                &[&machine],
+            )
+            .map_err(pg("기계의 주소를 읽"))?;
+        Ok(
+            row.map_or_else(MachineAddresses::default, |row| MachineAddresses {
+                api: row.get(0),
+                router: row.get(1),
+            }),
+        )
     }
 
     /// control database 의 이름.
