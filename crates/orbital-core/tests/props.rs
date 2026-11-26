@@ -1486,3 +1486,64 @@ mod cron {
         }
     }
 }
+
+// ---- 놓인 자리와 넘겨 주기 ----
+
+mod placement {
+    use orbital_core::placement::{Errand, Route, Unforwarded, route};
+    use proptest::prelude::*;
+
+    /// 어느 기계나 하는 일. 구현의 `reach` 를 부르지 않고 따로 적는다(기록과 인스턴스의 DB 에만 닿는 일).
+    const ANYWHERE: [Errand; 5] = [
+        Errand::Work,
+        Errand::ProductionView,
+        Errand::Users,
+        Errand::Secrets,
+        Errand::Rollout,
+    ];
+
+    fn errand() -> impl Strategy<Value = Errand> {
+        proptest::sample::select(Errand::ALL.to_vec())
+    }
+
+    /// 기계의 이름은 셋뿐이라 같은 기계와 다른 기계가 자주 나온다. `a` 와 `ab` 는 머리가 겹친다.
+    fn machine() -> impl Strategy<Value = &'static str> {
+        proptest::sample::select(vec!["a", "ab", "b"])
+    }
+
+    proptest! {
+        #[test]
+        fn 어떤_일이든_넘겨받은_요청은_다시_넘기지_않는다(
+            errand in errand(), placed in machine(), here in machine(), known in any::<bool>()
+        ) {
+            let routed = route(errand, placed, here, true, known);
+            prop_assert!(!matches!(routed, Route::Forward { .. }), "{:?}", routed);
+            // 넘기지 않는 대신 하지 않을 일은 「넘겨받았다」는 까닭으로 놓인 기계의 이름과 함께 거절한다
+            if placed != here && !ANYWHERE.contains(&errand) {
+                prop_assert_eq!(routed, Route::Refuse { machine: placed.to_owned(), why: Unforwarded::AlreadyForwarded });
+            }
+        }
+
+        #[test]
+        fn 어느_기계나_하는_일은_넘기지_않고_받은_기계가_한다(
+            errand in proptest::sample::select(ANYWHERE.to_vec()),
+            placed in machine(), here in machine(), forwarded in any::<bool>(), known in any::<bool>()
+        ) {
+            prop_assert_eq!(route(errand, placed, here, forwarded, known), Route::Here);
+        }
+
+        #[test]
+        fn 놓인_기계가_아닌_곳이_처음_받은_놓인_기계의_일은_주소를_알_때만_넘긴다(
+            errand in errand(), placed in machine(), here in machine(), known in any::<bool>()
+        ) {
+            let expected = if placed == here || ANYWHERE.contains(&errand) {
+                Route::Here
+            } else if known {
+                Route::Forward { machine: placed.to_owned() }
+            } else {
+                Route::Refuse { machine: placed.to_owned(), why: Unforwarded::NoAddress }
+            };
+            prop_assert_eq!(route(errand, placed, here, false, known), expected);
+        }
+    }
+}

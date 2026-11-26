@@ -1,7 +1,8 @@
 //! 놓인 자리. 인스턴스는 그것을 세운 관리 서버의 기계에 놓인다. 코드 저장소 · 빌드 폴더 · 떠 있는 프로세스가 그 기계에만 있어서다.
 //!
 //! 관리 서버의 일 가운데 그 파일과 프로세스에 닿는 일은 놓인 기계만 하고, 기록(control database)과 인스턴스의 DB 에만 닿는 일은
-//! 어느 기계든 한다. 어느 일이 어느 쪽인지를 여기 한곳에 적는다. 다른 기계는 일을 하지 않고 「다른 기계에 놓여 있다」고 답한다.
+//! 어느 기계든 한다. 어느 일이 어느 쪽인지를 여기 한곳에 적는다. 다른 기계는 일을 하지 않고, 놓인 기계의 주소를 알면 요청을 그 기계로
+//! 넘기고 모르면 「다른 기계에 놓여 있다」고 답한다(`route`). 넘겨받은 요청은 다시 넘기지 않는다.
 
 use serde::{Deserialize, Serialize};
 
@@ -41,10 +42,14 @@ pub enum Errand {
     Secrets,
     /// rollout 을 보기 · 다시 열기 · 거두기.
     Rollout,
+    /// 앱의 스캐폴드를 받기와 그 앱에서 인스턴스를 세우기. 앱의 코드 저장소는 처음 받은 기계에 있다.
+    App,
+    /// 고객의 요청(인스턴스의 하위 도메인으로 앱에 가는 것). 그 인스턴스의 router 와 앱의 프로세스는 놓인 기계에만 떠 있다.
+    Traffic,
 }
 
 impl Errand {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::SourceBundle,
         Self::Push,
         Self::Git,
@@ -61,6 +66,8 @@ impl Errand {
         Self::Users,
         Self::Secrets,
         Self::Rollout,
+        Self::App,
+        Self::Traffic,
     ];
 }
 
@@ -87,7 +94,9 @@ pub fn reach(errand: Errand) -> Reach {
         | Errand::Restore
         | Errand::ApplyUpdate
         | Errand::CreateRollout
-        | Errand::Destroy => Reach::Placed,
+        | Errand::Destroy
+        | Errand::App
+        | Errand::Traffic => Reach::Placed,
         Errand::Work
         | Errand::ProductionView
         | Errand::Users
@@ -96,7 +105,7 @@ pub fn reach(errand: Errand) -> Reach {
     }
 }
 
-/// 이 기계가 하지 않는 일. 인스턴스가 놓인 기계의 이름을 싣는다(다음 작업이 이것으로 요청을 넘긴다).
+/// 이 기계가 하지 않는 일. 인스턴스가 놓인 기계의 이름을 싣는다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Misplaced {
     pub machine: String,
@@ -110,6 +119,53 @@ pub fn judge(errand: Errand, placed_on: &str, here: &str) -> Result<(), Misplace
         Reach::Placed => Err(Misplaced {
             machine: placed_on.to_owned(),
         }),
+    }
+}
+
+/// 받은 요청을 어디서 처리하나.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "route")]
+pub enum Route {
+    /// 이 기계가 한다.
+    Here,
+    /// 놓인 기계로 요청을 그대로 넘긴다. 이 기계는 아무것도 하지 않는다.
+    Forward { machine: String },
+    /// 넘기지도 하지도 않고 놓인 기계의 이름으로 답한다(HTTP 의 421).
+    Refuse { machine: String, why: Unforwarded },
+}
+
+/// 놓인 기계로 넘기지 않은 까닭.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unforwarded {
+    /// 다른 기계에서 넘겨받은 요청이다. 다시 넘기면 기록이 엇갈렸을 때 기계 사이를 돌고 돈다.
+    AlreadyForwarded,
+    /// 놓인 기계가 자신의 주소를 기록에 적지 않았다.
+    NoAddress,
+}
+
+/// 이 기계(`here`)가 받은 요청을 어디서 처리하나.
+///
+/// `forwarded` 는 요청이 다른 기계에서 넘겨받은 것인지, `address_known` 은 놓인 기계의 주소가 기록에 있는지다.
+/// 어느 기계나 하는 일과 이 기계에 놓인 것의 일은 여기서 한다. 넘겨받은 요청은 어떤 일이든 다시 넘기지 않는다.
+pub fn route(
+    errand: Errand,
+    placed_on: &str,
+    here: &str,
+    forwarded: bool,
+    address_known: bool,
+) -> Route {
+    match judge(errand, placed_on, here) {
+        Ok(()) => Route::Here,
+        Err(Misplaced { machine }) if forwarded => Route::Refuse {
+            machine,
+            why: Unforwarded::AlreadyForwarded,
+        },
+        Err(Misplaced { machine }) if !address_known => Route::Refuse {
+            machine,
+            why: Unforwarded::NoAddress,
+        },
+        Err(Misplaced { machine }) => Route::Forward { machine },
     }
 }
 
@@ -131,6 +187,8 @@ mod tests {
             Errand::ApplyUpdate,
             Errand::CreateRollout,
             Errand::Destroy,
+            Errand::App,
+            Errand::Traffic,
         ];
         let anywhere = [
             Errand::Work,
@@ -155,5 +213,37 @@ mod tests {
             assert_eq!(judge(errand, "m1", "m1"), Ok(()), "{errand:?}");
             assert_eq!(judge(errand, "m1", "m2"), Ok(()), "{errand:?}");
         }
+    }
+
+    #[test]
+    fn 다른_기계에_놓인_것의_일은_주소를_알면_넘기고_모르거나_넘겨받은_것이면_421_이다() {
+        // 넘기는 끝: 놓인 기계가 다르고, 주소를 알고, 처음 받은 요청
+        assert_eq!(
+            route(Errand::Preview, "a", "b", false, true),
+            Route::Forward {
+                machine: "a".to_owned()
+            }
+        );
+        // 넘기지 않는 끝: 주소를 모른다
+        assert_eq!(
+            route(Errand::Preview, "a", "b", false, false),
+            Route::Refuse {
+                machine: "a".to_owned(),
+                why: Unforwarded::NoAddress
+            }
+        );
+        // 넘기지 않는 끝: 이미 넘겨받은 요청
+        assert_eq!(
+            route(Errand::Preview, "a", "b", true, true),
+            Route::Refuse {
+                machine: "a".to_owned(),
+                why: Unforwarded::AlreadyForwarded
+            }
+        );
+        // 놓인 기계가 받은 요청은 넘겨받은 것이든 아니든 여기서 한다
+        assert_eq!(route(Errand::Preview, "a", "a", true, true), Route::Here);
+        assert_eq!(route(Errand::Preview, "a", "a", false, false), Route::Here);
+        // 어느 기계나 하는 일은 주소를 알아도 넘기지 않는다
+        assert_eq!(route(Errand::Users, "a", "b", false, true), Route::Here);
     }
 }
