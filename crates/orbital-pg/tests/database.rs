@@ -1105,3 +1105,25 @@ fn 운영_db_의_문을_닫고_연결을_끊으면_복제할_수_있고_다시_�
         2
     );
 }
+
+/// 클러스터가 지금까지 요청받아 돌린 checkpoint 의 수.
+fn requested_checkpoints(client: &mut Client) -> i64 {
+    client
+        .batch_execute("SELECT pg_stat_clear_snapshot()")
+        .unwrap();
+    client
+        .query_one("SELECT num_requested FROM pg_stat_checkpointer", &[])
+        .unwrap()
+        .get(0)
+}
+
+#[test]
+fn 운영_db_의_문을_닫기_전에_문을_연_채로_checkpoint_를_마친다() {
+    let mut bench = bench!();
+    let mut watcher =
+        Client::connect(&std::env::var("ORBITAL_PG").unwrap(), postgres::NoTls).unwrap();
+    let before = requested_checkpoints(&mut watcher);
+    bench.admin.quiesce(&bench.names).unwrap();
+    assert!(requested_checkpoints(&mut watcher) > before);
+    bench.admin.resume(&bench.names).unwrap();
+}

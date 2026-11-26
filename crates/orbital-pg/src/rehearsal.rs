@@ -130,10 +130,15 @@ impl Admin {
 
     /// 운영 DB 의 문을 닫고 붙어 있는 연결을 끊는다. 복제는 원본에 다른 연결이 없어야 한다.
     ///
-    /// 닫혀 있는 동안 앱의 요청은 DB 에 붙지 못한다. 복제가 끝나면 곧바로 [`Admin::resume`] 으로 연다.
+    /// 닫기 전에 문을 연 채로 checkpoint 를 마친다. 닫혀 있는 동안 앱의 요청은 DB 에 붙지 못한다. 복제가 끝나면 곧바로 [`Admin::resume`] 으로 연다.
     /// proxy 가 요청을 붙잡아 주기 전까지의 모양이다.
     pub fn quiesce(&mut self, names: &Names) -> Result<(), Error> {
         let database = names.database();
+        // 복제(`FILE_COPY`)는 앞에서 checkpoint 를 건다. 쓰기가 몰린 DB 는 그 checkpoint 가 수 초 걸리므로,
+        // 문을 연 채로 먼저 마쳐 두어 닫혀 있는 동안에는 그 사이에 더러워진 페이지만 쓰게 한다(GCP 서울에서 4~5초 → 0.3~0.5초)
+        self.cluster
+            .batch_execute("CHECKPOINT")
+            .map_err(pg("checkpoint 를 돌리"))?;
         self.open(&database, false)?;
         self.cluster
             .execute(
