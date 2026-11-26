@@ -39,7 +39,7 @@ paths:
 | 로그인 링크 | 메일로 가는 한 번 쓰는 주소. 운영에서만 팩토리의 키로 나가고 프리뷰에서는 나가지 않는다. 15분, 요청한 브라우저에서만 열린다. 같은 이메일로는 1분에 하나 | `AuthStore::request_link` · `enter`, `judge_link` |
 | 세션 | 로그인한 브라우저의 쿠키(`__Host-orbital-session`)가 가리키는 것. 거두거나 사용자를 빼면 다음 요청부터 없는 것이다 | `AuthStore::session`, `judge_session` |
 | 팩토리의 설정 | 팩토리마다 한 벌인 로그인의 키(Resend 의 키 · 보내는 주소, Google 클라이언트). 비밀은 어떤 답에도 돌아오지 않는다. 없으면 그 로그인 방법은 운영에 오르지 못한다 | `Settings`, `PUT /v1/settings/auth`, `FactoryKey`, `missing_keys` |
-| 봉인 | 비밀(팩토리의 키 · 금고 · 운영의 신원 열쇠 · 레이어가 만든 비밀)을 기록에 두는 모양. 자리(조직 · 칸 등)를 함께 묶어 다른 줄에 옮기면 풀리지 않는다. 열쇠가 없는 개발용 레이어만 운영의 둘을 평문으로 적는다. 열쇠는 기록 밖(`ORBITAL_SEAL_KEY`)에 있고, 옛 열쇠(`ORBITAL_SEAL_KEY_PREVIOUS`)를 함께 주면 뜰 때 새 열쇠로 다시 봉인한다 | `seal`, `SealKey`, `reseal`, `Resealed` |
+| 봉인 | 비밀(팩토리의 키 · 금고 · 운영의 신원 열쇠 · 레이어가 만든 비밀 · 웹훅의 서명 비밀)을 기록에 두는 모양. 자리(조직 · 칸 등)를 함께 묶어 다른 줄에 옮기면 풀리지 않는다. 열쇠가 없는 개발용 레이어만 운영의 둘을 평문으로 적는다. 열쇠는 기록 밖(`ORBITAL_SEAL_KEY`)에 있고, 옛 열쇠(`ORBITAL_SEAL_KEY_PREVIOUS`)를 함께 주면 뜰 때 새 열쇠로 다시 봉인한다 | `seal`, `SealKey`, `reseal`, `Resealed` |
 | 밖에서 넣는 비밀 | 선언의 `[secrets] external` 에 이름만 적은 바깥 서비스의 키. 사람이 넣고, 앱은 같은 이름의 환경 변수로 받는다. 빌드와 마이그레이션에는 가지 않는다 | `Secrets::external`, `missing_secrets`, `Blocker::SecretMissing` |
 | 단계(stage) | 값이 들어가는 칸. 프리뷰(`preview`)와 운영(`production`) 둘이고 서로 넘어가지 않는다. 프리뷰의 값은 에이전트가 볼 수 있다고 본다 | `secrets::Stage` |
 | 금고(vault) | 밖에서 넣는 비밀을 인스턴스와 단계마다 봉인해 둔 것(control database 의 `vault_value`). 조직 · 인스턴스 · 단계 · 이름을 함께 묶는다. 값을 읽는 API 는 없다 | `Vault`, `SecretValue`, `secret_binding` |
@@ -66,7 +66,7 @@ paths:
 | 물결 | rollout 의 인스턴스를 나눈 순서 있는 묶음. 앞 물결이 모두 오른 뒤에 뒤 물결이 오른다 | `Rollout::waves`, `Refusal::EarlierWave` |
 | 합치기 | 레이어가 인스턴스의 `main` 에 업데이트를 기계적으로 합치는 일(`git merge` 의 판정). 충돌하면 인스턴스를 건드리지 않고 충돌한 파일의 이름만 알린다 | `SourceStore::merge`, `Merged`, `Layer::apply_update` |
 | 적합성 테스트 | 인스턴스가 어떻게 고쳐졌든 통과해야 하는, 팩토리가 정한 테스트(`[conformance] run` · `files`). 위쪽의 선언과 폴더로 모든 프리뷰에서 돌고, 프리뷰의 주소만 받는다. 통과하지 못하면 오르지 못한다 | `Conformance`, `Conformed`, `Blocker::ConformanceFailed`, `Runner::check` |
-| 기반 백업 | 운영 클러스터 전체를 뜬 것(`pg_basebackup`). control database(레이어의 기록)가 그 안에 들고, 코드 저장소의 묶음(`records.tar`: `sources` · `apps`, `RECORDS`)을 함께 둔다. 열쇠는 넣지 않는다. 다 뜬 때(`finished_at`) 뒤의 시점으로만 되살린다 | `BaseBackup`, `Store::base_backup` |
+| 기반 백업 · 보관 기간 | 운영 클러스터 전체를 뜬 것(`pg_basebackup`). control database(레이어의 기록)가 그 안에 들고, 코드 저장소의 묶음(`records.tar`: `sources` · `apps`, `RECORDS`)을 함께 둔다. 열쇠는 넣지 않는다. 다 뜬 때(`finished_at`) 뒤의 시점으로만 되살린다. 14일을 두고, 지난 것과 거기에만 딸린 WAL 을 지우되 마지막 기반 백업은 언제나 남긴다 | `BaseBackup`, `Store::base_backup`, `prune`, `KEEP_FOR` |
 | WAL 보관 · 보관의 표시 | 다 찬 WAL 조각을 `archive_command` 로 `<ORBITAL_BACKUP_DIR>/wal` 에 복사해 두는 것과, commit 하나를 적고 WAL 을 넘겨 보관된 것을 본 뒤 적는 「이 시각까지는 되살릴 수 있다」 | `Archive`, `LocalStore::archive_command`, `Seal`, `Store::seal` |
 | 기계 · 놓인 자리 · 넘겨 주기 | 관리 서버가 도는 자리(`ORBITAL_MACHINE`)와, 인스턴스를 세운 관리 서버의 기계. 그 인스턴스의 코드 저장소 · 빌드 · 프로세스에 닿는 일과 고객의 요청은 놓인 기계만 한다. 다른 기계는 아무것도 하지 않고, 놓인 기계의 주소(`ORBITAL_MACHINE_URL` · `ORBITAL_MACHINE_ROUTER_URL`)를 알면 요청을 그대로 넘기고(`x-orbital-forwarded-by` 를 붙이고, 그런 요청은 다시 넘기지 않는다) 모르면 421(`misplaced`), 닿지 못하면 502(`machine_unreachable`)로 답한다 | `Options::machine` · `machine_url`, `placement::{Errand, Reach, judge, route, Route}`, `Failure::Misplaced`, `forward::relay`, `Hosts::relaying` |
 | 시점 복구 | 기반 백업과 보관한 WAL 로 정한 시각의 클러스터를 되살리는 일. **옆에 세운 클러스터에만** 한다 | `judge_restore`, `Store::recover` |
@@ -76,5 +76,5 @@ paths:
 | 지문 | database 하나의 스키마 해시와 표마다의 행 수. 이름과 숫자만 있고 행의 값은 없다 | `Fingerprint`, `fingerprint` |
 | 잃을 수 있는 구간 | 훈련을 시작한 때 − 마지막으로 보관된 WAL 의 시각(초). 운영 클러스터를 잃으면 이만큼을 잃는다 | `DrillRecord::exposure_seconds` |
 | 낡은 훈련 | 마지막으로 통과한 훈련이 여드레를 넘겼거나 한 번도 통과하지 않은 것. 켠 레이어(`ORBITAL_REQUIRE_DRILL=1`)는 그동안 새 인스턴스만 받지 않는다 | `Freshness`, `freshness`, `DRILL_FRESH_FOR` |
-| control database | 레이어의 기록(인스턴스 · 일정 · rollout · 설정 · 금고 · 요청 · 입력 표 · 닫은 작업 · 훈련 · 기계 · 앱 · 조직 · service key)을 두는, 운영 클러스터 안의 레이어 전용 database(`ORBITAL_CONTROL_DB`, 기본 `orbital_control`). 인스턴스의 역할은 붙지 못한다. 마이그레이션은 번호 붙은 SQL 을 차례로 한 번씩 | `Records`, `migrate`, `control::pending` |
-| 보관 기간 | 기반 백업을 두는 기간(14일). 지난 것과 거기에만 딸린 WAL 을 지우되 마지막 기반 백업은 언제나 남긴다 | `prune`, `Pruning`, `KEEP_FOR` |
+| control database | 레이어의 기록(인스턴스 · 일정 · rollout · 설정 · 금고 · 요청 · 입력 표 · 닫은 작업 · 훈련 · 기계 · 앱 · 조직 · service key · 이벤트 · 웹훅)을 두는, 운영 클러스터 안의 레이어 전용 database(`ORBITAL_CONTROL_DB`, 기본 `orbital_control`). 인스턴스의 역할은 붙지 못한다. 마이그레이션은 번호 붙은 SQL 을 차례로 한 번씩 | `Records`, `migrate`, `control::pending` |
+| 이벤트 · 웹훅 | 레이어의 상태가 바뀐 것(`무엇.어찌됨`: 승격의 요청 · 승격 · 되돌려진 승격 · rollout 의 진행 · 비밀의 요청 · 인스턴스의 생김과 지워짐)을 그 일을 적는 트랜잭션에서 조직마다 차례대로 쌓은 것(30일)과, 조직이 건 주소 하나로 그것을 서명해(`orbital-signature`) 적어도 한 번 차례대로 보내는 것. 몸에는 이름과 숫자만. 바깥(공인)의 주소로만 보내고(보낼 때마다 풀어 판정한 그 주소에 붙는다) 리다이렉트는 따라가지 않는다. 사설 주소와 `http://` 는 명시해 켠 개발용 레이어(`ORBITAL_DEV_WEBHOOK=private`)만 | `event::Body`, `rollout_notes`, `after_failure`, `webhook::{judge_url, judge_resolved}`, `Layer::deliver_due`, `/v1/events` |
