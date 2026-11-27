@@ -1670,7 +1670,9 @@ impl Layer {
 
 impl Layer {
     fn app_path(&self, organization: &str, app: &Ident) -> Outcome<PathBuf> {
-        let organization = Ident::parse(organization)
+        // 조직의 이름 규칙(core 의 `organization_name`: 소문자 · 숫자 · `-` · `_`, 64자)으로 읽는다. 점과 `/` 가 없어 경로를 벗어나지 못한다.
+        // DB 의 이름 규칙(`Ident`)으로 읽으면 대시보드가 짓는 이름(하이픈 · 숫자로 시작 · 24자를 넘는)의 조직이 앱을 올리지 못한다
+        let organization = orbital_core::organization::organization_name(organization)
             .map_err(|_| internal("조직의 이름을 폴더 이름으로 쓸 수 없습니다"))?;
         Ok(self
             .home

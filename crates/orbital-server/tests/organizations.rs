@@ -592,6 +592,27 @@ fn 이미_있는_조직이나_환경_변수의_조직은_다시_만들지_못하
 }
 
 #[test]
+fn 받아들인_어떤_이름의_조직도_앱을_올리고_인스턴스를_세워_지운다() {
+    let mut bench = bench!();
+    bench.open("a");
+    // 대시보드가 짓는 이름: 숫자로 시작하거나 하이픈이 들거나 64자까지 긴 이름. 앱의 저장소는 조직의 이름으로 폴더를 짓는다
+    let long = format!("a{}", "-b".repeat(31)) + "c";
+    assert_eq!(long.len(), 64);
+    for id in ["9lives", "acme-labs", long.as_str()] {
+        let key = bench.organization("a", id, "live");
+        bench.upload("a", &key.value);
+        let instance = bench.instance("a", &key.value);
+        bench.destroy("a", &key.value, &instance);
+        bench.instances.retain(|(kept, _)| kept != &instance);
+    }
+    // 조직마다 제 폴더에 앱이 있다. 이름이 경로를 벗어나지 않는다
+    let apps = bench.home("a").join("apps");
+    for id in ["9lives", "acme-labs", long.as_str()] {
+        assert!(apps.join(id).join("records.git").is_dir(), "{id}");
+    }
+}
+
+#[test]
 fn 운영자의_열쇠로는_인스턴스_승격_비밀_사용자_열쇠의_일을_하지_못한다() {
     let mut bench = bench!();
     bench.open("a");
