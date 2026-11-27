@@ -46,7 +46,7 @@ pub const DEFAULT_MACHINE: &str = "local";
 pub const REFRESH_CHANNEL: &str = "orbital_refresh";
 
 /// 저장소에 둔 control database 의 마이그레이션(파일 이름, 내용). 번호는 이름의 앞 네 자리다.
-pub const MIGRATIONS: [(&str, &str); 5] = [
+pub const MIGRATIONS: [(&str, &str); 6] = [
     (
         "0001_records.sql",
         include_str!("../migrations/0001_records.sql"),
@@ -67,7 +67,16 @@ pub const MIGRATIONS: [(&str, &str); 5] = [
         "0005_dashboard.sql",
         include_str!("../migrations/0005_dashboard.sql"),
     ),
+    (
+        "0006_service_key_order.sql",
+        include_str!("../migrations/0006_service_key_order.sql"),
+    ),
 ];
+
+/// 기록의 bigint 칸에 적을 값. 넘치면 가장 큰 값이다.
+fn signed(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
 
 /// 옛 기록 파일. 처음 뜰 때 한 번 옮기고 `<이름>.imported` 로 바꾼다.
 pub const OLD_FILES: [&str; 5] = [
@@ -1276,7 +1285,8 @@ impl Records {
         let empty: bool = transaction
             .query_one(
                 "SELECT NOT EXISTS (SELECT 1 FROM orbital.instance) AND NOT EXISTS (SELECT 1 FROM orbital.rollout)
-                    AND NOT EXISTS (SELECT 1 FROM orbital.factory_settings) AND NOT EXISTS (SELECT 1 FROM orbital.drill)",
+                    AND NOT EXISTS (SELECT 1 FROM orbital.factory_settings) AND NOT EXISTS (SELECT 1 FROM orbital.drill)
+                    AND NOT EXISTS (SELECT 1 FROM orbital.organization)",
                 &[],
             )
             .map_err(|_| "control database 가 비었는지 보지 못했습니다".to_owned())?
@@ -1331,6 +1341,31 @@ impl Records {
                     &[organization, app, &self.machine.as_str(), &now_signed],
                 )
                 .map_err(pg("앱을 옮기"))?;
+        }
+        // 옛 파일의 조직과 service key. sha256 을 그대로 옮겨 같은 비밀이 계속 통한다. 종류는 운영(`live`)이다
+        for (organization, record) in &old.state.organizations {
+            transaction
+                .execute(
+                    "INSERT INTO orbital.organization (id, name, kind, created_at) VALUES ($1, $2, 'live', $3)",
+                    &[organization, &record.label, &signed(record.created_at)],
+                )
+                .map_err(pg("조직을 옮기"))?;
+            for key in &record.keys {
+                transaction
+                    .execute(
+                        "INSERT INTO orbital.service_key (id, organization, digest, label, created_at, revoked_at)
+                         VALUES ($1, $2, $3, $4, $5, $6)",
+                        &[
+                            &key.id,
+                            organization,
+                            &key.digest,
+                            &key.label,
+                            &signed(key.created_at),
+                            &key.revoked_at.map(signed),
+                        ],
+                    )
+                    .map_err(pg("service key 를 옮기"))?;
+            }
         }
         for (id, record) in &old.state.instances {
             let mut record = record.clone();

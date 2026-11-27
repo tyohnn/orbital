@@ -53,7 +53,7 @@ test("service key 가 없으면 뜨지 않고 무엇을 넣을지 말한다", as
 {
     const missingKey = await start({ ORBITAL_URL: layerUrl });
     assert.equal(missingKey.code, 1);
-    assert.match(missingKey.output, /ORBITAL_SERVICE_KEY 이 없습니다\. .*sk_test_/);
+    assert.match(missingKey.output, /ORBITAL_SERVICE_KEY 이 없습니다\. .*orb_sk_/);
     const missingUrl = await start({ ORBITAL_SERVICE_KEY: KEY });
     assert.equal(missingUrl.code, 1);
     assert.match(missingUrl.output, /ORBITAL_URL 이 없습니다/);

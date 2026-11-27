@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 
 const FACTORY: &str = "sk_test_factory";
 const OTHER: &str = "sk_test_other";
-const OPERATOR: &str = "op_test_operator_key_not_a_secret_0000";
+const ADMIN: &str = "admin_key_for_tests_0123456789abcdef";
 const TOKEN_KEY: [u8; 32] = [3; 32];
 const ALL: [&str; 4] = ["source", "preview", "rehearse", "secrets_request"];
 /// 운영의 밖에서 넣는 비밀. 어떤 답에도 나오면 안 된다.
@@ -185,7 +185,7 @@ impl Bench {
             machine: Ident::parse(name).unwrap(),
             token_key: Some(TOKEN_KEY.to_vec()),
             machine_url: Some(url),
-            operator_key: Some(OPERATOR.to_owned()),
+            admin_key: Some(ADMIN.to_owned()),
             test_instance_limit: 7,
             sleep_after: self.sleep_after,
             wake_timeout: Duration::from_secs(10),
@@ -559,13 +559,10 @@ fn 함대의_목록은_자기_조직의_인스턴스만_만든_차례로_쪽을_
     let (status, body) = bench.call("a", "GET", "/v1/instances?after=1&limit=0", FACTORY, &[]);
     assert_eq!(status, 422, "{body}");
     assert_eq!(body["details"].as_array().unwrap().len(), 2);
-    // 작업의 토큰과 운영자의 열쇠는 목록을 열지 못한다
+    // 작업의 토큰과 운영자 키는 목록을 열지 못한다
     let token = bench.token("a", FACTORY, &ours[0]);
     assert_eq!(bench.call("a", "GET", "/v1/instances", &token, &[]).0, 404);
-    assert_eq!(
-        bench.call("a", "GET", "/v1/instances", OPERATOR, &[]).0,
-        403
-    );
+    assert_eq!(bench.call("a", "GET", "/v1/instances", ADMIN, &[]).0, 403);
 }
 
 #[test]
@@ -819,7 +816,7 @@ fn 승격과_되돌려진_승격이_이력에_차례대로_쌓이고_승인과_�
             .all(|text| !text.contains(BANK) && !text.contains(&token))
     );
 
-    // 다른 조직 · 작업의 토큰 · 운영자의 열쇠는 이력을 보지 못한다
+    // 다른 조직 · 작업의 토큰 · 운영자 키는 이력을 보지 못한다
     assert_eq!(
         bench
             .call(
@@ -850,7 +847,7 @@ fn 승격과_되돌려진_승격이_이력에_차례대로_쌓이고_승인과_�
                 "b",
                 "GET",
                 &format!("/v1/instances/{instance}/history"),
-                OPERATOR,
+                ADMIN,
                 &[]
             )
             .0,
@@ -1040,9 +1037,9 @@ fn 운영의_로그는_service_key_로만_보고_작업의_토큰과_운영자�
         &[],
     );
     assert_eq!(status, 200, "{body}");
-    // 운영자의 열쇠는 열지 못하고, 다른 조직에게는 없는 것과 같다
+    // 운영자 키는 열지 못하고, 다른 조직에게는 없는 것과 같다
     for path in [&logs, &services] {
-        assert_eq!(bench.call("a", "GET", path, OPERATOR, &[]).0, 403);
+        assert_eq!(bench.call("a", "GET", path, ADMIN, &[]).0, 403);
         assert_eq!(bench.call("a", "GET", path, OTHER, &[]).0, 404);
     }
     // 열쇠가 없으면 401 이다
@@ -1243,7 +1240,7 @@ fn 연결된_클라이언트와_조직의_모습과_rollout_의_목록은_자기
     assert_eq!(bench.get("a", &grants, FACTORY), json!({ "grants": [] }));
     assert_eq!(bench.call("a", "GET", &grants, OTHER, &[]).0, 404);
     assert_eq!(bench.call("a", "GET", &grants, &token, &[]).0, 404);
-    assert_eq!(bench.call("a", "GET", &grants, OPERATOR, &[]).0, 403);
+    assert_eq!(bench.call("a", "GET", &grants, ADMIN, &[]).0, 403);
 
     // 조직의 모습: 설정에만 있는 조직과 기록의 시험용 조직
     let configured = bench.get("a", "/v1/organization", FACTORY);
@@ -1253,12 +1250,12 @@ fn 연결된_클라이언트와_조직의_모습과_rollout_의_목록은_자기
     );
     let (status, made) = bench.post(
         "a",
-        "/v1/operator/organizations",
-        OPERATOR,
-        &json!({ "id": "acme", "name": "애크미 개발사", "kind": "test" }),
+        "/v1/admin/organizations",
+        ADMIN,
+        &json!({ "id": "acme", "label": "애크미 개발사", "kind": "test" }),
     );
-    assert_eq!(status, 200, "{made}");
-    let acme = made["key"]["key"].as_str().unwrap().to_owned();
+    assert_eq!(status, 201, "{made}");
+    let acme = made["key"]["secret"].as_str().unwrap().to_owned();
     let shown = bench.get("a", "/v1/organization", &acme);
     assert_eq!(shown["id"], "acme");
     assert_eq!(shown["name"], "애크미 개발사");
@@ -1272,7 +1269,7 @@ fn 연결된_클라이언트와_조직의_모습과_rollout_의_목록은_자기
         404
     );
     assert_eq!(
-        bench.call("a", "GET", "/v1/organization", OPERATOR, &[]).0,
+        bench.call("a", "GET", "/v1/organization", ADMIN, &[]).0,
         403
     );
 

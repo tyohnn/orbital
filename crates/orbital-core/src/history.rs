@@ -102,7 +102,7 @@ impl Entry {
     }
 }
 
-/// 승인한 사람의 이름표를 본다. 서비스 키의 이름과 같은 규칙이다(비지 않고 · 80자 안 · 제어 문자 없음).
+/// 승인한 사람의 이름표를 본다. 비지 않고 · 80자 안 · 제어 문자 없음이다.
 pub fn check_approver(text: &str) -> Result<String, LabelProblem> {
     check_label(text)
 }

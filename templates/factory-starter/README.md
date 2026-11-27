@@ -13,7 +13,7 @@ server/     플러그인의 도구가 닿는 팩토리의 서버. service key �
 
 ## 빠른 시작
 
-처음 10분에 고객 한 사람의 인스턴스가 프리뷰로 섭니다. 레이어(Orbital 의 관리 서버)는 이미 떠 있고, 그 운영자에게 **시험용 조직의 열쇠**(`sk_test_…`)를 받았다고 봅니다.
+처음 10분에 고객 한 사람의 인스턴스가 프리뷰로 섭니다. 레이어(Orbital 의 관리 서버)는 이미 떠 있고, Orbital 의 대시보드에서 가입해 **시험용 조직의 service key**(`orb_sk_…`)를 받았다고 봅니다.
 필요한 것은 Node 22.18 이상과 `git` 입니다.
 
 ```sh
@@ -26,7 +26,7 @@ npm install
 
 # 3. 서버를 띄운다. 스캐폴드를 레이어에 올리고 http://127.0.0.1:3840/mcp 에서 듣는다
 export ORBITAL_URL=http://127.0.0.1:7700        # 레이어의 주소
-export ORBITAL_SERVICE_KEY=sk_test_…            # 받은 열쇠
+export ORBITAL_SERVICE_KEY=orb_sk_…             # 받은 service key
 npm start
 
 # 4. 다른 터미널에서: 플랫폼 없이 한 바퀴. 고객 「dev」로 연결해 인스턴스를 세우고, 고객의 사본을 ../try-app 에 받고, 프리뷰를 세운다
@@ -97,18 +97,18 @@ npm run pack -- ../acme.zip https://factory.example.com/mcp   # 플러그인 ZIP
 받는 길은 날것의 본문으로 서명을 확인하고(틀리면 401, 5분보다 오래된 서명도 401), 같은 `id` 는 한 번만 처리합니다. 처리기가 던지면 500 으로 답해 레이어가 다시 보냅니다.
 웹훅을 받으면 받은 것 앞에 받지 못한 이벤트(웹훅을 걸기 전에 생긴 것, 레이어가 하루 동안 보내다 그만둔 것)를 `events.list` 로 먼저 이어 받아 차례대로 처리합니다.
 
-## 열쇠 바꾸기
+## 키 바꾸기
 
-service key 는 새것을 먼저 내고, 서버를 옮긴 뒤, 옛것을 거둡니다. 둘은 그동안 함께 삽니다.
+service key 는 새것을 먼저 내고, 서버를 옮긴 뒤, 옛것을 폐기합니다. 둘은 그동안 함께 삽니다. Orbital 의 대시보드에서도 같은 일을 합니다.
 
 ```sh
-npm run operator -- key-create "2026-12 배포"   # 새 열쇠. 값은 이때 한 번만 찍힙니다. 비밀 저장소로 옮깁니다
+npm run operator -- key-create "2026-12 배포"   # 새 키. 비밀은 이때 한 번만 찍힙니다. 비밀 저장소로 옮깁니다
 # ORBITAL_SERVICE_KEY 를 새 값으로 바꿔 서버를 다시 배포합니다
-npm run operator -- keys                        # 옛 열쇠의 「마지막으로 쓴 때」가 멈췄는지 봅니다
-npm run operator -- key-revoke <옛 열쇠의 id>
+npm run operator -- keys                        # 옛 키의 「마지막으로 쓴 때」가 멈췄는지 봅니다
+npm run operator -- key-revoke <옛 키의 id>
 ```
 
-열쇠가 새어 나갔으면 레이어의 운영자에게 알립니다(그 조직의 다른 열쇠를 한 번에 거두는 길은 운영자에게 있습니다).
+키가 새어 나갔으면 레이어의 운영자에게 알립니다. 운영자가 그 조직의 키를 갈아(`reset-keys`) 모든 키를 한 번에 폐기하고 새 키 하나를 냅니다.
 
 ## 운영자의 스크립트
 

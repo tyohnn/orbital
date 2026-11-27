@@ -12,12 +12,8 @@ use postgres::Transaction;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{RecordError, Records, append_in, json as json_error, pg};
+use super::{RecordError, Records, append_in, json as json_error, pg, signed};
 use crate::registry::RolloutRecord;
-
-fn signed(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
 
 fn unsigned(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)

@@ -13,12 +13,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{RecordError, Records, json as json_error, pg};
+use super::{RecordError, Records, json as json_error, pg, signed};
 use crate::seal::{Rekeyed, SealKey, open, reseal, seal, webhook_binding};
-
-fn signed(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
 
 fn unsigned(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)

@@ -1,8 +1,8 @@
-//! 조직과 service key 는 레이어의 기록(control database)에 있다. 운영자의 열쇠로 조직을 만들고 첫 열쇠를 내고, 조직은 자기 열쇠를
-//! 더 내고 보고 거둔다. 같은 control database 를 보는 관리 서버 둘(기계 `a` · `b`)을 띄워 잰다.
+//! 팩토리(조직)와 service key 는 레이어의 기록(control database)에 있다. 대시보드가 가입을 받으면 운영자 키로 조직을 만들고 첫 키를 받아
+//! 한 번만 보여 주고, 팩토리는 그 키로 키를 더 만들고 보고 폐기한다. 같은 control database 를 보는 관리 서버 둘(기계 `a` · `b`)을 띄워 잰다.
 //!
-//! 실제 PostgreSQL 과 실제 git 으로 잰다. 관리 서버의 API 는 HTTP 층의 `handle` 에 바로 넣는다. 막는 테스트는 그 열쇠로 실제로 해 본다.
-//! 테스트의 열쇠는 한눈에 가짜인 글자이고, 레이어가 낸 열쇠는 테스트가 답에서 받는다. `ORBITAL_PG` 가 없으면 건너뛰었다고 찍고 통과한다.
+//! 실제 PostgreSQL 과 실제 git 으로 잰다. 관리 서버의 API 는 HTTP 층의 `handle` 에 바로 넣는다. 막는 테스트는 그 키로 실제로 해 본다.
+//! 테스트의 키는 한눈에 가짜인 글자이고, 레이어가 낸 키는 테스트가 답에서 받는다. `ORBITAL_PG` 가 없으면 건너뛰었다고 찍고 통과한다.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -27,8 +27,8 @@ use sha2::{Digest, Sha256};
 const FACTORY: &str = "sk_test_factory";
 /// 설정에만 있는 다른 조직 `other` 의 열쇠.
 const OTHER: &str = "sk_test_other";
-/// 운영자의 열쇠(`ORBITAL_OPERATOR_KEY`).
-const OPERATOR: &str = "op_test_operator_key_not_a_secret_0000";
+/// 운영자 키(`ORBITAL_ADMIN_KEY`).
+const ADMIN: &str = "admin_key_for_tests_0123456789abcdef";
 const ALL: [&str; 4] = ["source", "preview", "rehearse", "secrets_request"];
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -134,8 +134,8 @@ struct Bench {
     control: Ident,
     /// 레이어의 시계. 0 이면 실제 시각이다.
     clock: Arc<AtomicU64>,
-    /// 운영자의 열쇠를 줄까.
-    operator: bool,
+    /// 운영자 키를 줄까.
+    admin: bool,
     test_limit: u32,
     servers: BTreeMap<String, Layer>,
     /// (인스턴스, 놓인 기계). 끝날 때 걷는다.
@@ -157,7 +157,7 @@ impl Bench {
             pg_url,
             control: fresh_name("ctl"),
             clock: Arc::new(AtomicU64::new(0)),
-            operator: true,
+            admin: true,
             test_limit: 10,
             servers: BTreeMap::new(),
             instances: Vec::new(),
@@ -168,7 +168,9 @@ impl Bench {
         self.scratch.join(format!("home-{machine}"))
     }
 
+    /// 기계 하나의 관리 서버를 띄운다. 이미 떠 있으면 내리고 다시 띄운다(같은 기계의 관리 서버는 하나만 뜬다).
     fn open(&mut self, machine: &str) {
+        self.servers.remove(machine);
         let clock = Arc::clone(&self.clock);
         let options = Options {
             seal_key: Some(SealKey::from_bytes([7; 32])),
@@ -176,7 +178,7 @@ impl Bench {
             control_database: self.control.clone(),
             machine: Ident::parse(machine).unwrap(),
             token_key: Some([3; 32].to_vec()),
-            operator_key: self.operator.then(|| OPERATOR.to_owned()),
+            admin_key: self.admin.then(|| ADMIN.to_owned()),
             test_instance_limit: self.test_limit,
             clock: Arc::new(move || match clock.load(Ordering::SeqCst) {
                 0 => now(),
@@ -226,30 +228,29 @@ impl Bench {
         self.call(on, "POST", path, bearer, body.to_string().as_bytes())
     }
 
-    /// 운영자가 조직을 만든다. 첫 열쇠를 돌려준다.
+    /// 운영자가 조직을 만든다. 첫 키를 돌려준다.
     fn organization(&self, on: &str, id: &str, kind: &str) -> Key {
         let (status, body) = self.post(
             on,
-            "/v1/operator/organizations",
-            OPERATOR,
-            &json!({ "id": id, "name": format!("{id} 개발사"), "kind": kind, "label": "첫 열쇠" }),
+            "/v1/admin/organizations",
+            ADMIN,
+            &json!({ "id": id, "label": format!("{id} 개발사"), "kind": kind }),
         );
-        assert_eq!(status, 200, "{body}");
-        assert_eq!(body["organization"]["id"], id);
-        assert_eq!(body["organization"]["kind"], kind);
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(body["organization"], id);
         Key {
-            value: body["key"]["key"].as_str().unwrap().to_owned(),
+            value: body["key"]["secret"].as_str().unwrap().to_owned(),
             id: body["key"]["id"].as_str().unwrap().to_owned(),
         }
     }
 
-    /// 조직의 열쇠로 열쇠를 하나 더 낸다.
+    /// 조직의 키로 키를 하나 더 낸다.
     fn issue(&self, on: &str, key: &str, label: &str) -> Key {
         let (status, body) = self.post(on, "/v1/keys", key, &json!({ "label": label }));
-        assert_eq!(status, 200, "{body}");
+        assert_eq!(status, 201, "{body}");
         assert_eq!(body["label"], label);
         Key {
-            value: body["key"].as_str().unwrap().to_owned(),
+            value: body["secret"].as_str().unwrap().to_owned(),
             id: body["id"].as_str().unwrap().to_owned(),
         }
     }
@@ -261,7 +262,23 @@ impl Bench {
     }
 
     fn revoke(&self, on: &str, key: &str, id: &str) -> (u16, Value) {
-        self.call(on, "DELETE", &format!("/v1/keys/{id}"), key, &[])
+        self.call(on, "POST", &format!("/v1/keys/{id}/revoke"), key, &[])
+    }
+
+    /// 운영자 키로 `/v1/admin/organizations/{id}{tail}` 에 POST 한다.
+    fn admin(&self, on: &str, id: &str, tail: &str) -> (u16, Value) {
+        self.call(
+            on,
+            "POST",
+            &format!("/v1/admin/organizations/{id}{tail}"),
+            ADMIN,
+            &[],
+        )
+    }
+
+    /// service key 로만 되는 길 하나. 키가 살아 있는지 본다.
+    fn alive(&self, on: &str, key: &str) -> u16 {
+        self.call(on, "GET", "/v1/settings/auth", key, &[]).0
     }
 
     /// 그 열쇠의 조직에 스캐폴드를 올린다.
@@ -389,100 +406,154 @@ macro_rules! bench {
     };
 }
 
-// ---- 운영자와 첫 열쇠 ----
+fn ids(keys: &[Value]) -> Vec<String> {
+    keys.iter()
+        .map(|key| key["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// 그 조직의 살아 있는 키를 기록에서 모두 폐기한다. API 로는 마지막 키를 폐기하지 못하므로, 키의 비밀을 모두 잃은 조직을 이렇게 만든다.
+fn lose_all_keys(bench: &Bench, organization: &str) {
+    bench
+        .control()
+        .execute(
+            "UPDATE orbital.service_key SET revoked_at = 1 WHERE organization = $1 AND revoked_at IS NULL",
+            &[&organization],
+        )
+        .unwrap();
+}
+
+// ---- 운영자와 첫 키 ----
 
 #[test]
-fn 운영자의_열쇠로_만든_조직은_첫_열쇠를_한_번만_답에_싣고_그_열쇠로_조직의_일을_한다() {
+fn 운영자_키로_조직을_만들면_첫_service_key_를_한_번만_보여_주고_그_키로_부른다() {
     let mut bench = bench!();
     bench.open("a");
-    let first = bench.organization("a", "acme", "live");
-    assert!(first.value.starts_with("sk_live_"), "{}", first.value);
-    // 그 열쇠로 조직의 일을 한다: 앱을 올리고 인스턴스를 세운다
+    let (status, body) = bench.post(
+        "a",
+        "/v1/admin/organizations",
+        ADMIN,
+        &json!({ "id": "acme", "label": "Acme 팩토리" }),
+    );
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["organization"], "acme");
+    let first = Key {
+        value: body["key"]["secret"].as_str().unwrap().to_owned(),
+        id: body["key"]["id"].as_str().unwrap().to_owned(),
+    };
+    assert!(first.value.starts_with("orb_sk_"), "{}", first.value);
+    assert!(first.id.starts_with("key_"), "{}", first.id);
+    assert!(body["key"]["revoked_at"].is_null());
+    // 그 키로 조직의 일을 한다: 앱을 올리고 인스턴스를 세운다
     bench.upload("a", &first.value);
     let instance = bench.instance("a", &first.value);
-    // 목록에는 그 열쇠가 있되 값은 없다
+    // 목록에는 그 키가 있되 비밀은 다시 보이지 않는다
     let keys = bench.keys("a", &first.value);
-    assert_eq!(keys.len(), 1);
-    assert_eq!(keys[0]["id"], first.id.as_str());
-    assert_eq!(keys[0]["label"], "첫 열쇠");
-    assert_eq!(keys[0]["prefix"], "sk_live_");
-    assert!(!keys[0].to_string().contains(&first.value));
-    // 운영자는 조직의 이름과 숫자를 본다
-    let (status, report) = bench.call("a", "GET", "/v1/operator/organizations/acme", OPERATOR, &[]);
+    assert_eq!(ids(&keys), vec![first.id.clone()]);
+    assert!(keys[0].get("secret").is_none());
+    assert!(
+        !Value::Array(keys.clone())
+            .to_string()
+            .contains(&first.value)
+    );
+    // 운영자는 조직의 이름과 숫자를 본다. 종류를 적지 않았으면 운영의 조직이다
+    let (status, report) = bench.call("a", "GET", "/v1/admin/organizations/acme", ADMIN, &[]);
     assert_eq!(status, 200, "{report}");
+    assert_eq!(report["name"], "Acme 팩토리");
+    assert_eq!(report["kind"], "live");
     assert_eq!(report["instances"], 1);
     assert_eq!(report["keys"], 1);
-    let (status, list) = bench.call("a", "GET", "/v1/operator/organizations", OPERATOR, &[]);
+    let (status, list) = bench.call("a", "GET", "/v1/admin/organizations", ADMIN, &[]);
     assert_eq!(status, 200, "{list}");
     assert_eq!(list["organizations"][0]["id"], "acme");
     assert!(!list.to_string().contains(&first.value));
-    // 같은 조직을 두 번 만들지 못한다. 첫 열쇠도 새로 나오지 않는다
-    let (status, again) = bench.post(
-        "a",
-        "/v1/operator/organizations",
-        OPERATOR,
-        &json!({ "id": "acme", "name": "다른 이름", "kind": "test" }),
-    );
-    assert_eq!(status, 409, "{again}");
-    assert!(again.get("key").is_none());
-    // 조직의 식별자는 검증된 이름이어야 한다
-    let (status, bad) = bench.post(
-        "a",
-        "/v1/operator/organizations",
-        OPERATOR,
-        &json!({ "id": "Acme; DROP", "name": "이름", "kind": "live" }),
-    );
-    assert_eq!(status, 422, "{bad}");
     bench.destroy("a", &first.value, &instance);
 }
 
 #[test]
-fn 시험용_조직의_열쇠는_sk_test_로_시작하고_운영의_조직의_열쇠는_sk_live_로_시작한다() {
+fn 시험용_조직과_운영의_조직의_키는_모두_orb_sk_로_시작하고_종류는_조직이_안다() {
     let mut bench = bench!();
     bench.open("a");
     let test = bench.organization("a", "sandbox", "test");
     let live = bench.organization("a", "acme", "live");
-    assert!(test.value.starts_with("sk_test_"), "{}", test.value);
-    assert!(live.value.starts_with("sk_live_"), "{}", live.value);
-    assert!(
-        bench
-            .issue("a", &test.value, "둘째")
-            .value
-            .starts_with("sk_test_")
-    );
-    assert!(
-        bench
-            .issue("a", &live.value, "둘째")
-            .value
-            .starts_with("sk_live_")
-    );
-    let (status, issued) = bench.post(
+    for key in [
+        test.value.clone(),
+        live.value.clone(),
+        bench.issue("a", &test.value, "둘째").value,
+        bench.issue("a", &live.value, "둘째").value,
+    ] {
+        assert!(key.starts_with("orb_sk_"), "{key}");
+        assert!(!key.contains("test") && !key.contains("live"), "{key}");
+    }
+    for (id, kind) in [("sandbox", "test"), ("acme", "live")] {
+        let (status, report) = bench.call(
+            "a",
+            "GET",
+            &format!("/v1/admin/organizations/{id}"),
+            ADMIN,
+            &[],
+        );
+        assert_eq!(status, 200, "{report}");
+        assert_eq!(report["kind"], kind);
+    }
+    // 모르는 종류는 받지 않는다
+    let (status, _) = bench.post(
         "a",
-        "/v1/operator/organizations/sandbox/keys",
-        OPERATOR,
-        &json!({ "label": "운영자가 낸 것" }),
+        "/v1/admin/organizations",
+        ADMIN,
+        &json!({ "id": "odd", "kind": "trial" }),
     );
-    assert_eq!(status, 200, "{issued}");
-    assert!(issued["key"].as_str().unwrap().starts_with("sk_test_"));
+    assert!((400..500).contains(&status), "{status}");
 }
 
 #[test]
-fn 운영자의_열쇠를_주지_않은_레이어에는_운영자의_길이_없다() {
+fn 운영자_키가_없거나_틀리거나_service_key_면_조직을_만들지_못한다() {
     let mut bench = bench!();
-    bench.operator = false;
+    bench.open("a");
+    let body = json!({ "id": "acme" }).to_string();
+    for bearer in [
+        None,
+        Some("wrong_admin_key_0123456789abcdef0123"),
+        Some(FACTORY),
+    ] {
+        let reply = handle(
+            bench.layer("a"),
+            "POST",
+            "/v1/admin/organizations",
+            bearer,
+            body.as_bytes(),
+        );
+        assert_eq!(reply.status, 401, "{bearer:?}");
+    }
+    let acme = bench.organization("a", "acme", "live");
+    let (status, _) = bench.post(
+        "a",
+        "/v1/admin/organizations",
+        &acme.value,
+        &json!({ "id": "other" }),
+    );
+    assert_eq!(status, 401);
+    assert_eq!(bench.layer("a").records().organizations().unwrap().len(), 1);
+}
+
+#[test]
+fn 운영자_키를_주지_않은_레이어에서는_운영자의_길이_누구에게도_열리지_않는다() {
+    let mut bench = bench!();
+    bench.admin = false;
     bench.open("a");
     for (method, path) in [
-        ("POST", "/v1/operator/organizations"),
-        ("GET", "/v1/operator/organizations"),
-        ("GET", "/v1/operator/organizations/factory"),
-        ("POST", "/v1/operator/organizations/factory/keys"),
-        ("POST", "/v1/operator/organizations/factory/close"),
+        ("POST", "/v1/admin/organizations"),
+        ("GET", "/v1/admin/organizations"),
+        ("GET", "/v1/admin/organizations/factory"),
+        ("POST", "/v1/admin/organizations/factory/keys"),
+        ("POST", "/v1/admin/organizations/factory/reset-keys"),
+        ("POST", "/v1/admin/organizations/factory/close"),
     ] {
-        for bearer in [OPERATOR, FACTORY] {
-            let body = json!({ "id": "acme", "name": "Acme", "kind": "live", "label": "열쇠" });
+        for bearer in [ADMIN, FACTORY] {
+            let body = json!({ "id": "acme", "label": "Acme" });
             let (status, answer) =
                 bench.call("a", method, path, bearer, body.to_string().as_bytes());
-            assert_eq!(status, 404, "{method} {path}: {answer}");
+            assert_eq!(status, 401, "{method} {path}: {answer}");
         }
     }
     assert!(
@@ -493,6 +564,31 @@ fn 운영자의_열쇠를_주지_않은_레이어에는_운영자의_길이_없�
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn 이미_있는_조직이나_환경_변수의_조직은_다시_만들지_못하고_이름이_틀리면_400_이다() {
+    let mut bench = bench!();
+    bench.open("a");
+    bench.organization("a", "acme", "live");
+    for id in ["acme", "factory"] {
+        let (status, again) = bench.post(
+            "a",
+            "/v1/admin/organizations",
+            ADMIN,
+            &json!({ "id": id, "kind": "test" }),
+        );
+        assert_eq!(status, 409, "{id}: {again}");
+        // 첫 키도 새로 나오지 않는다
+        assert!(again.get("key").is_none());
+    }
+    for id in ["", "Acme", "-acme", "ac me", "아크미", "acme; DROP"] {
+        let (status, _) = bench.post("a", "/v1/admin/organizations", ADMIN, &json!({ "id": id }));
+        assert_eq!(status, 400, "{id}");
+    }
+    // 하이픈과 숫자로 시작하는 이름(대시보드가 짓는 이름)은 받는다
+    bench.organization("a", "0-factory-co_1", "live");
+    assert_eq!(bench.layer("a").records().organizations().unwrap().len(), 2);
 }
 
 #[test]
@@ -536,6 +632,11 @@ fn 운영자의_열쇠로는_인스턴스_승격_비밀_사용자_열쇠의_일�
             "/v1/keys".to_owned(),
             json!({ "label": "몰래" }).to_string().into_bytes(),
         ),
+        (
+            "POST",
+            "/v1/keys/key_0000000000000000/revoke".to_owned(),
+            Vec::new(),
+        ),
         ("GET", "/v1/settings/auth".to_owned(), Vec::new()),
         (
             "GET",
@@ -544,7 +645,7 @@ fn 운영자의_열쇠로는_인스턴스_승격_비밀_사용자_열쇠의_일�
         ),
     ];
     for (method, path, body) in &cases {
-        let (status, answer) = bench.call("a", method, path, OPERATOR, body);
+        let (status, answer) = bench.call("a", method, path, ADMIN, body);
         assert_eq!(status, 403, "{method} {path}: {answer}");
     }
     // 아무것도 바뀌지 않았다
@@ -570,39 +671,37 @@ fn service_key_와_작업의_토큰으로는_운영자의_길을_열지_못하�
     );
     assert_eq!(status, 200, "{opened}");
     let token = opened["token"].as_str().unwrap().to_owned();
-    let new = json!({ "id": "intruder", "name": "몰래", "kind": "live" });
-    for bearer in [FACTORY, recorded.value.as_str(), token.as_str()] {
-        let (status, answer) = bench.post("a", "/v1/operator/organizations", bearer, &new);
-        assert_eq!(status, 403, "{answer}");
+    // 서명이 맞든 틀리든 토큰 쪽에는 키의 길과 운영자의 길이 없다
+    let forged = "orb1.eyJ9.forged";
+    for bearer in [FACTORY, recorded.value.as_str(), token.as_str(), forged] {
         let (status, answer) = bench.post(
             "a",
-            "/v1/operator/organizations/acme/keys",
+            "/v1/admin/organizations",
             bearer,
-            &json!({ "label": "몰래" }),
+            &json!({ "id": "intruder" }),
         );
-        assert_eq!(status, 403, "{answer}");
-        let (status, answer) = bench.call(
-            "a",
-            "POST",
-            "/v1/operator/organizations/acme/close",
-            bearer,
-            &[],
-        );
-        assert_eq!(status, 403, "{answer}");
+        assert_eq!(status, 401, "{answer}");
+        for tail in ["/keys", "/reset-keys", "/close"] {
+            let (status, answer) = bench.call(
+                "a",
+                "POST",
+                &format!("/v1/admin/organizations/acme{tail}"),
+                bearer,
+                &[],
+            );
+            assert_eq!(status, 401, "{tail}: {answer}");
+        }
+        let (status, answer) = bench.call("a", "GET", "/v1/admin/organizations", bearer, &[]);
+        assert_eq!(status, 401, "{answer}");
     }
-    // 작업의 토큰에는 열쇠의 길이 없다
-    let (status, answer) = bench.post("a", "/v1/keys", &token, &json!({ "label": "몰래" }));
-    assert_eq!(status, 404, "{answer}");
-    let (status, answer) = bench.call("a", "GET", "/v1/keys", &token, &[]);
-    assert_eq!(status, 404, "{answer}");
-    let (status, answer) = bench.call(
-        "a",
-        "DELETE",
-        &format!("/v1/keys/{}", recorded.id),
-        &token,
-        &[],
-    );
-    assert_eq!(status, 404, "{answer}");
+    for bearer in [token.as_str(), forged] {
+        let (status, answer) = bench.post("a", "/v1/keys", bearer, &json!({ "label": "몰래" }));
+        assert_eq!(status, 404, "{answer}");
+        let (status, answer) = bench.call("a", "GET", "/v1/keys", bearer, &[]);
+        assert_eq!(status, 404, "{answer}");
+        let (status, answer) = bench.revoke("a", bearer, &recorded.id);
+        assert_eq!(status, 404, "{answer}");
+    }
     // 아무것도 바뀌지 않았다
     let records = bench.layer("a").records();
     assert_eq!(records.organizations().unwrap().len(), 1);
@@ -618,6 +717,55 @@ fn service_key_와_작업의_토큰으로는_운영자의_길을_열지_못하�
     bench.destroy("a", &recorded.value, &instance);
 }
 
+// ---- 키 만들기와 목록 ----
+
+#[test]
+fn 조직의_키로_새_키를_만들고_목록에는_만든_차례로_비밀_없이_보인다() {
+    let mut bench = bench!();
+    bench.open("a");
+    let first = bench.organization("a", "acme", "live");
+    let deploy = bench.issue("a", &first.value, "배포 서버");
+    let laptop = bench.issue("a", &first.value, "노트북");
+    assert_eq!(bench.alive("a", &deploy.value), 200);
+    let listed = bench.keys("a", &deploy.value);
+    assert_eq!(
+        ids(&listed),
+        vec![first.id.clone(), deploy.id.clone(), laptop.id.clone()]
+    );
+    assert_eq!(listed[1]["label"], "배포 서버");
+    let text = Value::Array(listed).to_string();
+    for secret in [&first.value, &deploy.value, &laptop.value] {
+        assert!(!text.contains(secret.as_str()));
+    }
+    // 이름 없이 불러도 되고, 이름은 100글자까지다
+    let (status, unnamed) = bench.call("a", "POST", "/v1/keys", &first.value, &[]);
+    assert_eq!(status, 201, "{unnamed}");
+    assert_eq!(unnamed["label"], "");
+    let (status, _) = bench.post(
+        "a",
+        "/v1/keys",
+        &first.value,
+        &json!({ "label": "가".repeat(100) }),
+    );
+    assert_eq!(status, 201);
+    let (status, _) = bench.post(
+        "a",
+        "/v1/keys",
+        &first.value,
+        &json!({ "label": "가".repeat(101) }),
+    );
+    assert_eq!(status, 400);
+    // 줄바꿈 같은 제어 문자는 받지 않는다
+    let (status, _) = bench.post(
+        "a",
+        "/v1/keys",
+        &first.value,
+        &json!({ "label": "둘\n째 줄" }),
+    );
+    assert_eq!(status, 400);
+    assert_eq!(bench.keys("a", &first.value).len(), 5);
+}
+
 // ---- 값은 남지 않는다 ----
 
 #[test]
@@ -627,16 +775,9 @@ fn 열쇠의_값은_기록과_목록과_오류와_관리_서버의_폴더_어디
     bench.open("b");
     let first = bench.organization("a", "acme", "live");
     let second = bench.issue("b", &first.value, "둘째");
-    let (status, issued) = bench.post(
-        "a",
-        "/v1/operator/organizations/acme/keys",
-        OPERATOR,
-        &json!({ "label": "셋째" }),
-    );
-    assert_eq!(status, 200, "{issued}");
-    let third = issued["key"].as_str().unwrap().to_owned();
+    let third = bench.issue("a", &second.value, "셋째").value;
     let values = [first.value.clone(), second.value.clone(), third.clone()];
-    // 열쇠를 쓰고, 거두고, 거둔 열쇠로 해 보고, 틀린 일도 해 본다
+    // 키를 쓰고, 폐기하고, 폐기한 키로 해 보고, 틀린 일도 해 본다
     bench.upload("a", &first.value);
     let instance = bench.instance("a", &second.value);
     let mut answers = String::new();
@@ -645,8 +786,8 @@ fn 열쇠의_값은_기록과_목록과_오류와_관리_서버의_폴더_어디
     answers.push_str(&raw);
     let (status, _, raw) = bench.raw(
         "b",
-        "DELETE",
-        &format!("/v1/keys/{}", second.id),
+        "POST",
+        &format!("/v1/keys/{}/revoke", second.id),
         &first.value,
         &[],
     );
@@ -673,24 +814,37 @@ fn 열쇠의_값은_기록과_목록과_오류와_관리_서버의_폴더_어디
     let mut files = Vec::new();
     all_bytes(&bench.scratch, &mut files);
     for value in &values {
-        // 머리말을 뗀 몸의 일부도 없다
-        let body = &value[8..];
+        // 머리말(`orb_sk_`)을 뗀 몸의 일부도 없다
+        let body = &value["orb_sk_".len()..];
         for (place, found) in [
             ("기록", records.contains(body)),
             ("답", answers.contains(body)),
             ("폴더", contains(&files, body)),
         ] {
-            assert!(!found, "열쇠의 값이 {place}에 남았습니다");
+            assert!(!found, "키의 값이 {place}에 남았습니다");
         }
         // 기록에는 sha256 만 있다
         assert!(
             records.contains(&sha(value)),
-            "기록에 열쇠의 sha256 이 없습니다"
+            "기록에 키의 sha256 이 없습니다"
         );
     }
 }
 
-// ---- 바꾸기와 거두기 ----
+#[test]
+fn 키는_해시로만_기록에_두고_관리_서버가_다시_떠도_남는다() {
+    let mut bench = bench!();
+    bench.open("a");
+    let first = bench.organization("a", "acme", "live");
+    let second = bench.issue("a", &first.value, "배포 서버");
+    assert_eq!(bench.revoke("a", &first.value, &second.id).0, 200);
+    bench.open("a");
+    assert_eq!(bench.alive("a", &first.value), 200);
+    assert_eq!(bench.alive("a", &second.value), 401);
+    assert_eq!(bench.keys("a", &first.value).len(), 2);
+}
+
+// ---- 바꾸기와 폐기하기 ----
 
 #[test]
 fn 열쇠를_바꾸는_동안_옛_열쇠와_새_열쇠가_함께_살고_옛_것을_거두면_다음_요청부터_받지_않는다() {
@@ -700,16 +854,16 @@ fn 열쇠를_바꾸는_동안_옛_열쇠와_새_열쇠가_함께_살고_옛_것�
     bench.upload("a", &old.value);
     let instance = bench.instance("a", &old.value);
     let production = format!("/v1/instances/{instance}/production");
-    let new = bench.issue("a", &old.value, "새 열쇠");
+    let new = bench.issue("a", &old.value, "새 키");
     // 둘이 함께 산다
     for key in [&old.value, &new.value] {
         assert_eq!(bench.call("a", "GET", &production, key, &[]).0, 200);
     }
-    // 새 열쇠로 옛 열쇠를 거둔다
+    // 새 키로 옛 키를 폐기한다
     let (status, revoked) = bench.revoke("a", &new.value, &old.id);
     assert_eq!(status, 200, "{revoked}");
     assert!(revoked["revoked_at"].is_u64());
-    // 다음 요청부터 옛 열쇠는 어떤 길에서도 받지 않는다
+    // 다음 요청부터 옛 키는 어떤 길에서도 받지 않는다
     for (method, path) in [
         ("GET", production.clone()),
         ("GET", "/v1/keys".to_owned()),
@@ -721,7 +875,7 @@ fn 열쇠를_바꾸는_동안_옛_열쇠와_새_열쇠가_함께_살고_옛_것�
         assert_eq!(status, 401, "{method} {path}: {answer}");
         assert_eq!(answer["error"], "unauthorized");
     }
-    // git 의 길에서도 거둔 열쇠는 401 이다(service key 로 열지 않는다는 403 이 아니다)
+    // git 의 길에서도 폐기한 키는 401 이다(service key 로 열지 않는다는 403 이 아니다)
     let (status, _) = bench.call(
         "a",
         "GET",
@@ -730,7 +884,7 @@ fn 열쇠를_바꾸는_동안_옛_열쇠와_새_열쇠가_함께_살고_옛_것�
         &[],
     );
     assert_eq!(status, 401);
-    // 새 열쇠는 그대로 되고, 목록에 거둔 때가 보인다
+    // 새 키는 그대로 되고, 목록에 폐기한 때가 보인다
     assert_eq!(bench.call("a", "GET", &production, &new.value, &[]).0, 200);
     let keys = bench.keys("a", &new.value);
     let listed = keys
@@ -738,7 +892,7 @@ fn 열쇠를_바꾸는_동안_옛_열쇠와_새_열쇠가_함께_살고_옛_것�
         .find(|key| key["id"] == old.id.as_str())
         .unwrap();
     assert!(listed["revoked_at"].is_u64());
-    // 이미 거둔 것을 다시 거두면 아무것도 바뀌지 않는다
+    // 이미 폐기한 것을 다시 폐기하면 같은 답이고 아무것도 바뀌지 않는다
     let (status, again) = bench.revoke("a", &new.value, &old.id);
     assert_eq!(status, 200, "{again}");
     assert_eq!(again["revoked_at"], revoked["revoked_at"]);
@@ -752,7 +906,7 @@ fn 한_관리_서버에서_낸_열쇠는_다른_관리_서버가_바로_받고_�
     bench.open("a");
     bench.open("b");
     let first = bench.organization("a", "acme", "live");
-    // a 에서 만든 조직의 열쇠를 b 가 받는다
+    // a 에서 만든 조직의 키를 b 가 받는다
     assert_eq!(bench.keys("b", &first.value).len(), 1);
     for (issued_on, revoked_on, used_on) in [
         ("a", "a", "b"),
@@ -760,7 +914,7 @@ fn 한_관리_서버에서_낸_열쇠는_다른_관리_서버가_바로_받고_�
         ("a", "b", "a"),
         ("b", "a", "b"),
     ] {
-        let key = bench.issue(issued_on, &first.value, "돌려 쓰는 열쇠");
+        let key = bench.issue(issued_on, &first.value, "돌려 쓰는 키");
         for on in ["a", "b"] {
             assert_eq!(
                 bench.call(on, "GET", "/v1/keys", &key.value, &[]).0,
@@ -784,21 +938,21 @@ fn 다른_조직의_열쇠는_보지도_거두지도_못하고_없는_것과_같
     let acme = bench.organization("a", "acme", "live");
     let acme_second = bench.issue("a", &acme.value, "둘째");
     let beta = bench.organization("a", "beta", "test");
-    // beta 의 목록에는 acme 의 열쇠가 없다
+    // beta 의 목록에는 acme 의 키가 없다
     let listed = bench.keys("a", &beta.value);
     assert!(
         listed
             .iter()
             .all(|key| key["id"] != acme.id.as_str() && key["id"] != acme_second.id.as_str())
     );
-    // acme 의 열쇠를 거둬 보면 없는 열쇠와 같은 답이다
+    // acme 의 키를 폐기해 보면 없는 키와 같은 답이다
     let (status, other) = bench.revoke("a", &beta.value, &acme_second.id);
     let (unknown_status, unknown) = bench.revoke("a", &beta.value, "key_0000000000000000");
     assert_eq!((status, unknown_status), (404, 404), "{other} {unknown}");
     assert_eq!(other, unknown);
-    // 설정에만 있는 조직의 열쇠도 거두지 못한다
+    // 설정에만 있는 조직의 키로도 폐기하지 못한다
     assert_eq!(bench.revoke("a", FACTORY, &acme_second.id).0, 404);
-    // acme 의 열쇠는 그대로 산다
+    // acme 의 키는 그대로 산다
     assert_eq!(
         bench
             .call("a", "GET", "/v1/keys", &acme_second.value, &[])
@@ -817,70 +971,80 @@ fn 다른_조직의_열쇠는_보지도_거두지도_못하고_없는_것과_같
 }
 
 #[test]
-fn 살아_있는_마지막_열쇠는_거두지_못하고_운영자가_새_열쇠를_낼_수_있다() {
+fn 조직의_마지막_살아_있는_키는_폐기하지_못하고_새_키를_만든_뒤에는_폐기한다() {
     let mut bench = bench!();
     bench.open("a");
     let only = bench.organization("a", "acme", "live");
     let (status, refused) = bench.revoke("a", &only.value, &only.id);
     assert_eq!(status, 409, "{refused}");
-    assert_eq!(bench.call("a", "GET", "/v1/keys", &only.value, &[]).0, 200);
-    // 운영자가 새 열쇠를 낸다. 그러면 옛 것을 거둘 수 있다
-    let (status, issued) = bench.post(
-        "a",
-        "/v1/operator/organizations/acme/keys",
-        OPERATOR,
-        &json!({ "label": "되찾은 열쇠" }),
-    );
-    assert_eq!(status, 200, "{issued}");
-    let recovered = issued["key"].as_str().unwrap().to_owned();
-    let (status, body) = bench.revoke("a", &recovered, &only.id);
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(bench.call("a", "GET", "/v1/keys", &only.value, &[]).0, 401);
-    // 스스로를 거두는 것도 마지막이면 거절이다
-    let id = issued["id"].as_str().unwrap();
-    assert_eq!(bench.revoke("a", &recovered, id).0, 409);
-    // 없는 조직에는 운영자도 열쇠를 내지 못한다
-    let (status, _) = bench.post(
-        "a",
-        "/v1/operator/organizations/nobody/keys",
-        OPERATOR,
-        &json!({ "label": "열쇠" }),
-    );
-    assert_eq!(status, 404);
+    assert_eq!(bench.alive("a", &only.value), 200);
+    // 새 키를 만든 뒤에는 앞의 키를 폐기하고, 그러면 새 키가 마지막 키다
+    let second = bench.issue("a", &only.value, "새 키");
+    assert_eq!(bench.revoke("a", &second.value, &only.id).0, 200);
+    assert_eq!(bench.alive("a", &only.value), 401);
+    assert_eq!(bench.revoke("a", &second.value, &second.id).0, 409);
 }
 
 #[test]
-fn 운영자가_다른_열쇠를_모두_거두며_새_열쇠를_내면_새어_나간_열쇠와_그것으로_낸_열쇠가_한_번에_끊긴다()
- {
+fn 운영자는_살아_있는_키가_없는_조직에만_키를_내어_되살린다() {
+    let mut bench = bench!();
+    bench.open("a");
+    let first = bench.organization("a", "acme", "live");
+    // 살아 있는 키가 있으면 운영자는 키를 내지 않는다
+    assert_eq!(bench.admin("a", "acme", "/keys").0, 409);
+    // 설정의 키가 있는 조직에도, 없는 조직에도 내지 않고, service key 로는 부르지 못한다
+    assert_eq!(bench.admin("a", "factory", "/keys").0, 409);
+    assert_eq!(bench.admin("a", "nobody", "/keys").0, 404);
+    let (status, _) = bench.call(
+        "a",
+        "POST",
+        "/v1/admin/organizations/acme/keys",
+        &first.value,
+        &[],
+    );
+    assert_eq!(status, 401);
+    // 키의 비밀을 모두 잃은 조직에는 하나를 내어 되살린다
+    lose_all_keys(&bench, "acme");
+    assert_eq!(bench.alive("a", &first.value), 401);
+    let (status, issued) = bench.post(
+        "a",
+        "/v1/admin/organizations/acme/keys",
+        ADMIN,
+        &json!({ "label": "되찾은 키" }),
+    );
+    assert_eq!(status, 201, "{issued}");
+    assert_eq!(issued["label"], "되찾은 키");
+    let recovered = issued["secret"].as_str().unwrap().to_owned();
+    assert_eq!(bench.alive("a", &recovered), 200);
+    // 되살린 뒤에는 다시 살아 있는 키가 있으므로 더 내지 않는다
+    assert_eq!(bench.admin("a", "acme", "/keys").0, 409);
+}
+
+#[test]
+fn 운영자가_키를_갈면_새어_나간_키와_그것으로_낸_키가_한_번에_끊기고_새_키_하나로만_부른다() {
     let mut bench = bench!();
     bench.open("a");
     bench.open("b");
     let leaked = bench.organization("a", "acme", "live");
-    let other = bench.organization("a", "other", "live");
-    // 새어 나간 열쇠를 쥔 쪽이 열쇠를 더 내 두고, 주인의 열쇠를 거뒀다
+    let other = bench.organization("a", "other_co", "live");
+    // 새어 나간 키를 쥔 쪽이 키를 더 내 두고, 주인의 키를 폐기했다
     let owner = bench.issue("a", &leaked.value, "주인의 서버");
-    let planted = bench.issue("b", &leaked.value, "심어 둔 열쇠");
+    let planted = bench.issue("b", &leaked.value, "심어 둔 키");
     assert_eq!(bench.revoke("a", &planted.value, &owner.id).0, 200);
-
     // service key 로는 이 길을 열지 못한다
-    let (status, _) = bench.post(
+    let (status, _) = bench.call(
         "a",
-        "/v1/operator/organizations/acme/keys",
+        "POST",
+        "/v1/admin/organizations/acme/reset-keys",
         &leaked.value,
-        &json!({ "label": "되찾기", "revoke_others": true }),
+        &[],
     );
-    assert_eq!(status, 403);
-    // 운영자가 다른 열쇠를 모두 거두며 새 열쇠를 낸다. 거둔 수가 답에 있다(살아 있던 둘)
-    let (status, issued) = bench.post(
-        "a",
-        "/v1/operator/organizations/acme/keys",
-        OPERATOR,
-        &json!({ "label": "되찾은 열쇠", "revoke_others": true }),
-    );
-    assert_eq!(status, 200, "{issued}");
-    assert_eq!(issued["revoked"], 2, "{issued}");
-    let recovered = issued["key"].as_str().unwrap().to_owned();
-    // 새어 나간 열쇠도 그것으로 낸 열쇠도 어느 관리 서버에서든 받지 않는다. 열쇠를 더 내지도 못한다
+    assert_eq!(status, 401);
+    // 운영자가 키를 간다. 살아 있는 키가 있어도 한다
+    let (status, fresh) = bench.admin("a", "acme", "/reset-keys");
+    assert_eq!(status, 201, "{fresh}");
+    let recovered = fresh["secret"].as_str().unwrap().to_owned();
+    // 새어 나간 키도 그것으로 낸 키도 어느 관리 서버에서든 받지 않는다. 키를 더 내지도 못한다
     for on in ["a", "b"] {
         for dead in [&leaked.value, &planted.value, &owner.value] {
             assert_eq!(bench.call(on, "GET", "/v1/keys", dead, &[]).0, 401, "{on}");
@@ -888,26 +1052,61 @@ fn 운영자가_다른_열쇠를_모두_거두며_새_열쇠를_내면_새어_�
             assert_eq!(status, 401, "{on}");
         }
     }
-    // 새 열쇠 하나만 살아 있다
+    // 새 키 하나만 살아 있다
     let alive: Vec<Value> = bench
         .keys("b", &recovered)
         .into_iter()
         .filter(|key| key["revoked_at"].is_null())
         .collect();
     assert_eq!(alive.len(), 1, "{alive:?}");
-    assert_eq!(alive[0]["id"], issued["id"]);
-    // 다른 조직의 열쇠는 그대로다
-    assert_eq!(bench.call("a", "GET", "/v1/keys", &other.value, &[]).0, 200);
-    // 거두지 않고 내는 것(기본)은 다른 열쇠를 건드리지 않는다
-    let (status, more) = bench.post(
-        "a",
-        "/v1/operator/organizations/acme/keys",
-        OPERATOR,
-        &json!({ "label": "하나 더" }),
+    assert_eq!(alive[0]["id"], fresh["id"]);
+    // 다른 조직의 키는 그대로다
+    assert_eq!(bench.alive("a", &other.value), 200);
+    // 설정의 키가 있는 조직과 없는 조직의 키는 갈지 않는다
+    assert_eq!(bench.admin("a", "factory", "/reset-keys").0, 409);
+    assert_eq!(bench.admin("a", "nobody", "/reset-keys").0, 404);
+    assert_eq!(bench.alive("a", FACTORY), 200);
+}
+
+#[test]
+fn 운영자가_키를_가는_사이에_다른_관리_서버가_내던_키도_기다렸다가_함께_폐기한다() {
+    let mut bench = bench!();
+    bench.open("a");
+    let leaked = bench.organization("a", "acme", "live");
+    // 다른 관리 서버가 새어 나간 키로 키를 내는 중이다: 조직의 줄을 잡은 채 아직 commit 하지 않았다
+    let planted = "orb_sk_planted_by_the_other_server_not_a_secret";
+    let mut other = bench.control();
+    let mut pending = other.transaction().unwrap();
+    pending
+        .execute(
+            "INSERT INTO orbital.service_key (id, organization, digest, label, created_at) VALUES ('key_planted', 'acme', $1, '심어 둔 키', 1)",
+            &[&sha(planted)],
+        )
+        .unwrap();
+    std::thread::scope(|scope| {
+        let reset = scope.spawn(|| bench.admin("a", "acme", "/reset-keys"));
+        // 키 갈기는 조직의 줄을 기다린다. 그사이에 다른 관리 서버가 commit 한다
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !reset.is_finished(),
+            "키 갈기가 조직의 줄을 기다리지 않았습니다"
+        );
+        pending.commit().unwrap();
+        let (status, fresh) = reset.join().unwrap();
+        assert_eq!(status, 201, "{fresh}");
+    });
+    // 기다렸다가 함께 폐기했으므로 심어 둔 키도 받지 않는다
+    assert_eq!(bench.alive("a", planted), 401);
+    assert_eq!(bench.alive("a", &leaked.value), 401);
+    assert_eq!(
+        bench
+            .layer("a")
+            .records()
+            .organization_counts("acme")
+            .unwrap()
+            .1,
+        1
     );
-    assert_eq!(status, 200, "{more}");
-    assert_eq!(more["revoked"], 0, "{more}");
-    assert_eq!(bench.call("a", "GET", "/v1/keys", &recovered, &[]).0, 200);
 }
 
 // ---- 조직 닫기 ----
@@ -919,43 +1118,20 @@ fn 인스턴스가_남은_조직은_닫지_못하고_먼저_지울_인스턴스�
     let key = bench.organization("a", "acme", "live");
     bench.upload("a", &key.value);
     let instance = bench.instance("a", &key.value);
-    let (status, refused) = bench.call(
-        "a",
-        "POST",
-        "/v1/operator/organizations/acme/close",
-        OPERATOR,
-        &[],
-    );
+    let (status, refused) = bench.admin("a", "acme", "/close");
     assert_eq!(status, 409, "{refused}");
     assert!(
         refused["message"].as_str().unwrap().contains(&instance),
         "{refused}"
     );
-    // 닫지 않았으므로 열쇠는 그대로 산다
+    // 닫지 않았으므로 키는 그대로 산다
     assert_eq!(bench.call("a", "GET", "/v1/keys", &key.value, &[]).0, 200);
     bench.destroy("a", &key.value, &instance);
-    let (status, closed) = bench.call(
-        "a",
-        "POST",
-        "/v1/operator/organizations/acme/close",
-        OPERATOR,
-        &[],
-    );
+    let (status, closed) = bench.admin("a", "acme", "/close");
     assert_eq!(status, 200, "{closed}");
     assert!(closed["organization"]["closed_at"].is_u64());
     // 없는 조직은 닫지 못한다
-    assert_eq!(
-        bench
-            .call(
-                "a",
-                "POST",
-                "/v1/operator/organizations/nobody/close",
-                OPERATOR,
-                &[]
-            )
-            .0,
-        404
-    );
+    assert_eq!(bench.admin("a", "nobody", "/close").0, 404);
 }
 
 #[test]
@@ -963,19 +1139,13 @@ fn 닫힌_조직의_열쇠는_기록의_것이든_설정의_것이든_어느_관
     let mut bench = bench!();
     bench.open("a");
     bench.open("b");
-    // 설정의 열쇠(FACTORY)와 같은 조직 이름으로 기록의 조직을 만든다
-    let recorded = bench.organization("a", "factory", "live");
+    // 설정의 키(FACTORY)로 키를 내면 같은 조직 이름의 기록이 생긴다
+    let recorded = bench.issue("a", FACTORY, "기록의 키");
     let second = bench.issue("a", &recorded.value, "둘째");
     for key in [FACTORY, recorded.value.as_str(), second.value.as_str()] {
-        assert_eq!(bench.call("b", "GET", "/v1/settings/auth", key, &[]).0, 200);
+        assert_eq!(bench.alive("b", key), 200);
     }
-    let (status, closed) = bench.call(
-        "b",
-        "POST",
-        "/v1/operator/organizations/factory/close",
-        OPERATOR,
-        &[],
-    );
+    let (status, closed) = bench.admin("b", "factory", "/close");
     assert_eq!(status, 200, "{closed}");
     for on in ["a", "b"] {
         for key in [FACTORY, recorded.value.as_str(), second.value.as_str()] {
@@ -987,19 +1157,14 @@ fn 닫힌_조직의_열쇠는_기록의_것이든_설정의_것이든_어느_관
             );
         }
     }
-    // 닫힌 조직에는 운영자도 열쇠를 내지 않는다
-    let (status, _) = bench.post(
-        "a",
-        "/v1/operator/organizations/factory/keys",
-        OPERATOR,
-        &json!({ "label": "열쇠" }),
-    );
-    assert_eq!(status, 409);
+    // 닫힌 조직에는 운영자도 키를 내거나 갈지 않는다
+    bench.organization("a", "acme", "live");
+    assert_eq!(bench.admin("a", "acme", "/close").0, 200);
+    lose_all_keys(&bench, "acme");
+    assert_eq!(bench.admin("a", "acme", "/keys").0, 409);
+    assert_eq!(bench.admin("a", "acme", "/reset-keys").0, 409);
     // 다른 조직(설정에만 있는 other)은 그대로다
-    assert_eq!(
-        bench.call("a", "GET", "/v1/settings/auth", OTHER, &[]).0,
-        200
-    );
+    assert_eq!(bench.alive("a", OTHER), 200);
 }
 
 // ---- 시험용 조직 ----
@@ -1046,7 +1211,7 @@ fn 시험용_조직은_인스턴스의_상한을_넘지_못하고_운영의_조�
     }
 }
 
-// ---- 설정의 열쇠와 함께 살기 ----
+// ---- 설정의 키와 함께 살기 ----
 
 #[test]
 fn 설정의_열쇠와_기록의_열쇠가_같은_조직_이름을_가리켜_함께_산다() {
@@ -1054,22 +1219,103 @@ fn 설정의_열쇠와_기록의_열쇠가_같은_조직_이름을_가리켜_함
     bench.open("a");
     bench.upload("a", FACTORY);
     let instance = bench.instance("a", FACTORY);
-    // 설정에만 있는 조직은 열쇠를 내지 못한다(기록에 조직이 없다). 목록은 비어 있다
-    let (status, refused) = bench.post("a", "/v1/keys", FACTORY, &json!({ "label": "열쇠" }));
-    assert_eq!(status, 409, "{refused}");
+    // 설정에만 있는 조직의 목록은 비어 있다(설정의 키는 목록에 보이지 않는다)
     assert!(bench.keys("a", FACTORY).is_empty());
-    // 운영자가 같은 이름으로 조직을 만들면 기록의 열쇠가 같은 인스턴스를 본다
-    let recorded = bench.organization("a", "factory", "live");
+    // 설정의 키로 키를 내면 그 조직의 기록이 운영의 조직으로 생기고, 그 키가 같은 인스턴스를 본다
+    let recorded = bench.issue("a", FACTORY, "API 로 만든 키");
     let production = format!("/v1/instances/{instance}/production");
     for key in [FACTORY, recorded.value.as_str()] {
         assert_eq!(bench.call("a", "GET", &production, key, &[]).0, 200);
     }
-    // 설정의 열쇠로도 이제 열쇠를 낸다
-    let more = bench.issue("a", FACTORY, "설정의 열쇠로 낸 것");
+    let organization = bench
+        .layer("a")
+        .records()
+        .organization("factory")
+        .unwrap()
+        .unwrap();
+    assert_eq!(organization.kind, orbital_core::organization::Kind::Live);
+    // 설정의 키는 목록에 보이지 않는다
+    assert_eq!(ids(&bench.keys("a", FACTORY)), vec![recorded.id.clone()]);
+    // 기록의 키로도 키를 낸다
+    let more = bench.issue("a", &recorded.value, "기록의 키로 낸 것");
     assert_eq!(bench.call("a", "GET", &production, &more.value, &[]).0, 200);
-    // 다른 조직(other)의 열쇠에는 여전히 없는 인스턴스다
+    // 다른 조직(other)의 키에는 여전히 없는 인스턴스다
     assert_eq!(bench.call("a", "GET", &production, OTHER, &[]).0, 404);
     bench.destroy("a", &recorded.value, &instance);
+}
+
+#[test]
+fn 환경_변수의_키는_부트스트랩으로_계속_쓰이고_그_조직의_마지막_기록의_키도_폐기한다() {
+    let mut bench = bench!();
+    bench.open("a");
+    assert_eq!(bench.alive("a", FACTORY), 200);
+    let made = bench.issue("a", FACTORY, "API 로 만든 키");
+    // 설정의 키가 있으니 마지막 기록의 키도 폐기한다. 조직은 잠기지 않는다
+    assert_eq!(bench.revoke("a", FACTORY, &made.id).0, 200);
+    assert_eq!(bench.alive("a", FACTORY), 200);
+    assert_eq!(bench.alive("a", &made.value), 401);
+}
+
+// ---- 옛 기록 파일에서 옮기기 ----
+
+#[test]
+fn 옛_registry_json_의_조직과_키는_처음_뜰_때_옮겨져_같은_비밀이_계속_통한다() {
+    let mut bench = bench!();
+    // `main` 의 레이어가 적던 모양. 비밀은 없고 sha256 만 있다
+    let live = "orb_sk_old_live_key_not_a_secret_0000000000";
+    let gone = "orb_sk_old_revoked_key_not_a_secret_00000000";
+    let home = bench.home("a");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("registry.json"),
+        json!({
+            "organizations": {
+                "old-factory": {
+                    "label": "옛 팩토리",
+                    "created_at": 1_800_000_000_u64,
+                    "keys": [
+                        { "id": "key_0000000000000001", "label": "", "digest": sha(live), "created_at": 1_800_000_000_u64 },
+                        { "id": "key_0000000000000002", "label": "배포 서버", "digest": sha(gone), "created_at": 1_800_000_100_u64, "revoked_at": 1_800_000_200_u64 }
+                    ]
+                }
+            },
+            "instances": {},
+            "rollouts": {}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    bench.open("a");
+    assert!(home.join("registry.json.imported").is_file());
+    // 같은 비밀이 계속 통하고, 폐기한 키는 그대로 폐기한 것이다. 다른 관리 서버도 같다
+    bench.open("b");
+    for on in ["a", "b"] {
+        assert_eq!(bench.alive(on, live), 200, "{on}");
+        assert_eq!(bench.alive(on, gone), 401, "{on}");
+    }
+    let keys = bench.keys("a", live);
+    assert_eq!(
+        ids(&keys),
+        vec!["key_0000000000000001", "key_0000000000000002"]
+    );
+    assert_eq!(keys[1]["label"], "배포 서버");
+    assert_eq!(keys[1]["revoked_at"], 1_800_000_200_u64);
+    let (status, report) = bench.call(
+        "a",
+        "GET",
+        "/v1/admin/organizations/old-factory",
+        ADMIN,
+        &[],
+    );
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["name"], "옛 팩토리");
+    assert_eq!(report["kind"], "live");
+    assert_eq!(report["keys"], 1);
+    // 옮긴 조직은 마지막 살아 있는 키를 폐기하지 못한다
+    assert_eq!(bench.revoke("a", live, "key_0000000000000001").0, 409);
+    // 다시 떠도 두 번 옮기지 않는다
+    bench.open("a");
+    assert_eq!(bench.keys("a", live).len(), 2);
 }
 
 // ---- 기록을 읽지 못할 때 ----

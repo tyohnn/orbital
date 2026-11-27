@@ -120,9 +120,36 @@ pub struct RolloutRecord {
     pub rollout: Rollout,
 }
 
+/// 옛 기록 파일의 service key 한 줄(2026-11-26 의 `main` 이 적던 모양). 비밀은 없고 sha256(hex)만 있다. 처음 뜰 때 control database 로 옮긴다.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyRecord {
+    pub id: String,
+    /// 사람이 붙인 이름(「배포 서버」 같은).
+    pub label: String,
+    /// 비밀의 sha256(hex).
+    pub digest: String,
+    pub created_at: u64,
+    /// 폐기한 시각.
+    #[serde(default)]
+    pub revoked_at: Option<u64>,
+}
+
+/// 옛 기록 파일의 팩토리 하나. 운영자 키로 만들었거나, 설정의 열쇠로 처음 키를 만들 때 생겼다.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OrganizationRecord {
+    pub label: String,
+    pub created_at: u64,
+    /// 만든 차례대로. 폐기한 키도 있다.
+    #[serde(default)]
+    pub keys: Vec<KeyRecord>,
+}
+
 /// 옛 기록 파일(`registry.json`)의 모양.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
+    /// API 로 만든 팩토리(설정의 열쇠로 처음 키를 만든 조직도 있다).
+    #[serde(default)]
+    pub organizations: BTreeMap<String, OrganizationRecord>,
     #[serde(default)]
     pub instances: BTreeMap<String, InstanceRecord>,
     /// rollout 의 식별자마다. 끝났거나 거둔 것도 남긴다.

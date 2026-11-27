@@ -25,8 +25,8 @@ use serde_json::{Value, json};
 
 const FACTORY: &str = "sk_test_factory";
 const OTHER_FACTORY: &str = "sk_test_other";
-/// 운영자의 열쇠(`ORBITAL_OPERATOR_KEY`). 모든 관리 서버가 같이 쓴다.
-const OPERATOR: &str = "op_test_operator_key_not_a_secret_0000";
+/// 운영자 키(`ORBITAL_ADMIN_KEY`). 모든 관리 서버가 같이 쓴다.
+const ADMIN: &str = "admin_key_for_tests_0123456789abcdef";
 /// 모든 관리 서버가 같이 쓰는 토큰의 열쇠(`ORBITAL_TOKEN_KEY`).
 const TOKEN_KEY: [u8; 32] = [3; 32];
 const ALL: [&str; 4] = ["source", "preview", "rehearse", "secrets_request"];
@@ -336,7 +336,7 @@ impl Bench {
             ),
             machine_url: api,
             machine_router_url: router,
-            operator_key: Some(OPERATOR.to_owned()),
+            admin_key: Some(ADMIN.to_owned()),
             hosting: listen.map(|listen| Hosting {
                 listen,
                 base: BaseDomain::parse(BASE).unwrap(),
@@ -900,22 +900,23 @@ fn 기록의_service_key_는_넘겨받은_요청에서도_놓인_기계가_다�
  {
     let mut bench = bench!(false);
     let instance = pair(&mut bench);
-    // 설정의 열쇠(FACTORY)와 같은 조직 이름으로 기록의 조직을 b 에서 만들고 열쇠 둘을 낸다
-    let (status, created) = bench.post(
-        "b",
-        "/v1/operator/organizations",
-        OPERATOR,
-        &json!({ "id": "factory", "name": "팩토리", "kind": "live" }),
-    );
-    assert_eq!(status, 200, "{created}");
-    let first = created["key"]["key"].as_str().unwrap().to_owned();
+    // 설정의 키(FACTORY)로 b 에서 키 둘을 낸다. 같은 조직 이름의 기록이 생긴다
+    let (status, created) = bench.post("b", "/v1/keys", FACTORY, &json!({ "label": "첫째" }));
+    assert_eq!(status, 201, "{created}");
+    let first = created["secret"].as_str().unwrap().to_owned();
     let (status, issued) = bench.post("b", "/v1/keys", &first, &json!({ "label": "둘째" }));
-    assert_eq!(status, 200, "{issued}");
-    let second = issued["key"].as_str().unwrap().to_owned();
+    assert_eq!(status, 201, "{issued}");
+    let second = issued["secret"].as_str().unwrap().to_owned();
     let second_id = issued["id"].as_str().unwrap().to_owned();
     let path = format!("/v1/instances/{instance}");
-    // a 에서 거둔다
-    let (status, body) = bench.call("a", "DELETE", &format!("/v1/keys/{second_id}"), &first, &[]);
+    // a 에서 폐기한다
+    let (status, body) = bench.call(
+        "a",
+        "POST",
+        &format!("/v1/keys/{second_id}/revoke"),
+        &first,
+        &[],
+    );
     assert_eq!(status, 200, "{body}");
     // b 는 거둔 열쇠를 넘기기 전에 막는다. a 에 닿지 않는다
     let before = bench.machine("a").front.hits();

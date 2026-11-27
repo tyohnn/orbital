@@ -1,17 +1,17 @@
-// 팩토리의 운영자가 터미널에서 부르는 스크립트. 함대 · 이력 · 서비스의 상태 · 운영의 로그를 읽고, 열쇠와 웹훅을 다룬다.
+// 팩토리의 운영자가 터미널에서 부르는 스크립트. 함대 · 이력 · 서비스의 상태 · 운영의 로그를 읽고, service key 와 웹훅을 다룬다.
 //
 //   npm run operator -- fleet                     함대(이 조직의 인스턴스)
 //   npm run operator -- history <인스턴스>         release 의 이력(누가 승인했는지 포함)
 //   npm run operator -- services <인스턴스>        운영의 서비스마다 깨어 있는지 · 자는지
 //   npm run operator -- logs <인스턴스> [줄]       운영의 로그의 끝
 //   npm run operator -- destroy <인스턴스>         인스턴스를 걷는다(되돌릴 수 없다)
-//   npm run operator -- keys                      service key 의 목록(값 없이)
-//   npm run operator -- key-create <이름표>        열쇠를 하나 더 낸다. 값은 이때 한 번만 찍힌다
-//   npm run operator -- key-revoke <id>           열쇠를 거둔다
+//   npm run operator -- keys                      service key 의 목록(비밀 없이)
+//   npm run operator -- key-create [이름표]        키를 하나 더 낸다. 비밀은 이때 한 번만 찍힌다
+//   npm run operator -- key-revoke <id>           키를 폐기한다
 //   npm run operator -- webhook <https 주소>       웹훅을 건다. 서명 비밀은 이때 한 번만 찍힌다
 //
 // ⚠ **운영의 로그는 여기서만 읽는다.** 앱이 찍은 글이라 고객의 데이터가 섞일 수 있다. 에이전트의 도구로 돌려주지 않는다.
-// ⚠ 열쇠와 비밀의 값은 낼 때 한 번 찍힌다. 터미널의 기록에 남기지 말고 팩토리의 비밀 저장소로 옮긴다.
+// ⚠ 키와 웹훅의 비밀은 낼 때 한 번 찍힌다. 터미널의 기록에 남기지 말고 팩토리의 비밀 저장소로 옮긴다.
 import { createOrbital } from "@harmony/orbital/server";
 
 const url = process.env.ORBITAL_URL ?? "";
@@ -98,19 +98,19 @@ switch (command)
     case "keys":
         for (const key of await orbital.keys.list())
         {
-            console.log(`${key.id}  ${key.prefix}…  ${key.label}  만든 때 ${when(key.createdAt)}  거둔 때 ${when(key.revokedAt)}  마지막으로 쓴 때 ${when(key.usedAt)}`);
+            console.log(`${key.id}  ${key.label}  만든 때 ${when(key.createdAt)}  폐기한 때 ${when(key.revokedAt)}  마지막으로 쓴 때 ${when(key.usedAt)}`);
         }
         break;
     case "key-create":
     {
-        const issued = await orbital.keys.create({ label: needs(first, "이름표") });
-        console.log(`새 열쇠 ${issued.id}: ${issued.key}`);
-        console.log("값은 다시 받을 수 없습니다. 팩토리의 비밀 저장소에 옮기고 서버를 이 열쇠로 다시 띄운 뒤 옛 열쇠를 거둬 주세요.");
+        const issued = await orbital.keys.create(first === undefined ? {} : { label: first });
+        console.log(`새 키 ${issued.id}: ${issued.secret}`);
+        console.log("비밀은 다시 받을 수 없습니다. 팩토리의 비밀 저장소에 옮기고 서버를 이 키로 다시 띄운 뒤 옛 키를 폐기해 주세요.");
         break;
     }
     case "key-revoke":
         await orbital.keys.revoke(needs(first, "id"));
-        console.log("거뒀습니다");
+        console.log("폐기했습니다");
         break;
     case "webhook":
     {

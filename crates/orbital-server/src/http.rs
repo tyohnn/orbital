@@ -1,13 +1,15 @@
 //! HTTP API. 팩토리의 서버가 SDK 로 부른다. 에이전트는 레이어를 직접 부르지 않고 팩토리의 도구와 git 만 쓴다.
 //!
 //! 요청마다 `Authorization: Bearer …` 를 본다. `orb1.` 로 시작하면 작업의 토큰이고, 아니면 팩토리의 service key 다.
+//! `/v1/admin/…` 은 운영자 키(`ORBITAL_ADMIN_KEY`)만 받는다. 조직을 만들고(첫 키와 함께) 보고 닫고, 잠긴 조직에 키를 내고 키를 간다.
+//! 대시보드가 가입을 받을 때 부른다. 팩토리는 제 service key 로 `/v1/keys` 에서 키를 보고 · 만들고 · 폐기한다.
 //! 토큰으로 되는 일과 service key 로 되는 일은 길이 다르다. 운영을 바꾸는 길은 service key 쪽에만 있다.
 //! git 이 바로 붙는 길(`/v1/instances/{id}/git/…`, smart HTTP)은 작업의 토큰으로만 열린다. git 의 자격 도우미가 보내는
 //! `Basic` 의 비밀번호 자리에 든 토큰도 받고, 사용자 이름은 보지 않는다. 자격이 없으면 401 과 `WWW-Authenticate: Basic` 으로 답한다.
 //! 열쇠 없이 오는 길은 Google 의 콜백(`GET /v1/auth/google/callback`) 하나다. 무엇을 할지는 레이어가 서명한 `state` 가 정한다.
-//! service key 는 관리 서버의 설정(`ORBITAL_SERVICE_KEYS`)이나 기록(control database, sha256 으로만)에 있고, 요청마다 거뒀는지와 조직이 닫혔는지를 본다.
-//! 조직은 자기 열쇠를 더 내고(`POST /v1/keys`, 값은 그 답에만) 보고(`GET /v1/keys`, 값 없이) 거둔다(`DELETE /v1/keys/{id}`).
-//! 운영자의 길(`/v1/operator/…`)은 운영자의 열쇠로만 열리고 조직을 만들고 보고 닫고 열쇠를 낸다. 운영자의 열쇠로는 조직의 일을 하지 못한다.
+//! service key 는 관리 서버의 설정(`ORBITAL_SERVICE_KEYS`)이나 기록(control database, sha256 으로만)에 있고, 요청마다 폐기했는지와 조직이 닫혔는지를 본다.
+//! 조직은 제 키를 더 내고(`POST /v1/keys`, 비밀은 그 답에만) 보고(`GET /v1/keys`, 비밀 없이) 폐기한다(`POST /v1/keys/{id}/revoke`).
+//! 운영자 키로는 조직의 일을 하지 못하고(403), service key 와 작업의 토큰은 운영자의 길을 열지 못한다(401).
 //! 팩토리의 로그인 설정(`/v1/settings/auth`)은 service key 에만 있고, 넣은 비밀은 어떤 답에도 싣지 않는다.
 //! 이벤트(`GET /v1/events?after=&limit=`)와 웹훅(`/v1/settings/webhook`)도 service key 에만 있다. 웹훅의 서명 비밀은 걸 때의 답에만 실린다.
 //! 밖에서 넣는 비밀(`/v1/instances/{id}/secrets`)의 값은 service key 와 입력 표(`POST /v1/secret-entries`, 표는 `Authorization: Bearer`)로만 들어오고 어떤 열쇠로도 나가지 않는다.
@@ -26,7 +28,7 @@ use std::sync::Arc;
 use orbital_core::auth::query_value;
 use orbital_core::git::{Route as GitRoute, route as git_route};
 use orbital_core::name::InstanceId;
-use orbital_core::organization::Kind as OrganizationKind;
+use orbital_core::organization::{Kind as OrganizationKind, OperatorIssue};
 use orbital_core::placement::{Route, Unforwarded, route as place_route};
 use orbital_core::release::{Approver, Change, PromoteDenied};
 use orbital_core::scope::{Action, Capability};
@@ -395,6 +397,79 @@ fn entry(layer: &Layer, method: &str, ticket: Option<&str>, body: &[u8]) -> Repl
     reply
 }
 
+/// 운영자가 만드는 조직. 첫 키를 함께 낸다. `label` 은 사람이 읽는 조직의 이름이고, `kind` 가 없으면 운영의 조직(`live`)이다.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewOrganization {
+    id: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    kind: Option<OrganizationKind>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct NewKey {
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// 빈 본문은 기본값으로 읽는다(`POST /v1/keys` 는 이름 없이 불러도 된다).
+fn parse_or_default<'a, T: Deserialize<'a> + Default>(body: &'a [u8]) -> Result<T, Failure> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(T::default());
+    }
+    parse(body)
+}
+
+fn created(value: Value) -> Reply {
+    Reply {
+        status: 201,
+        ..ok(value)
+    }
+}
+
+/// 운영자 키로 하는 일. 조직을 만들고 보고 닫으며, 살아 있는 키가 없는 조직에 키를 내고, 키를 간다.
+/// 살아 있는 조직의 인스턴스에는 닿지 않는다.
+fn with_operator(
+    layer: &Layer,
+    method: &str,
+    path: &[&str],
+    body: &[u8],
+) -> Result<Reply, Failure> {
+    match (method, path) {
+        ("POST", ["organizations"]) => {
+            let request: NewOrganization = parse(body)?;
+            let (organization, key) = layer.create_organization(
+                &request.id,
+                request.label.as_deref(),
+                request.kind.unwrap_or(OrganizationKind::Live),
+            )?;
+            Ok(created(json!({ "organization": organization, "key": key })))
+        }
+        ("GET", ["organizations"]) => Ok(ok(json!({ "organizations": layer.organizations()? }))),
+        ("GET", ["organizations", organization]) => {
+            Ok(ok(json!(layer.organization_report(organization)?)))
+        }
+        ("POST", ["organizations", organization, "keys"]) => {
+            let request: NewKey = parse_or_default(body)?;
+            Ok(created(json!(layer.operator_issue_key(
+                organization,
+                request.label.as_deref(),
+                OperatorIssue::Issue
+            )?)))
+        }
+        ("POST", ["organizations", organization, "reset-keys"]) => Ok(created(json!(
+            layer.operator_issue_key(organization, None, OperatorIssue::Reset)?
+        ))),
+        ("POST", ["organizations", organization, "close"]) => Ok(ok(json!({
+            "organization": layer.close_organization(organization)?
+        }))),
+        _ => Err(Failure::NotFound),
+    }
+}
+
 #[derive(Deserialize)]
 struct NewInstance {
     app: String,
@@ -589,13 +664,15 @@ fn with_service_key(
     let caller = layer.caller(key)?;
     let organization = caller.organization.0.clone();
     match (method, path) {
-        // 이 조직의 service key. 값은 낼 때의 답에만 실린다
+        // 제 조직의 키. 목록에는 비밀이 없고, 만든 키의 비밀은 이 답에서 한 번만 보인다. 설정의 키는 목록에 없다
         ("GET", ["keys"]) => Ok(ok(json!({ "keys": layer.list_keys(&caller)? }))),
         ("POST", ["keys"]) => {
-            let request: NewKeyRequest = parse(body)?;
-            Ok(ok(json!(layer.issue_key(&caller, &request.label)?)))
+            let request: NewKey = parse_or_default(body)?;
+            Ok(created(json!(
+                layer.issue_key(&caller, request.label.as_deref())?
+            )))
         }
-        ("DELETE", ["keys", id]) => Ok(ok(json!(layer.revoke_key(&caller, id)?))),
+        ("POST", ["keys", id, "revoke"]) => Ok(ok(json!(layer.revoke_key(&caller, id)?))),
         // 팩토리마다 한 벌. 비밀은 답에 싣지 않는다
         ("GET", ["settings", "auth"]) => Ok(ok(layer.auth_settings(&organization))),
         ("PUT", ["settings", "auth"]) => {
@@ -794,81 +871,6 @@ fn with_service_key(
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NewKeyRequest {
-    label: String,
-}
-
-/// 운영자가 조직에 내는 열쇠. `revoke_others` 면 그 조직의 다른 살아 있는 열쇠를 함께 모두 거둔다(열쇠가 새어 나갔을 때).
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OperatorKeyRequest {
-    label: String,
-    #[serde(default)]
-    revoke_others: bool,
-}
-
-/// 운영자가 만드는 조직. 첫 열쇠를 함께 낸다.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NewOrganization {
-    id: String,
-    name: String,
-    kind: OrganizationKind,
-    /// 첫 열쇠의 이름. 없으면 「첫 열쇠」다.
-    #[serde(default)]
-    label: Option<String>,
-}
-
-/// 운영자의 길(`/v1/operator/…`). 운영자의 열쇠로만 연다. 조직을 만들고(첫 열쇠와 함께) 보고 닫고, 열쇠를 낸다.
-/// 운영자의 열쇠를 주지 않은 레이어에는 이 길이 없다(404). service key 와 작업의 토큰으로는 열지 않는다(403).
-fn operator(
-    layer: &Layer,
-    method: &str,
-    path: &[&str],
-    bearer: Option<&str>,
-    body: &[u8],
-) -> Result<Reply, Failure> {
-    if !layer.operator_enabled() {
-        return Err(Failure::NotFound);
-    }
-    let Some(bearer) = bearer else {
-        return Err(Failure::Unauthorized);
-    };
-    if !layer.is_operator(bearer) {
-        return Err(Failure::Forbidden(
-            "운영자의 길은 운영자의 열쇠(`ORBITAL_OPERATOR_KEY`)로만 엽니다. service key 와 작업의 토큰으로는 열지 않습니다".to_owned(),
-        ));
-    }
-    match (method, path) {
-        ("POST", ["organizations"]) => {
-            let request: NewOrganization = parse(body)?;
-            let (organization, key) = layer.create_organization(
-                &request.id,
-                &request.name,
-                request.kind,
-                request.label.as_deref().unwrap_or("첫 열쇠"),
-            )?;
-            Ok(ok(json!({ "organization": organization, "key": key })))
-        }
-        ("GET", ["organizations"]) => Ok(ok(json!({ "organizations": layer.organizations()? }))),
-        ("GET", ["organizations", id]) => Ok(ok(json!(layer.organization_report(id)?))),
-        ("POST", ["organizations", id, "keys"]) => {
-            let request: OperatorKeyRequest = parse(body)?;
-            let (key, revoked) =
-                layer.operator_issue_key(id, &request.label, request.revoke_others)?;
-            let mut answer = json!(key);
-            answer["revoked"] = json!(revoked);
-            Ok(ok(answer))
-        }
-        ("POST", ["organizations", id, "close"]) => {
-            Ok(ok(json!({ "organization": layer.close_organization(id)? })))
-        }
-        _ => Err(Failure::NotFound),
-    }
-}
-
 /// git 의 길이 보는 요청의 나머지.
 #[derive(Clone, Copy)]
 struct Incoming<'a> {
@@ -1038,14 +1040,17 @@ pub fn handle_request(layer: &Layer, call: &Call<'_>) -> Reply {
             Err(error) => failure(error),
         };
     }
-    // 운영자의 길. 운영자의 열쇠를 준 레이어에만 있다
-    if let ["operator", tail @ ..] = rest {
-        return operator(layer, method, tail, bearer, body).unwrap_or_else(failure);
-    }
     let Some(bearer) = bearer else {
         return failure(Failure::Unauthorized);
     };
-    let result = if bearer.starts_with("orb1.") {
+    let result = if let ["admin", tail @ ..] = rest {
+        // 운영자 키가 아니면(service key · 토큰이어도, 운영자 키를 두지 않은 레이어여도) 이 길은 열리지 않는다
+        if layer.is_admin(bearer) {
+            with_operator(layer, method, tail, body)
+        } else {
+            Err(Failure::Unauthorized)
+        }
+    } else if bearer.starts_with("orb1.") {
         match rest {
             ["instances", tail @ ..] => with_token(layer, method, tail, bearer, body),
             // rollout 을 만들고 · 합치고 · 다시 열고 · 거두는 길을 토큰으로 두드리면 core 가 「service key 로만」이라고 답한다

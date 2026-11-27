@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+:root
+{
+    color-scheme: light dark;
+}
+
+body
+{
+    font-family: ui-sans-serif, system-ui, -apple-system, "Pretendard", sans-serif;
+}

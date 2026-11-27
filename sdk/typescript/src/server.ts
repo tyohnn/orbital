@@ -194,32 +194,6 @@ export interface SecretEntry
     expiresAt: number;
 }
 
-/**
- * 조직의 service key 하나. 값은 없다. 값은 낼 때(`keys.create`)의 답 한 번에만 오고, 레이어는 sha256 만 갖는다.
- * `prefix` 는 조직의 종류(`sk_live_` 운영 · `sk_test_` 시험용)다.
- */
-export interface ServiceKey
-{
-    id: string;
-    label: string;
-    prefix: "sk_live_" | "sk_test_";
-    /** 만든 때(Unix 초). */
-    createdAt: number;
-    /** 거둔 때(Unix 초). 살아 있으면 `null` 이다. */
-    revokedAt: number | null;
-    /** 마지막으로 쓴 때(Unix 초, 분 단위로 뭉친 것). 쓴 적이 없으면 `null` 이다. */
-    usedAt: number | null;
-}
-
-/** 새로 낸 열쇠. `key`(값)는 이 답에만 있다. 팩토리의 서버의 비밀 저장소에 옮겨 두고, 다시 받을 길은 없다. */
-export interface IssuedServiceKey
-{
-    id: string;
-    label: string;
-    key: string;
-    createdAt: number;
-}
-
 /** 이벤트의 종류(`무엇.어찌됨`). 종류는 늘 수 있으니 받는 쪽은 모르는 종류를 건너뛴다. */
 export type EventType =
     | "promotion.requested"
@@ -631,6 +605,26 @@ export interface GoogleSettings
     clientSecret: string;
 }
 
+/** 팩토리의 service key 한 줄. 비밀은 실리지 않는다. */
+export interface ServiceKey
+{
+    id: string;
+    /** 사람이 붙인 이름(「배포 서버」 같은). */
+    label: string;
+    /** 만든 때(Unix 초). */
+    createdAt: number;
+    /** 폐기한 때(Unix 초). 살아 있으면 `null` 이다. 폐기한 키는 다음 요청부터 거절된다. */
+    revokedAt: number | null;
+    /** 마지막으로 쓴 때(Unix 초, 분 단위로 뭉친 것). 쓴 적이 없으면 `null` 이다. */
+    usedAt: number | null;
+}
+
+/** 막 만든 키. `secret` 은 이 답에서 한 번만 보인다. 다시 받을 길은 없다. */
+export interface IssuedKey extends ServiceKey
+{
+    secret: string;
+}
+
 export interface OrbitalOptions
 {
     /** 관리 서버의 주소. */
@@ -643,6 +637,14 @@ export interface OrbitalOptions
 
 export interface Orbital
 {
+    keys: {
+        /** 제 조직의 키를 만든 차례로. 폐기한 키도 오고, 비밀은 오지 않는다. 환경 변수의 키는 보이지 않는다. */
+        list(): Promise<ServiceKey[]>;
+        /** 새 키를 만든다. 비밀은 돌아온 값에서 한 번만 보인다. */
+        create(input?: { label?: string }): Promise<IssuedKey>;
+        /** 키를 폐기한다. 조직의 마지막 살아 있는 키는 폐기하지 못한다(409). 다른 조직의 키는 없는 키와 같다(404). */
+        revoke(id: string): Promise<ServiceKey>;
+    };
     apps: {
         /** 스캐폴드를 올린다. `bundle` 은 버전마다 태그를 단 저장소의 git bundle 이다. */
         put(app: string, bundle: Uint8Array): Promise<void>;
@@ -676,21 +678,6 @@ export interface Orbital
     backup: {
         /** 레이어의 복구 훈련이 통과했는지와 숫자. */
         get(): Promise<Backup>;
-    };
-    /**
-     * 이 조직의 service key. 바꿀 때는 새 열쇠를 내고(`create`), 팩토리의 서버를 그 열쇠로 옮긴 뒤 옛 열쇠를 거둔다(`revoke`).
-     * 둘은 거두기 전까지 함께 산다. 조직(과 첫 열쇠)은 레이어의 운영자가 만든다. 관리 서버의 설정에만 있는 조직은 열쇠를 내지 못한다(409).
-     */
-    keys: {
-        /** 열쇠를 하나 더 낸다. 값은 이 답에만 있다. */
-        create(input: { label: string }): Promise<IssuedServiceKey>;
-        /** 이 조직의 열쇠 모두(거둔 것도). 값은 없다. */
-        list(): Promise<ServiceKey[]>;
-        /**
-         * 열쇠를 거둔다. 어느 관리 서버에서든 다음 요청부터 받지 않는다. 다른 조직의 열쇠는 없는 것과 같고(404),
-         * 살아 있는 마지막 열쇠는 거두지 않는다(409. 새 열쇠를 먼저 낸다). 이미 거둔 것이면 그대로 돌려준다.
-         */
-        revoke(id: string): Promise<ServiceKey>;
     };
     /**
      * 이 조직의 이벤트(승격의 요청 · 승격 · 되돌려진 승격 · rollout 의 진행 · 비밀의 요청 · 인스턴스의 생김과 지워짐). 30일 동안 둔다.
@@ -927,33 +914,12 @@ function toRollout(value: unknown): Rollout
     };
 }
 
-function toAuthSettings(value: unknown): AuthSettings
-{
-    const record = isRecord(value) ? value : {};
-    const mail = isRecord(record.mail) ? record.mail : {};
-    const google = isRecord(record.google) ? record.google : {};
-    return {
-        mail: {
-            configured: mail.configured === true,
-            provider: mail.provider === "resend" ? "resend" : null,
-            from: typeof mail.from === "string" ? mail.from : null,
-            fromName: typeof mail.from_name === "string" ? mail.from_name : null,
-        },
-        google: {
-            configured: google.configured === true,
-            clientId: typeof google.client_id === "string" ? google.client_id : null,
-            redirectUri: text(google.redirect_uri),
-        },
-    };
-}
-
-function toServiceKey(value: unknown): ServiceKey
+function toKey(value: unknown): ServiceKey
 {
     const record = isRecord(value) ? value : {};
     return {
         id: text(record.id),
         label: text(record.label),
-        prefix: record.prefix === "sk_test_" ? "sk_test_" : "sk_live_",
         createdAt: number(record.created_at),
         revokedAt: typeof record.revoked_at === "number" ? record.revoked_at : null,
         usedAt: typeof record.used_at === "number" ? record.used_at : null,
@@ -1250,14 +1216,18 @@ function gitTail(method: string, url: URL): string | undefined
 const GIT_REQUEST_HEADERS = ["content-type", "content-encoding", "accept"];
 const GIT_ANSWER_HEADERS = ["content-type", "cache-control"];
 
-export function createOrbital(options: OrbitalOptions): Orbital
+function toIssuedKey(value: unknown): IssuedKey
 {
-    const base = options.url.replace(/\/+$/, "");
-    const send = options.fetch ?? fetch;
+    return { ...toKey(value), secret: text(isRecord(value) ? value.secret : undefined) };
+}
 
-    async function call(method: string, path: string, body?: Json | Uint8Array, bearer: string = options.serviceKey): Promise<unknown>
+/** 열쇠 하나로 관리 서버를 부르는 함수를 짓는다. 실패하면 `OrbitalError` 를 던진다. `as` 를 주면 그 열쇠(작업의 토큰)로 부른다. */
+function caller(url: string, bearer: string, send: typeof fetch)
+{
+    const base = url.replace(/\/+$/, "");
+    return async function call(method: string, path: string, body?: Json | Uint8Array, as: string = bearer): Promise<unknown>
     {
-        const headers: Record<string, string> = { authorization: `Bearer ${bearer}` };
+        const headers: Record<string, string> = { authorization: `Bearer ${as}` };
         const init: RequestInit = { method, headers };
         if (body instanceof Uint8Array)
         {
@@ -1284,7 +1254,34 @@ export function createOrbital(options: OrbitalOptions): Orbital
             texts(problem.details),
             text(problem.machine) || null,
         );
-    }
+    };
+}
+
+function toAuthSettings(value: unknown): AuthSettings
+{
+    const record = isRecord(value) ? value : {};
+    const mail = isRecord(record.mail) ? record.mail : {};
+    const google = isRecord(record.google) ? record.google : {};
+    return {
+        mail: {
+            configured: mail.configured === true,
+            provider: mail.provider === "resend" ? "resend" : null,
+            from: typeof mail.from === "string" ? mail.from : null,
+            fromName: typeof mail.from_name === "string" ? mail.from_name : null,
+        },
+        google: {
+            configured: google.configured === true,
+            clientId: typeof google.client_id === "string" ? google.client_id : null,
+            redirectUri: text(google.redirect_uri),
+        },
+    };
+}
+
+export function createOrbital(options: OrbitalOptions): Orbital
+{
+    const base = options.url.replace(/\/+$/, "");
+    const send = options.fetch ?? fetch;
+    const call = caller(options.url, options.serviceKey, send);
 
     const at = (instance: string, tail: string): string => `instances/${encodeURIComponent(instance)}${tail}`;
 
@@ -1414,6 +1411,22 @@ export function createOrbital(options: OrbitalOptions): Orbital
     }
 
     return {
+        keys: {
+            async list()
+            {
+                const reply = await call("GET", "keys");
+                const keys = isRecord(reply) && Array.isArray(reply.keys) ? reply.keys : [];
+                return keys.map(toKey);
+            },
+            async create(input = {})
+            {
+                return toIssuedKey(await call("POST", "keys", input.label === undefined ? {} : { label: input.label }));
+            },
+            async revoke(id)
+            {
+                return toKey(await call("POST", `keys/${encodeURIComponent(id)}/revoke`));
+            },
+        },
         apps: {
             async put(app, bundle)
             {
@@ -1511,23 +1524,6 @@ export function createOrbital(options: OrbitalOptions): Orbital
                             failedChecks: number(last.failed_checks),
                         },
                 };
-            },
-        },
-        keys: {
-            async create({ label })
-            {
-                const reply = await call("POST", "keys", { label });
-                const record = isRecord(reply) ? reply : {};
-                return { id: text(record.id), label: text(record.label), key: text(record.key), createdAt: number(record.created_at) };
-            },
-            async list()
-            {
-                const reply = await call("GET", "keys");
-                return (isRecord(reply) && Array.isArray(reply.keys) ? reply.keys : []).map(toServiceKey);
-            },
-            async revoke(id)
-            {
-                return toServiceKey(await call("DELETE", `keys/${encodeURIComponent(id)}`));
             },
         },
         events: {
@@ -1772,6 +1768,128 @@ export function createOrbital(options: OrbitalOptions): Orbital
                     createdAt: number(grant.created_at),
                     lastTokenAt: orNull(grant.last_token_at),
                 }));
+            },
+        },
+    };
+}
+
+export interface OrbitalAdminOptions
+{
+    /** 관리 서버의 주소. */
+    url: string;
+    /** 운영자 키(`ORBITAL_ADMIN_KEY`). Orbital 의 대시보드 서버에만 둔다. 팩토리에 건네지 않는다. */
+    adminKey: string;
+    /** 테스트에서 갈아 끼운다. */
+    fetch?: typeof fetch;
+}
+
+/** 운영자가 보는 조직 하나. 이름과 숫자만 있다. */
+export interface AdminOrganization
+{
+    id: string;
+    /** 사람이 읽는 이름(만들 때의 `label`). */
+    name: string;
+    /** 운영의 조직(`live`)이거나 인스턴스의 수에 상한이 있는 시험용 조직(`test`)이다. */
+    kind: "live" | "test";
+    createdAt: number;
+    /** 닫은 때(Unix 초). 닫힌 조직의 키는 어디서 왔든 받지 않는다. */
+    closedAt: number | null;
+}
+
+/** 운영자가 보는 조직 하나와 그 숫자. */
+export interface AdminOrganizationReport extends AdminOrganization
+{
+    /** 지금 세워진 인스턴스의 수. */
+    instances: number;
+    /** 살아 있는 키의 수(설정의 키는 세지 않는다). */
+    keys: number;
+}
+
+/**
+ * Orbital 의 대시보드가 쓰는 운영자의 client. 팩토리 제작자가 가입하면 조직을 만들고 첫 키를 받는다.
+ * 운영자 키로는 살아 있는 팩토리의 인스턴스에 닿지 못한다. 키가 하나도 살아 있지 않은 조직을 되살리는 길과,
+ * 키가 새어 나갔을 때 모든 키를 끊고 새 키 하나를 내는 길만 있다.
+ */
+export interface OrbitalAdmin
+{
+    organizations: {
+        /**
+         * 조직을 만들고 첫 키를 낸다. 이름은 소문자 · 숫자로 시작하고 소문자 · 숫자 · `-` · `_` 로 64글자까지다. 이미 있으면 409 다.
+         * `kind` 를 주지 않으면 운영의 조직(`live`)이다. 시험용 조직(`test`)은 인스턴스의 수에만 상한이 있다.
+         */
+        create(input: { id: string; label?: string; kind?: "live" | "test" }): Promise<{ organization: string; key: IssuedKey }>;
+        /** 살아 있는 키가 없는 조직에 키를 하나 낸다. 살아 있는 키가 있으면 409 다. */
+        issueKey(organization: string, input?: { label?: string }): Promise<IssuedKey>;
+        /**
+         * 조직의 키를 모두 폐기하고 새 키 하나를 낸다. 키의 비밀을 모두 잃었거나 키가 새어 나간 조직을 되살린다.
+         * 새어 나간 키로 더 낸 키도 한 트랜잭션에서 함께 끊긴다.
+         */
+        resetKeys(organization: string): Promise<IssuedKey>;
+        /** 모든 조직. 이름 순이다. */
+        list(): Promise<AdminOrganization[]>;
+        /** 조직 하나와 그 인스턴스 · 살아 있는 키의 수. 없으면 404 다. */
+        get(organization: string): Promise<AdminOrganizationReport>;
+        /** 조직을 닫는다. 인스턴스가 남아 있으면 409 와 먼저 지울 인스턴스다. 닫으면 그 조직의 키는 어디서 왔든 받지 않는다. */
+        close(organization: string): Promise<AdminOrganization>;
+    };
+}
+
+function toAdminOrganization(value: unknown): AdminOrganization
+{
+    const record = isRecord(value) ? value : {};
+    return {
+        id: text(record.id),
+        name: text(record.name),
+        kind: record.kind === "test" ? "test" : "live",
+        createdAt: number(record.created_at),
+        closedAt: typeof record.closed_at === "number" ? record.closed_at : null,
+    };
+}
+
+export function createOrbitalAdmin(options: OrbitalAdminOptions): OrbitalAdmin
+{
+    const call = caller(options.url, options.adminKey, options.fetch ?? fetch);
+    const at = (organization: string, tail: string): string => `admin/organizations/${encodeURIComponent(organization)}${tail}`;
+    return {
+        organizations: {
+            async create({ id, label, kind })
+            {
+                const body: { [key: string]: Json } = { id };
+                if (label !== undefined)
+                {
+                    body.label = label;
+                }
+                if (kind !== undefined)
+                {
+                    body.kind = kind;
+                }
+                const reply = await call("POST", "admin/organizations", body);
+                const record = isRecord(reply) ? reply : {};
+                return { organization: text(record.organization), key: toIssuedKey(record.key) };
+            },
+            async issueKey(organization, input = {})
+            {
+                return toIssuedKey(await call("POST", at(organization, "/keys"), input.label === undefined ? {} : { label: input.label }));
+            },
+            async resetKeys(organization)
+            {
+                return toIssuedKey(await call("POST", at(organization, "/reset-keys")));
+            },
+            async list()
+            {
+                const reply = await call("GET", "admin/organizations");
+                return (isRecord(reply) && Array.isArray(reply.organizations) ? reply.organizations : []).map(toAdminOrganization);
+            },
+            async get(organization)
+            {
+                const reply = await call("GET", at(organization, ""));
+                const record = isRecord(reply) ? reply : {};
+                return { ...toAdminOrganization(record), instances: number(record.instances), keys: number(record.keys) };
+            },
+            async close(organization)
+            {
+                const reply = await call("POST", at(organization, "/close"));
+                return toAdminOrganization(isRecord(reply) ? reply.organization : undefined);
             },
         },
     };

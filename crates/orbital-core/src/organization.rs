@@ -1,12 +1,69 @@
-//! 조직과 service key 의 판정. 받을 열쇠인가, 그 조직이 인스턴스를 더 세울 수 있는가, 그 열쇠를 거둘 수 있는가, 조직을 닫을 수 있는가.
+//! 조직(팩토리)과 service key 의 판정. 받을 열쇠인가, 그 열쇠를 거둘 수 있는가, 열쇠를 더 낼 수 있는가(조직 스스로 · 운영자),
+//! 그 조직이 인스턴스를 더 세울 수 있는가, 조직을 닫을 수 있는가.
 //!
-//! 열쇠의 값을 읽고 sha256 을 셈하고 기록을 찾는 일은 관리 서버가 한다. 여기서는 찾은 사실(어디서 왔나 · 거뒀나 · 조직이 닫혔나)을 받아
-//! 판정만 한다. 시험용 조직(`test`)과 운영의 조직(`live`)이 갈리는 자리는 열쇠의 머리말과 인스턴스의 상한 둘뿐이다.
-//! 그 밖의 관문(메일 · 복구 훈련 · 권한 · 승격)은 이 종류를 받지 않는다.
+//! 열쇠의 값을 읽고 sha256 을 셈하고 기록을 찾는 일은 관리 서버가 한다. 여기서는 찾은 사실(어디서 왔나 · 거뒀나 · 조직이 닫혔나 ·
+//! 살아 있는 열쇠의 수 · 설정의 열쇠가 있나)을 받아 판정만 한다.
+//! 시험용 조직(`test`)과 운영의 조직(`live`)이 갈리는 자리는 인스턴스의 상한 하나뿐이다. 열쇠는 종류와 상관없이 `orb_sk_` 로 시작한다.
+//!
+//! 설정의 열쇠(`ORBITAL_SERVICE_KEYS`)는 부트스트랩이다. 목록에 보이지 않고 API 로 거두지 못하며, 그 조직은 기록의 열쇠가 없어도 잠기지 않은 것으로 본다.
 
 use serde::{Deserialize, Serialize};
 
 use crate::scope::OrganizationId;
+
+/// 조직 이름의 문제. 오류 문구는 레이어가 짓는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BadOrganization;
+
+impl std::fmt::Display for BadOrganization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "조직 이름은 소문자 · 숫자로 시작하고 소문자 · 숫자 · - · _ 로 64글자까지여야 합니다",
+        )
+    }
+}
+
+/// 조직 이름. 소문자 · 숫자로 시작하고 소문자 · 숫자 · `-` · `_` 로 64글자까지다(Higgs 의 조직 이름과 같은 규칙).
+/// 조직 이름은 레이어의 기록과 API 에만 쓰이고 database 와 역할의 이름에는 들어가지 않는다. SQL 에는 매개변수로만 간다.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct OrganizationName(String);
+
+impl TryFrom<String> for OrganizationName {
+    type Error = BadOrganization;
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        organization_name(&text)
+    }
+}
+
+impl From<OrganizationName> for String {
+    fn from(name: OrganizationName) -> Self {
+        name.0
+    }
+}
+
+impl OrganizationName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+pub fn organization_name(raw: &str) -> Result<OrganizationName, BadOrganization> {
+    let mut chars = raw.chars();
+    let valid = raw.len() <= 64
+        && chars
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    if valid {
+        Ok(OrganizationName(raw.to_owned()))
+    } else {
+        Err(BadOrganization)
+    }
+}
+
+/// service key 가 시작하는 글자. 조직의 종류와 상관없이 같다(종류는 조직이 안다). 비밀 검사 도구가 찾기 쉽다.
+pub const KEY_PREFIX: &str = "orb_sk_";
 
 /// 조직의 종류.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -19,14 +76,6 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// 이 종류의 열쇠가 시작하는 글자. 열쇠만 보고 어느 종류의 조직인지 안다.
-    pub const fn key_prefix(self) -> &'static str {
-        match self {
-            Self::Live => "sk_live_",
-            Self::Test => "sk_test_",
-        }
-    }
-
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Live => "live",
@@ -157,10 +206,12 @@ pub enum RevokeRefusal {
 }
 
 /// `caller` 의 조직이 열쇠 하나(`target`, 없으면 `None`)를 거둘 수 있는가. `alive` 는 그 조직의 기록에 살아 있는 열쇠의 수다(거둘 것을 포함).
+/// `bootstrap` 은 그 조직에 설정의 열쇠가 있는가다. 있으면 기록의 마지막 열쇠를 거둬도 조직이 잠기지 않는다.
 pub fn judge_revoke(
     caller: &OrganizationId,
     target: Option<&KeyFacts>,
     alive: u32,
+    bootstrap: bool,
 ) -> Result<Revoking, RevokeRefusal> {
     let Some(target) = target.filter(|target| &target.organization == caller) else {
         return Err(RevokeRefusal::NotFound);
@@ -168,28 +219,73 @@ pub fn judge_revoke(
     if target.revoked {
         return Ok(Revoking::AlreadyRevoked);
     }
-    if alive <= 1 {
+    if alive <= 1 && !bootstrap {
         return Err(RevokeRefusal::LastKey);
     }
     Ok(Revoking::Revoke)
 }
 
-/// 열쇠를 내지 않는 까닭.
+/// 조직이 제 열쇠로 열쇠를 더 내지 않는 까닭.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueRefusal {
-    /// 기록에 없는 조직이다(설정의 열쇠만 있는 조직 포함). 운영자가 조직을 먼저 만든다.
+    /// 기록에도 설정에도 없는 조직이다.
     NotFound,
     /// 닫힌 조직이다.
     Closed,
 }
 
-/// 그 조직에 열쇠를 더 낼 수 있는가. 내는 열쇠의 종류(머리말)를 돌려준다.
-pub fn judge_issue(state: Option<&OrganizationState>) -> Result<Kind, IssueRefusal> {
+/// 조직이 제 열쇠로 열쇠를 하나 더 낼 수 있는가. `state` 는 기록의 조직이고, `bootstrap` 은 설정의 열쇠가 있는가다.
+/// 설정의 열쇠만 있는 조직도 낸다(그 조직의 기록이 운영의 조직으로 생긴다).
+pub fn judge_issue(state: Option<&OrganizationState>, bootstrap: bool) -> Result<(), IssueRefusal> {
     match state {
+        None if bootstrap => Ok(()),
         None => Err(IssueRefusal::NotFound),
         Some(OrganizationState { closed: true, .. }) => Err(IssueRefusal::Closed),
-        Some(state) => Ok(state.kind),
+        Some(_) => Ok(()),
+    }
+}
+
+/// 운영자가 조직에 열쇠를 내는 모양.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorIssue {
+    /// 살아 있는 열쇠가 없는 조직에 하나를 낸다(잠긴 조직을 되살린다).
+    Issue,
+    /// 그 조직의 살아 있는 열쇠를 모두 거두고 새 열쇠 하나를 낸다(열쇠가 새어 나갔거나 모두 잃었을 때).
+    Reset,
+}
+
+/// 운영자가 열쇠를 내지 않는 까닭.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorRefusal {
+    /// 기록에 없는 조직이다.
+    NotFound,
+    /// 설정의 열쇠가 있는 조직이다. 운영자는 손대지 않는다.
+    Bootstrap,
+    /// 닫힌 조직이다.
+    Closed,
+    /// 살아 있는 열쇠가 있다. 조직의 열쇠로 새 열쇠를 내야 한다(`Issue` 만).
+    HasLiveKey,
+}
+
+/// 운영자가 조직에 열쇠를 내도 되는가. 운영자는 살아 있는 열쇠가 있는 조직에 열쇠를 보태지 않는다.
+/// 그래서 운영자 키로는 살아 있는 팩토리의 인스턴스에 몰래 닿지 못한다. `Reset` 은 살아 있는 열쇠를 모두 끊으므로 조직이 알아챈다.
+pub fn judge_operator_issue(
+    state: Option<&OrganizationState>,
+    alive: u32,
+    bootstrap: bool,
+    how: OperatorIssue,
+) -> Result<(), OperatorRefusal> {
+    if bootstrap {
+        return Err(OperatorRefusal::Bootstrap);
+    }
+    match state {
+        None => Err(OperatorRefusal::NotFound),
+        Some(OrganizationState { closed: true, .. }) => Err(OperatorRefusal::Closed),
+        Some(_) if how == OperatorIssue::Issue && alive > 0 => Err(OperatorRefusal::HasLiveKey),
+        Some(_) => Ok(()),
     }
 }
 
@@ -245,7 +341,7 @@ pub fn judge_close(
     Ok(())
 }
 
-/// 사람이 붙이는 이름(조직의 이름 · 열쇠의 이름)의 문제.
+/// 사람이 붙이는 이름표의 문제.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LabelProblem {
@@ -257,10 +353,10 @@ pub enum LabelProblem {
     Control,
 }
 
-/// 사람이 붙이는 이름의 최대 글자 수.
+/// 비울 수 없는 이름표(승인한 사람)의 최대 글자 수.
 pub const LABEL_MAX: usize = 80;
 
-/// 사람이 붙이는 이름을 본다. 앞뒤의 빈칸은 떼고 본다.
+/// 비울 수 없는 이름표를 본다. 앞뒤의 빈칸은 떼고 본다.
 pub fn check_label(text: &str) -> Result<String, LabelProblem> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -268,6 +364,21 @@ pub fn check_label(text: &str) -> Result<String, LabelProblem> {
     }
     if trimmed.chars().count() > LABEL_MAX {
         return Err(LabelProblem::TooLong { max: LABEL_MAX });
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(LabelProblem::Control);
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// 열쇠와 조직의 이름표(「배포 서버」 · 「Acme 팩토리」)의 최대 글자 수.
+pub const KEY_LABEL_MAX: usize = 100;
+
+/// 열쇠와 조직의 이름표를 본다. 비어도 된다(이름 없이 낸다). 앞뒤의 빈칸은 떼고 본다.
+pub fn check_key_label(text: &str) -> Result<String, LabelProblem> {
+    let trimmed = text.trim();
+    if trimmed.chars().count() > KEY_LABEL_MAX {
+        return Err(LabelProblem::TooLong { max: KEY_LABEL_MAX });
     }
     if trimmed.chars().any(char::is_control) {
         return Err(LabelProblem::Control);
@@ -356,27 +467,47 @@ mod tests {
             revoked: false,
         };
         assert_eq!(
-            judge_revoke(&org("acme"), Some(&mine), 1),
+            judge_revoke(&org("acme"), Some(&mine), 1, false),
             Err(RevokeRefusal::LastKey)
         );
         assert_eq!(
-            judge_revoke(&org("acme"), Some(&mine), 2),
+            judge_revoke(&org("acme"), Some(&mine), 2, false),
             Ok(Revoking::Revoke)
         );
+    }
+
+    #[test]
+    fn 설정의_열쇠가_있는_조직은_기록의_마지막_열쇠도_거둔다() {
+        let mine = KeyFacts {
+            organization: org("acme"),
+            revoked: false,
+        };
+        assert_eq!(
+            judge_revoke(&org("acme"), Some(&mine), 1, true),
+            Ok(Revoking::Revoke)
+        );
+    }
+
+    #[test]
+    fn 없는_열쇠와_다른_조직의_열쇠는_없다고_하고_이미_거둔_열쇠는_다시_거두지_않는다() {
+        let mine = KeyFacts {
+            organization: org("acme"),
+            revoked: false,
+        };
         let gone = KeyFacts {
             revoked: true,
             ..mine.clone()
         };
         assert_eq!(
-            judge_revoke(&org("acme"), Some(&gone), 1),
+            judge_revoke(&org("acme"), Some(&gone), 1, false),
             Ok(Revoking::AlreadyRevoked)
         );
         assert_eq!(
-            judge_revoke(&org("other"), Some(&mine), 2),
+            judge_revoke(&org("other"), Some(&mine), 2, false),
             Err(RevokeRefusal::NotFound)
         );
         assert_eq!(
-            judge_revoke(&org("acme"), None, 2),
+            judge_revoke(&org("acme"), None, 2, false),
             Err(RevokeRefusal::NotFound)
         );
     }
@@ -397,13 +528,42 @@ mod tests {
     }
 
     #[test]
-    fn 열쇠는_기록에_있고_열린_조직에만_내고_머리말은_종류를_따른다() {
-        assert_eq!(judge_issue(Some(&TEST)), Ok(Kind::Test));
-        assert_eq!(judge_issue(Some(&LIVE)), Ok(Kind::Live));
-        assert_eq!(judge_issue(Some(&CLOSED)), Err(IssueRefusal::Closed));
-        assert_eq!(judge_issue(None), Err(IssueRefusal::NotFound));
-        assert_eq!(Kind::Live.key_prefix(), "sk_live_");
-        assert_eq!(Kind::Test.key_prefix(), "sk_test_");
+    fn 조직은_열려_있으면_종류와_상관없이_열쇠를_더_내고_설정의_열쇠만_있는_조직도_낸다() {
+        assert_eq!(judge_issue(Some(&TEST), false), Ok(()));
+        assert_eq!(judge_issue(Some(&LIVE), false), Ok(()));
+        assert_eq!(judge_issue(None, true), Ok(()));
+        assert_eq!(judge_issue(Some(&CLOSED), true), Err(IssueRefusal::Closed));
+        assert_eq!(judge_issue(None, false), Err(IssueRefusal::NotFound));
+    }
+
+    #[test]
+    fn 운영자는_살아_있는_키가_없는_조직에만_키를_낸다() {
+        let issue = |state, alive, bootstrap| {
+            judge_operator_issue(state, alive, bootstrap, OperatorIssue::Issue)
+        };
+        assert_eq!(issue(Some(&LIVE), 0, false), Ok(()));
+        assert_eq!(issue(Some(&TEST), 0, false), Ok(()));
+        assert_eq!(
+            issue(Some(&LIVE), 1, false),
+            Err(OperatorRefusal::HasLiveKey)
+        );
+        assert_eq!(issue(None, 0, false), Err(OperatorRefusal::NotFound));
+        assert_eq!(issue(Some(&CLOSED), 0, false), Err(OperatorRefusal::Closed));
+        assert_eq!(issue(Some(&LIVE), 0, true), Err(OperatorRefusal::Bootstrap));
+        assert_eq!(issue(None, 0, true), Err(OperatorRefusal::Bootstrap));
+    }
+
+    #[test]
+    fn 운영자의_키_갈기는_살아_있는_키가_있어도_하되_설정의_조직과_닫힌_조직과_없는_조직에는_하지_않는다()
+     {
+        let reset = |state, alive, bootstrap| {
+            judge_operator_issue(state, alive, bootstrap, OperatorIssue::Reset)
+        };
+        assert_eq!(reset(Some(&LIVE), 3, false), Ok(()));
+        assert_eq!(reset(Some(&LIVE), 0, false), Ok(()));
+        assert_eq!(reset(Some(&LIVE), 1, true), Err(OperatorRefusal::Bootstrap));
+        assert_eq!(reset(Some(&CLOSED), 1, false), Err(OperatorRefusal::Closed));
+        assert_eq!(reset(None, 0, false), Err(OperatorRefusal::NotFound));
     }
 
     #[test]
@@ -432,6 +592,33 @@ mod tests {
             Err(LabelProblem::TooLong { max: LABEL_MAX })
         );
         assert_eq!(check_label("둘\n째 줄"), Err(LabelProblem::Control));
+    }
+
+    #[test]
+    fn 열쇠와_조직의_이름표는_비어도_되고_100자를_넘거나_제어_문자가_들면_받지_않는다() {
+        assert_eq!(check_key_label("  배포 서버  "), Ok("배포 서버".to_owned()));
+        assert_eq!(check_key_label(""), Ok(String::new()));
+        assert_eq!(
+            check_key_label(&"가".repeat(KEY_LABEL_MAX)),
+            Ok("가".repeat(KEY_LABEL_MAX))
+        );
+        assert_eq!(
+            check_key_label(&"가".repeat(KEY_LABEL_MAX + 1)),
+            Err(LabelProblem::TooLong { max: KEY_LABEL_MAX })
+        );
+        assert_eq!(check_key_label("둘\n째 줄"), Err(LabelProblem::Control));
+    }
+
+    #[test]
+    fn 조직_이름은_소문자_숫자로_시작하고_소문자_숫자_하이픈_밑줄로_64글자까지다() {
+        assert!(organization_name("acme").is_ok());
+        assert!(organization_name("0-factory_co").is_ok());
+        assert!(organization_name(&"a".repeat(64)).is_ok());
+        for bad in ["", "-acme", "_acme", "Acme", "ac me", "acme.", "아크미"] {
+            assert_eq!(organization_name(bad), Err(BadOrganization), "{bad}");
+        }
+        assert!(organization_name(&"a".repeat(65)).is_err());
+        assert!(serde_json::from_str::<OrganizationName>("\"Acme\"").is_err());
     }
 
     #[test]

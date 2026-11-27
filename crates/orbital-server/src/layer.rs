@@ -582,10 +582,11 @@ pub struct Options {
     pub home: PathBuf,
     /// DB 의 관리 주소.
     pub pg_url: String,
-    /// (service key, 조직). 팩토리의 서버가 쓴다(`ORBITAL_SERVICE_KEYS`). 기록(control database)의 열쇠와 함께 산다.
+    /// (service key, 조직). 팩토리의 서버가 쓴다(`ORBITAL_SERVICE_KEYS`). 부트스트랩이고, 기록(control database)의 열쇠와 함께 산다.
     pub service_keys: Vec<(String, String)>,
-    /// 운영자의 열쇠(`ORBITAL_OPERATOR_KEY`). 조직을 만들고 보고 닫고 열쇠를 내는 길(`/v1/operator/…`)만 연다. 없으면 그 길이 없다(404).
-    pub operator_key: Option<String>,
+    /// 운영자 키(`ORBITAL_ADMIN_KEY`). 조직을 만들고 보고 닫고, 잠긴 조직에 키를 내고 키를 가는 길(`/v1/admin/…`)만 연다.
+    /// 없으면 그 길은 누구에게도 열리지 않는다(401).
+    pub admin_key: Option<String>,
     /// 시험용 조직이 세울 수 있는 인스턴스의 수(`ORBITAL_TEST_INSTANCE_LIMIT`, 기본 10).
     pub test_instance_limit: u32,
     pub runner: Box<dyn Runner>,
@@ -672,7 +673,7 @@ impl Options {
             home,
             pg_url,
             service_keys,
-            operator_key: None,
+            admin_key: None,
             test_instance_limit: orbital_core::organization::TEST_INSTANCE_LIMIT,
             runner,
             seal_key: None,
@@ -776,8 +777,8 @@ pub struct LayerCore {
     runtime: Runtime,
     token_key: Vec<u8>,
     service_keys: Vec<([u8; 32], String)>,
-    /// 운영자의 열쇠의 sha256. 없으면 운영자의 길이 없다.
-    operator_key: Option<[u8; 32]>,
+    /// 운영자 키의 sha256. 없으면 운영자의 길이 없다.
+    admin_key: Option<[u8; 32]>,
     test_instance_limit: u32,
     /// 운영의 서버가 찍은 로그를 service key 에 내주는가.
     production_logs: bool,
@@ -1137,7 +1138,7 @@ impl Layer {
                 .iter()
                 .map(|(key, organization)| (digest(key), organization.clone()))
                 .collect(),
-            operator_key: options.operator_key.as_deref().map(digest),
+            admin_key: options.admin_key.as_deref().map(digest),
             test_instance_limit: options.test_instance_limit,
             production_logs: options.production_logs,
             building: Mutex::new(BTreeMap::new()),

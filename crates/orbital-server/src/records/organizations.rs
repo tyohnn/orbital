@@ -9,7 +9,7 @@ use postgres::Transaction;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::{RecordError, Records, pg};
+use super::{RecordError, Records, pg, signed};
 use crate::registry::InstanceRecord;
 
 /// 기록의 조직 하나.
@@ -32,13 +32,11 @@ impl OrganizationRow {
     }
 }
 
-/// 기록의 열쇠 하나. 값도 sha256 도 싣지 않는다.
+/// 기록의 열쇠 하나. 값도 sha256 도 싣지 않는다. 끝 네 글자 같은 값의 조각도 싣지 않는다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct KeyRow {
     pub id: String,
     pub label: String,
-    /// 열쇠가 시작하는 글자(`sk_live_` · `sk_test_`). 값의 일부가 아니라 조직의 종류다.
-    pub prefix: &'static str,
     pub created_at: u64,
     pub revoked_at: Option<u64>,
     /// 마지막으로 쓴 때. 분 단위로 뭉친 것이다.
@@ -61,10 +59,6 @@ pub struct FoundKey {
     pub revoked: bool,
     pub state: OrganizationState,
     pub used_at: Option<u64>,
-}
-
-fn signed(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn unsigned(value: i64) -> u64 {
@@ -99,6 +93,18 @@ fn hold_organization(
         .map_err(pg("조직의 차례를 잡"))
 }
 
+const KEY_COLUMNS: &str = "id, label, created_at, revoked_at, used_at";
+
+fn key_row(row: &postgres::Row) -> KeyRow {
+    KeyRow {
+        id: row.get(0),
+        label: row.get(1),
+        created_at: unsigned(row.get(2)),
+        revoked_at: row.get::<_, Option<i64>>(3).map(unsigned),
+        used_at: row.get::<_, Option<i64>>(4).map(unsigned),
+    }
+}
+
 const ORGANIZATION_COLUMNS: &str = "id, name, kind, created_at, closed_at";
 
 fn organization_row(row: &postgres::Row) -> Result<OrganizationRow, RecordError> {
@@ -131,6 +137,18 @@ fn state_in(
             })
         })
         .transpose()
+}
+
+/// 조직의 살아 있는(거두지 않은) 열쇠의 수.
+fn alive_in(transaction: &mut Transaction<'_>, organization: &str) -> Result<u32, RecordError> {
+    let alive: i64 = transaction
+        .query_one(
+            "SELECT count(*) FROM orbital.service_key WHERE organization = $1 AND revoked_at IS NULL",
+            &[&organization],
+        )
+        .map_err(pg("열쇠를 세"))?
+        .get(0);
+    Ok(u32::try_from(alive).unwrap_or(u32::MAX))
 }
 
 fn insert_key(
@@ -273,63 +291,56 @@ impl Records {
 
     /// 조직의 열쇠 모두. 만든 차례다. 값과 sha256 은 싣지 않는다.
     pub fn keys(&self, organization: &str) -> Result<Vec<KeyRow>, RecordError> {
-        self.client()?
+        Ok(self
+            .client()?
             .query(
-                "SELECT k.id, k.label, o.kind, k.created_at, k.revoked_at, k.used_at
-                 FROM orbital.service_key k JOIN orbital.organization o ON o.id = k.organization
-                 WHERE k.organization = $1 ORDER BY k.created_at, k.id",
+                &format!(
+                    "SELECT {KEY_COLUMNS} FROM orbital.service_key WHERE organization = $1 ORDER BY made"
+                ),
                 &[&organization],
             )
             .map_err(pg("열쇠를 읽"))?
             .iter()
-            .map(|row| {
-                Ok(KeyRow {
-                    id: row.get(0),
-                    label: row.get(1),
-                    prefix: kind_of(row.get(2))?.key_prefix(),
-                    created_at: unsigned(row.get(3)),
-                    revoked_at: row.get::<_, Option<i64>>(4).map(unsigned),
-                    used_at: row.get::<_, Option<i64>>(5).map(unsigned),
-                })
-            })
-            .collect()
+            .map(key_row)
+            .collect())
     }
 
-    /// 조직에 열쇠를 하나 더 적는다. 조직의 줄을 잠그고 `judge` 가 받아들일 때만 적는다.
+    /// 조직에 열쇠를 하나 적는다. 조직의 줄을 잠그고 그 모습과 살아 있는 열쇠의 수를 `judge` 에 넘겨 받아들일 때만 적는다.
+    ///
+    /// `bootstrap` 이면(설정의 열쇠가 있는 조직) 기록에 없는 조직의 줄을 운영의 조직으로 먼저 만든다. 판정이 거절하면 그 줄도 남지 않는다.
+    /// `revoke_others` 면 같은 트랜잭션에서 그 조직의 살아 있는 열쇠를 모두 거둔다(운영자의 키 갈기). 새어 나간 열쇠와 그것으로 낸 열쇠가
+    /// 한 번에 끊기고, 조직의 줄을 잠그므로 그사이에 다른 관리 서버에서 낸 열쇠도 남지 않는다. 거둔 수를 돌려준다.
     pub fn issue_key<E: From<RecordError>>(
         &self,
         organization: &str,
         key: &NewKey<'_>,
-        judge: impl FnOnce(Option<&OrganizationState>) -> Result<(), E>,
-    ) -> Result<(), E> {
-        let mut client = self.client()?;
-        let mut transaction = client.transaction().map_err(pg("열쇠를 적"))?;
-        let state = state_in(&mut transaction, organization, true)?;
-        judge(state.as_ref())?;
-        insert_key(&mut transaction, organization, key)?;
-        transaction.commit().map_err(pg("열쇠를 적"))?;
-        Ok(())
-    }
-
-    /// 조직에 열쇠를 하나 적고, 같은 트랜잭션에서 그 조직의 다른 살아 있는 열쇠를 모두 거둔다. 거둔 수를 돌려준다.
-    /// 열쇠가 새어 나갔을 때 되찾는 길이다. 새어 나간 열쇠와 그것으로 낸 열쇠가 한 번에 끊기고, 그사이에 낸 열쇠도 남지 않는다
-    /// (조직의 줄을 잠그고 한다).
-    pub fn issue_key_alone<E: From<RecordError>>(
-        &self,
-        organization: &str,
-        key: &NewKey<'_>,
-        judge: impl FnOnce(Option<&OrganizationState>) -> Result<(), E>,
+        (bootstrap, revoke_others): (bool, bool),
+        judge: impl FnOnce(Option<&OrganizationState>, u32) -> Result<(), E>,
     ) -> Result<u32, E> {
         let mut client = self.client()?;
         let mut transaction = client.transaction().map_err(pg("열쇠를 적"))?;
+        if bootstrap {
+            transaction
+                .execute(
+                    "INSERT INTO orbital.organization (id, name, kind, created_at) VALUES ($1, '', 'live', $2)
+                     ON CONFLICT (id) DO NOTHING",
+                    &[&organization, &signed(key.created_at)],
+                )
+                .map_err(pg("조직을 적"))?;
+        }
         let state = state_in(&mut transaction, organization, true)?;
-        judge(state.as_ref())?;
-        let revoked = transaction
-            .execute(
-                "UPDATE orbital.service_key SET revoked_at = $2 WHERE organization = $1 AND revoked_at IS NULL",
-                &[&organization, &signed(key.created_at)],
-            )
-            .map_err(pg("열쇠를 거두"))?;
+        let alive = alive_in(&mut transaction, organization)?;
+        judge(state.as_ref(), alive)?;
+        let revoked = if revoke_others {
+            transaction
+                .execute(
+                    "UPDATE orbital.service_key SET revoked_at = $2 WHERE organization = $1 AND revoked_at IS NULL",
+                    &[&organization, &signed(key.created_at)],
+                )
+                .map_err(pg("열쇠를 거두"))?
+        } else {
+            0
+        };
         insert_key(&mut transaction, organization, key)?;
         transaction.commit().map_err(pg("열쇠를 적"))?;
         Ok(u32::try_from(revoked).unwrap_or(u32::MAX))
@@ -357,14 +368,8 @@ impl Records {
                 organization: OrganizationId(row.get(0)),
                 revoked: row.get::<_, Option<i64>>(1).is_some(),
             });
-        let alive: i64 = transaction
-            .query_one(
-                "SELECT count(*) FROM orbital.service_key WHERE organization = $1 AND revoked_at IS NULL",
-                &[&caller],
-            )
-            .map_err(pg("열쇠를 세"))?
-            .get(0);
-        let revoking = judge(target.as_ref(), u32::try_from(alive).unwrap_or(u32::MAX))?;
+        let alive = alive_in(&mut transaction, caller)?;
+        let revoking = judge(target.as_ref(), alive)?;
         if revoking == Revoking::Revoke {
             transaction
                 .execute(
@@ -375,20 +380,13 @@ impl Records {
         }
         let row = transaction
             .query_one(
-                "SELECT k.id, k.label, o.kind, k.created_at, k.revoked_at, k.used_at
-                 FROM orbital.service_key k JOIN orbital.organization o ON o.id = k.organization
-                 WHERE k.id = $1 AND k.organization = $2",
+                &format!(
+                    "SELECT {KEY_COLUMNS} FROM orbital.service_key WHERE id = $1 AND organization = $2"
+                ),
                 &[&id, &caller],
             )
             .map_err(pg("열쇠를 읽"))?;
-        let key = KeyRow {
-            id: row.get(0),
-            label: row.get(1),
-            prefix: kind_of(row.get(2))?.key_prefix(),
-            created_at: unsigned(row.get(3)),
-            revoked_at: row.get::<_, Option<i64>>(4).map(unsigned),
-            used_at: row.get::<_, Option<i64>>(5).map(unsigned),
-        };
+        let key = key_row(&row);
         transaction.commit().map_err(pg("열쇠를 거두"))?;
         Ok(key)
     }

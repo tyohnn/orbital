@@ -110,6 +110,6 @@ editJson("server/package.json", (pkg) =>
 console.log(`팩토리 ${name} 를 ${destination} 에 만들었습니다(레이어의 앱 이름 ${app}).`);
 console.log("다음:");
 console.log(`  cd ${join(destination, "server")} && npm install`);
-console.log("  ORBITAL_URL=<레이어의 주소> ORBITAL_SERVICE_KEY=sk_test_… npm start");
+console.log("  ORBITAL_URL=<레이어의 주소> ORBITAL_SERVICE_KEY=orb_sk_… npm start");
 console.log("  (다른 터미널에서) npm run try");
 console.log(`자세한 차례는 ${join(destination, "README.md")} 에 있습니다.`);

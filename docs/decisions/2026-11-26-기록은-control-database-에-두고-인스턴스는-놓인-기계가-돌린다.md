@@ -91,4 +91,4 @@
 - 기계 사이의 넘겨 주기를 서로 확인하기(mTLS · 서명). 지금은 관리 서버끼리만 닿는 망에 둔다고 보고, 권한은 토큰과 service key 가 정한다.
 - 기계가 죽었는지 알고 그 인스턴스를 다른 기계가 이어 받기(코드 저장소를 나눠 써야 한다).
 - DB 클러스터 여럿. control database 는 어느 클러스터에 두나(지금은 관리 연결의 클러스터 하나).
-- service key 를 조직마다 내고 거두는 길을 control database 에 둘지.
+- ~~service key 를 조직마다 내고 거두는 길을 control database 에 둘지.~~ 두었다([조직과 service key](2026-11-26-조직과-service-key-는-기록에-두고-값은-sha256-으로만-둔다.md)).

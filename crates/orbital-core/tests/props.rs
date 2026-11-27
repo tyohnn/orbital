@@ -1556,8 +1556,8 @@ mod placement {
 
 mod organization {
     use orbital_core::organization::{
-        Caller, KeyFacts, Kind, OrganizationState, Presented, RevokeRefusal, judge_key,
-        judge_new_instance, judge_revoke,
+        Caller, KeyFacts, Kind, OperatorIssue, OperatorRefusal, OrganizationState, Presented,
+        RevokeRefusal, Revoking, judge_key, judge_new_instance, judge_operator_issue, judge_revoke,
     };
     use orbital_core::scope::OrganizationId;
     use proptest::prelude::*;
@@ -1640,10 +1640,10 @@ mod organization {
 
         #[test]
         fn 어떤_조직의_열쇠도_다른_조직의_열쇠를_거두지_못하고_없는_것과_같다(
-            caller in organization(), owner in organization(), revoked in any::<bool>(), alive in 0u32..4
+            caller in organization(), owner in organization(), revoked in any::<bool>(), alive in 0u32..4, bootstrap in any::<bool>()
         ) {
             let target = KeyFacts { organization: owner.clone(), revoked };
-            let judged = judge_revoke(&caller, Some(&target), alive);
+            let judged = judge_revoke(&caller, Some(&target), alive, bootstrap);
             if caller != owner {
                 prop_assert_eq!(judged, Err(RevokeRefusal::NotFound));
             }
@@ -1652,7 +1652,56 @@ mod organization {
         #[test]
         fn 살아_있는_열쇠가_하나뿐인_조직은_그_열쇠를_거두지_못한다(organization in organization(), alive in 0u32..2) {
             let target = KeyFacts { organization: organization.clone(), revoked: false };
-            prop_assert_eq!(judge_revoke(&organization, Some(&target), alive), Err(RevokeRefusal::LastKey));
+            prop_assert_eq!(judge_revoke(&organization, Some(&target), alive, false), Err(RevokeRefusal::LastKey));
+        }
+
+        #[test]
+        fn 어떤_차례로_만들고_폐기하든_환경_변수의_키가_없는_조직에는_살아_있는_키가_언제나_하나는_남는다(
+            bootstrap in any::<bool>(),
+            steps in prop::collection::vec((any::<bool>(), 0usize..4), 0..24)
+        ) {
+            // 조직은 첫 키 하나로 시작한다. 키마다 거뒀는지만 둔다
+            let mine = OrganizationId("acme".to_owned());
+            let mut revoked = vec![false];
+            for (create, pick) in steps {
+                if create {
+                    revoked.push(false);
+                    continue;
+                }
+                let live_before = revoked.iter().filter(|gone| !**gone).count();
+                let target = revoked.get(pick).map(|gone| KeyFacts { organization: mine.clone(), revoked: *gone });
+                let verdict = judge_revoke(&mine, target.as_ref(), u32::try_from(live_before).unwrap(), bootstrap);
+                // 기대값은 판정을 다시 부르지 않고 센 수에서 바로 찾는다
+                let expected = match revoked.get(pick) {
+                    None => Err(RevokeRefusal::NotFound),
+                    Some(true) => Ok(Revoking::AlreadyRevoked),
+                    Some(false) if live_before == 1 && !bootstrap => Err(RevokeRefusal::LastKey),
+                    Some(false) => Ok(Revoking::Revoke),
+                };
+                prop_assert_eq!(verdict, expected);
+                if verdict == Ok(Revoking::Revoke) {
+                    revoked[pick] = true;
+                }
+                if !bootstrap {
+                    prop_assert!(revoked.iter().any(|gone| !*gone));
+                }
+            }
+        }
+
+        #[test]
+        fn 운영자는_어떤_모습의_조직이든_살아_있는_키가_있으면_키를_보태지_않는다(
+            state in proptest::option::of(state()), alive in 0u32..3, bootstrap in any::<bool>()
+        ) {
+            let judged = judge_operator_issue(state.as_ref(), alive, bootstrap, OperatorIssue::Issue);
+            if alive > 0 {
+                prop_assert!(judged.is_err());
+            }
+            // 오라클: 열린 기록의 조직에 설정의 열쇠도 살아 있는 키도 없을 때만 낸다
+            let expected = !bootstrap && alive == 0 && state.is_some_and(|state| !state.closed);
+            prop_assert_eq!(judged.is_ok(), expected);
+            if bootstrap {
+                prop_assert_eq!(judged, Err(OperatorRefusal::Bootstrap));
+            }
         }
 
         #[test]

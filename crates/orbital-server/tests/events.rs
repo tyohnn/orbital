@@ -34,8 +34,8 @@ use sha2::Sha256;
 const FACTORY: &str = "sk_test_factory_events";
 /// 다른 조직 `other` 의 열쇠.
 const OTHER: &str = "sk_test_other_events";
-/// 운영자의 열쇠.
-const OPERATOR: &str = "op_test_operator_key_not_a_secret_0000";
+/// 운영자 키(`ORBITAL_ADMIN_KEY`).
+const ADMIN: &str = "admin_key_for_tests_0123456789abcdef";
 /// 밖에서 넣는 비밀의 값(가짜).
 const BANK: &str = "sk_live_bank_FAKE_Ev71pZ";
 const ALL: [&str; 4] = ["source", "preview", "rehearse", "secrets_request"];
@@ -375,7 +375,7 @@ impl Bench {
             control_database: self.control.clone(),
             machine: Ident::parse(machine).unwrap(),
             token_key: Some([3; 32].to_vec()),
-            operator_key: Some(OPERATOR.to_owned()),
+            admin_key: Some(ADMIN.to_owned()),
             clock: Arc::new(move || match clock.load(Ordering::SeqCst) {
                 0 => now(),
                 at => at,
@@ -715,7 +715,7 @@ fn 토큰과_운영자의_열쇠로는_이벤트를_보지도_웹훅을_걸지�
     let token = bench.token("a", FACTORY, &instance);
     let receiver = Receiver::start();
     let hook = json!({ "url": receiver.url() }).to_string();
-    for bearer in [token.as_str(), OPERATOR] {
+    for bearer in [token.as_str(), ADMIN] {
         let (status, body) = bench.call("a", "GET", "/v1/events", bearer, &[]);
         assert_eq!(status, 403, "{body}");
         for method in ["GET", "PUT", "DELETE"] {

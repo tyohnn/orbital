@@ -1,6 +1,6 @@
 // 팩토리의 서버를 띄운다.
 //
-//   ORBITAL_URL=… ORBITAL_SERVICE_KEY=sk_test_… npm start
+//   ORBITAL_URL=… ORBITAL_SERVICE_KEY=orb_sk_… npm start
 //
 // | 환경 변수 | 무엇 |
 // |---|---|
@@ -45,7 +45,7 @@ function required(name: string, what: string): string
 }
 
 const layerUrl = required("ORBITAL_URL", "레이어(관리 서버)의 주소");
-const serviceKey = required("ORBITAL_SERVICE_KEY", "레이어의 운영자에게 받은 service key(시험용은 sk_test_ 로 시작합니다)");
+const serviceKey = required("ORBITAL_SERVICE_KEY", "Orbital 의 대시보드에서 받은 service key(orb_sk_ 로 시작합니다)");
 const port = Number(process.env.FACTORY_PORT ?? "3840");
 const origin = (process.env.FACTORY_PUBLIC_URL ?? "").replace(/\/+$/, "") || `http://127.0.0.1:${port}`;
 const home = process.env.FACTORY_HOME ?? join(here, "..", ".factory");
